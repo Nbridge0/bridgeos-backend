@@ -1,0 +1,3 @@
+SUPABASE_URL=https://your-project-id.supabase.co
+SUPABASE_SERVICE_KEY=your_service_role_key
+SUPABASE_JWT_SECRET=your_jwt_secret
