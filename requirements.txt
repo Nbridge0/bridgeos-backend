@@ -1,9 +1,12 @@
 fastapi
 uvicorn[standard]
-python-dotenv
+gunicorn
 supabase
-PyJWT
+python-dotenv
 requests
+PyJWT
+pydantic[email]
 python-multipart
-email-validator
-pydantic
+openai
+pypdf
+python-docx

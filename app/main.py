@@ -3,20 +3,26 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
+from app.config import FRONTEND_ORIGINS
 
 from app.auth import get_user
 from app import services
 
 app = FastAPI(title="Yacht Secure Chatbot API")
 
+allowed_origins = (
+    ["*"]
+    if FRONTEND_ORIGINS == "*"
+    else [origin.strip() for origin in FRONTEND_ORIGINS.split(",")]
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 security = HTTPBearer()
 # ------------------------
 # REQUEST MODELS
