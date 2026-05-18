@@ -88,14 +88,35 @@ def signup_admin(email: str, password: str, full_name: str, yacht_name: str):
 def login(email: str, password: str):
     """
     Logs in a user using Supabase Auth.
-    Frontend should use the returned access_token as:
-    Authorization: Bearer ACCESS_TOKEN
+
+    Returns a clean JSON response for the frontend:
+    {
+      "access_token": "...",
+      "refresh_token": "...",
+      "user": {...}
+    }
     """
 
-    return supabase.auth.sign_in_with_password({
+    auth_res = supabase.auth.sign_in_with_password({
         "email": email,
         "password": password
     })
+
+    if not auth_res.session:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    if not auth_res.session.access_token:
+        raise HTTPException(status_code=401, detail="No access token returned")
+
+    return {
+        "access_token": auth_res.session.access_token,
+        "refresh_token": auth_res.session.refresh_token,
+        "token_type": "bearer",
+        "user": {
+            "id": auth_res.user.id if auth_res.user else None,
+            "email": auth_res.user.email if auth_res.user else email
+        }
+    }
 
 
 # ------------------------
