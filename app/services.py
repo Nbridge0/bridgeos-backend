@@ -44,65 +44,38 @@ def signup_admin(email: str, password: str, full_name: str, yacht_name: str):
     3. Crew profile with security_level = 1
     """
 
-    try:
-        auth_res = supabase.auth.admin.create_user({
-            "email": email,
-            "password": password,
-            "email_confirm": True
-        })
-    except Exception as e:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Could not create Supabase Auth user: {str(e)}"
-        )
+    auth_res = supabase.auth.admin.create_user({
+        "email": email,
+        "password": password,
+        "email_confirm": True
+    })
 
-    if not auth_res or not auth_res.user:
-        raise HTTPException(
-            status_code=400,
-            detail="Could not create admin user. Supabase returned no user."
-        )
+    if not auth_res.user:
+        raise HTTPException(status_code=400, detail="Could not create admin user")
 
     user_id = auth_res.user.id
 
-    try:
-        yacht_res = supabase.table("yachts").insert({
-            "name": yacht_name,
-            "owner_id": user_id
-        }).execute()
-    except Exception as e:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Could not create yacht row: {str(e)}"
-        )
+    yacht_res = supabase.table("yachts").insert({
+        "name": yacht_name,
+        "owner_id": user_id
+    }).execute()
 
     if not yacht_res.data:
-        raise HTTPException(
-            status_code=400,
-            detail="Could not create yacht. No data returned from Supabase."
-        )
+        raise HTTPException(status_code=400, detail="Could not create yacht")
 
     yacht = yacht_res.data[0]
 
-    try:
-        crew_res = supabase.table("crew").insert({
-            "id": user_id,
-            "email": email,
-            "full_name": full_name,
-            "yacht_id": yacht["id"],
-            "security_level": 1,
-            "created_by": user_id
-        }).execute()
-    except Exception as e:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Could not create crew profile row: {str(e)}"
-        )
+    crew_res = supabase.table("crew").insert({
+        "id": user_id,
+        "email": email,
+        "full_name": full_name,
+        "yacht_id": yacht["id"],
+        "security_level": 1,
+        "created_by": user_id
+    }).execute()
 
     if not crew_res.data:
-        raise HTTPException(
-            status_code=400,
-            detail="Could not create admin crew profile. No data returned from Supabase."
-        )
+        raise HTTPException(status_code=400, detail="Could not create admin crew profile")
 
     return {
         "message": "Admin account created successfully",
@@ -112,29 +85,30 @@ def signup_admin(email: str, password: str, full_name: str, yacht_name: str):
     }
 
 
-
 def login(email: str, password: str):
     """
-    Logs in a user using Supabase Auth.
-
-    Returns a clean JSON response for the frontend:
-    {
-      "access_token": "...",
-      "refresh_token": "...",
-      "user": {...}
-    }
+    Logs in a user using Supabase Auth and returns a clean token response.
     """
 
-    auth_res = supabase.auth.sign_in_with_password({
-        "email": email,
-        "password": password
-    })
+    try:
+        auth_res = supabase.auth.sign_in_with_password({
+            "email": email,
+            "password": password
+        })
+    except Exception as e:
+        raise HTTPException(
+            status_code=401,
+            detail=f"Supabase login failed: {str(e)}"
+        )
 
-    if not auth_res.session:
-        raise HTTPException(status_code=401, detail="Invalid email or password")
+    if not auth_res:
+        raise HTTPException(status_code=401, detail="No login response from Supabase")
+
+    if not getattr(auth_res, "session", None):
+        raise HTTPException(status_code=401, detail="No session returned from Supabase")
 
     if not auth_res.session.access_token:
-        raise HTTPException(status_code=401, detail="No access token returned")
+        raise HTTPException(status_code=401, detail="No access token returned from Supabase")
 
     return {
         "access_token": auth_res.session.access_token,
@@ -145,6 +119,7 @@ def login(email: str, password: str):
             "email": auth_res.user.email if auth_res.user else email
         }
     }
+
 
 
 # ------------------------
