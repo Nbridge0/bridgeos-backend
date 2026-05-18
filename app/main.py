@@ -114,6 +114,17 @@ async def login(body: LoginRequest):
     )
 
 
+
+# ------------------------
+# TEMP DEV LOGIN
+# Remove before production.
+# ------------------------
+
+@app.post("/auth/dev-login")
+async def dev_login():
+    return services.dev_demo_login()
+
+
 # ------------------------
 # CURRENT USER
 # ------------------------

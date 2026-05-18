@@ -899,3 +899,86 @@ def chat(query: str, crew_id: str, yacht_id: str, security_level: int):
         "answer": answer,
         "sources": sources
     }
+# ------------------------
+# TEMP DEMO LOGIN FOR TESTING ONLY
+# Remove before production.
+# ------------------------
+
+import time
+import uuid
+import jwt as pyjwt
+
+from app.config import SUPABASE_JWT_SECRET
+
+
+def dev_demo_login(email: str = "demo@bridgeos.com"):
+    """
+    TEMP TEST LOGIN.
+
+    Creates/fetches a demo yacht and demo crew row directly in the database,
+    then returns a JWT that your existing get_user() can read.
+
+    This bypasses Supabase Auth only so you can test upload/chat now.
+    Remove before production.
+    """
+
+    demo_user_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, email))
+    demo_yacht_name = "Demo Yacht"
+
+    crew_res = supabase.table("crew") \
+        .select("*") \
+        .eq("id", demo_user_id) \
+        .execute()
+
+    if crew_res.data:
+        crew = crew_res.data[0]
+    else:
+        yacht_res = supabase.table("yachts").insert({
+            "name": demo_yacht_name,
+            "owner_id": demo_user_id
+        }).execute()
+
+        if not yacht_res.data:
+            raise HTTPException(status_code=400, detail="Could not create demo yacht")
+
+        yacht = yacht_res.data[0]
+
+        crew_insert = supabase.table("crew").insert({
+            "id": demo_user_id,
+            "email": email,
+            "full_name": "Demo Admin",
+            "yacht_id": yacht["id"],
+            "security_level": 1,
+            "created_by": demo_user_id
+        }).execute()
+
+        if not crew_insert.data:
+            raise HTTPException(status_code=400, detail="Could not create demo crew")
+
+        crew = crew_insert.data[0]
+
+    now = int(time.time())
+
+    token = pyjwt.encode(
+        {
+            "sub": demo_user_id,
+            "email": email,
+            "aud": "authenticated",
+            "role": "authenticated",
+            "iat": now,
+            "exp": now + 60 * 60 * 24 * 7
+        },
+        SUPABASE_JWT_SECRET,
+        algorithm="HS256"
+    )
+
+    return {
+        "access_token": token,
+        "refresh_token": None,
+        "token_type": "bearer",
+        "user": {
+            "id": demo_user_id,
+            "email": email
+        },
+        "crew": crew
+    }
