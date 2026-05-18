@@ -44,38 +44,65 @@ def signup_admin(email: str, password: str, full_name: str, yacht_name: str):
     3. Crew profile with security_level = 1
     """
 
-    auth_res = supabase.auth.admin.create_user({
-        "email": email,
-        "password": password,
-        "email_confirm": True
-    })
+    try:
+        auth_res = supabase.auth.admin.create_user({
+            "email": email,
+            "password": password,
+            "email_confirm": True
+        })
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not create Supabase Auth user: {str(e)}"
+        )
 
-    if not auth_res.user:
-        raise HTTPException(status_code=400, detail="Could not create admin user")
+    if not auth_res or not auth_res.user:
+        raise HTTPException(
+            status_code=400,
+            detail="Could not create admin user. Supabase returned no user."
+        )
 
     user_id = auth_res.user.id
 
-    yacht_res = supabase.table("yachts").insert({
-        "name": yacht_name,
-        "owner_id": user_id
-    }).execute()
+    try:
+        yacht_res = supabase.table("yachts").insert({
+            "name": yacht_name,
+            "owner_id": user_id
+        }).execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not create yacht row: {str(e)}"
+        )
 
     if not yacht_res.data:
-        raise HTTPException(status_code=400, detail="Could not create yacht")
+        raise HTTPException(
+            status_code=400,
+            detail="Could not create yacht. No data returned from Supabase."
+        )
 
     yacht = yacht_res.data[0]
 
-    crew_res = supabase.table("crew").insert({
-        "id": user_id,
-        "email": email,
-        "full_name": full_name,
-        "yacht_id": yacht["id"],
-        "security_level": 1,
-        "created_by": user_id
-    }).execute()
+    try:
+        crew_res = supabase.table("crew").insert({
+            "id": user_id,
+            "email": email,
+            "full_name": full_name,
+            "yacht_id": yacht["id"],
+            "security_level": 1,
+            "created_by": user_id
+        }).execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not create crew profile row: {str(e)}"
+        )
 
     if not crew_res.data:
-        raise HTTPException(status_code=400, detail="Could not create admin crew profile")
+        raise HTTPException(
+            status_code=400,
+            detail="Could not create admin crew profile. No data returned from Supabase."
+        )
 
     return {
         "message": "Admin account created successfully",
@@ -83,6 +110,7 @@ def signup_admin(email: str, password: str, full_name: str, yacht_name: str):
         "yacht": yacht,
         "crew": crew_res.data[0]
     }
+
 
 
 def login(email: str, password: str):
