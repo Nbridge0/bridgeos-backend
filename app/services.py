@@ -982,3 +982,96 @@ def dev_demo_login(email: str = "demo@bridgeos.com"):
         },
         "crew": crew
     }
+
+# ------------------------
+# TEMP WORKING DEMO AUTH
+# This bypasses Supabase Auth so you can test upload/chat now.
+# Remove before production.
+# ------------------------
+
+DEV_ACCESS_TOKEN = "bridgeos-dev-token"
+DEV_USER_ID = "11111111-1111-1111-1111-111111111111"
+DEV_EMAIL = "demo@bridgeos.com"
+DEV_YACHT_NAME = "Demo Yacht"
+
+
+def ensure_demo_account():
+    """
+    Creates or reuses:
+    - demo yacht
+    - demo crew profile with security_level = 1
+
+    This does NOT use Supabase Auth.
+    It only creates database rows needed by the app.
+    """
+
+    try:
+        crew_res = supabase.table("crew") \
+            .select("*") \
+            .eq("id", DEV_USER_ID) \
+            .execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not query demo crew. Check crew table. Error: {str(e)}"
+        )
+
+    if crew_res.data:
+        return crew_res.data[0]
+
+    try:
+        yacht_res = supabase.table("yachts").insert({
+            "name": DEV_YACHT_NAME,
+            "owner_id": DEV_USER_ID
+        }).execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not create demo yacht. Check yachts table columns. Error: {str(e)}"
+        )
+
+    if not yacht_res.data:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not create demo yacht. Supabase returned no data."
+        )
+
+    yacht = yacht_res.data[0]
+
+    try:
+        crew_insert = supabase.table("crew").insert({
+            "id": DEV_USER_ID,
+            "email": DEV_EMAIL,
+            "full_name": "Demo Admin",
+            "yacht_id": yacht["id"],
+            "security_level": 1,
+            "created_by": DEV_USER_ID
+        }).execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not create demo crew. Check crew table columns. Error: {str(e)}"
+        )
+
+    if not crew_insert.data:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not create demo crew. Supabase returned no data."
+        )
+
+    return crew_insert.data[0]
+
+
+def test_login_response():
+    crew = ensure_demo_account()
+
+    return {
+        "access_token": DEV_ACCESS_TOKEN,
+        "refresh_token": None,
+        "token_type": "bearer",
+        "user": {
+            "id": DEV_USER_ID,
+            "email": DEV_EMAIL
+        },
+        "crew": crew
+    }

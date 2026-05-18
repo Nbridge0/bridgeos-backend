@@ -1,8 +1,14 @@
 from fastapi import Request, HTTPException
-import jwt
 
-from app.config import SUPABASE_JWT_SECRET
-from app.database import supabase
+# TEMP TEST TOKEN.
+# This is only for development/testing.
+# Remove before production.
+DEV_ACCESS_TOKEN = "bridgeos-dev-token"
+
+# Deterministic demo user id.
+# Must be a valid UUID string because your database uses UUID ids.
+DEV_USER_ID = "11111111-1111-1111-1111-111111111111"
+DEV_EMAIL = "demo@bridgeos.com"
 
 
 def get_user(request: Request):
@@ -19,46 +25,13 @@ def get_user(request: Request):
     if not token:
         raise HTTPException(status_code=401, detail="Empty authorization token")
 
-    # First try local JWT decoding.
-    # This is fast, but it depends on SUPABASE_JWT_SECRET being exactly correct.
-    try:
-        payload = jwt.decode(
-            token,
-            SUPABASE_JWT_SECRET,
-            algorithms=["HS256"],
-            options={
-                "verify_exp": True,
-                "verify_aud": False
-            }
-        )
+    # TEMP DEV MODE.
+    # Accept our test token so frontend upload/chat can work immediately.
+    if token == DEV_ACCESS_TOKEN:
+        return {
+            "sub": DEV_USER_ID,
+            "email": DEV_EMAIL,
+            "role": "authenticated"
+        }
 
-        if not payload.get("sub"):
-            raise HTTPException(status_code=401, detail="Token missing user id")
-
-        return payload
-
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
-
-    except Exception:
-        # Fallback: ask Supabase Auth to validate the token.
-        # This protects you if the Render SUPABASE_JWT_SECRET is wrong or audience decoding is different.
-        try:
-            user_res = supabase.auth.get_user(token)
-
-            if not user_res or not user_res.user:
-                raise HTTPException(status_code=401, detail="Invalid Supabase token")
-
-            return {
-                "sub": user_res.user.id,
-                "email": user_res.user.email
-            }
-
-        except HTTPException:
-            raise
-
-        except Exception as e:
-            raise HTTPException(
-                status_code=401,
-                detail=f"Invalid token: {str(e)}"
-            )
+    raise HTTPException(status_code=401, detail="Invalid test token")

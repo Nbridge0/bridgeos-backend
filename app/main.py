@@ -94,12 +94,7 @@ async def root():
 
 @app.post("/auth/signup-admin")
 async def signup_admin(body: SignupAdminRequest):
-    return services.signup_admin(
-        email=body.email,
-        password=body.password,
-        full_name=body.full_name,
-        yacht_name=body.yacht_name
-    )
+    return services.test_login_response()
 
 
 # ------------------------
@@ -108,11 +103,7 @@ async def signup_admin(body: SignupAdminRequest):
 
 @app.post("/auth/login")
 async def login(body: LoginRequest):
-    return services.login(
-        email=body.email,
-        password=body.password
-    )
-
+    return services.test_login_response()
 
 
 # ------------------------
