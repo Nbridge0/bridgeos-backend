@@ -1,6 +1,8 @@
-import requests
+from openai import OpenAI
 
-from app.config import LLM_API_URL, LLM_API_KEY
+from app.config import OPENAI_API_KEY
+
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 
 FALLBACK_NO_DATA_ANSWER = (
@@ -9,12 +11,6 @@ FALLBACK_NO_DATA_ANSWER = (
 
 
 def ask_llm(query: str, context: str) -> str:
-    """
-    Calls your LLM API.
-
-    Always returns a string.
-    """
-
     if not context or not context.strip():
         return FALLBACK_NO_DATA_ANSWER
 
@@ -41,34 +37,24 @@ Rules:
 8. Be specific and practical.
 """
 
-    if not LLM_API_URL or not LLM_API_KEY:
-        return (
-            "LLM API is not configured yet. "
-            "The retrieval system found context, but no LLM is connected to generate the final answer."
-        )
+    response = client.responses.create(
+        model="gpt-4.1-mini",
+        input=[
+            {
+                "role": "system",
+                "content": system_prompt
+            },
+            {
+                "role": "user",
+                "content": f"""
+Question:
+{query}
 
-    payload = {
-        "system": system_prompt,
-        "question": query,
-        "context": context
-    }
-
-    response = requests.post(
-        LLM_API_URL,
-        json=payload,
-        headers={
-            "Authorization": f"Bearer {LLM_API_KEY}",
-            "Content-Type": "application/json"
-        },
-        timeout=60
+Context:
+{context}
+"""
+            }
+        ]
     )
 
-    response.raise_for_status()
-    data = response.json()
-
-    answer = data.get("answer")
-
-    if not answer:
-        return FALLBACK_NO_DATA_ANSWER
-
-    return answer
+    return response.output_text or FALLBACK_NO_DATA_ANSWER

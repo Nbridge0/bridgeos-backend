@@ -64,6 +64,10 @@ class AuthorizeDocumentRequest(BaseModel):
     crew_id: str
 
 
+
+class AuthorizeAssetRequest(BaseModel):
+    crew_id: str
+
 class ChatRequest(BaseModel):
     query: Optional[str] = None
     message: Optional[str] = None

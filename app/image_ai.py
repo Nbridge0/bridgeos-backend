@@ -1,26 +1,44 @@
-import requests
+import base64
+from openai import OpenAI
 
-from app.config import VISION_API_URL, VISION_API_KEY, OCR_API_URL, OCR_API_KEY
+from app.config import OPENAI_API_KEY
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+
+def _file_to_data_url(file, filename: str) -> str:
+    file.seek(0)
+    data = file.read()
+    file.seek(0)
+
+    ext = filename.lower().split(".")[-1]
+
+    mime_type = "image/jpeg"
+
+    if ext == "png":
+        mime_type = "image/png"
+    elif ext == "webp":
+        mime_type = "image/webp"
+    elif ext in ["jpg", "jpeg"]:
+        mime_type = "image/jpeg"
+
+    encoded = base64.b64encode(data).decode("utf-8")
+
+    return f"data:{mime_type};base64,{encoded}"
 
 
 def describe_image(file, filename: str) -> str:
-    """
-    Sends image to a vision model and returns a searchable visual description.
+    data_url = _file_to_data_url(file, filename)
 
-    Until VISION_API_URL and VISION_API_KEY are configured, returns empty string.
-    """
-
-    if not VISION_API_URL or not VISION_API_KEY:
-        return ""
-
-    file.seek(0)
-
-    files = {
-        "file": (filename, file)
-    }
-
-    data = {
-        "prompt": """
+    response = client.responses.create(
+        model="gpt-4.1-mini",
+        input=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": """
 Describe this image for a private yacht memory/search system.
 
 Include:
@@ -35,50 +53,44 @@ Include:
 
 Do not invent exact dates unless visible or provided.
 """
-    }
-
-    response = requests.post(
-        VISION_API_URL,
-        headers={
-            "Authorization": f"Bearer {VISION_API_KEY}"
-        },
-        files=files,
-        data=data,
-        timeout=60
+                    },
+                    {
+                        "type": "input_image",
+                        "image_url": data_url
+                    }
+                ]
+            }
+        ]
     )
 
-    response.raise_for_status()
-    result = response.json()
-
-    return result.get("description", "")
+    return response.output_text or ""
 
 
 def extract_ocr_from_image(file, filename: str) -> str:
-    """
-    Extracts visible text from an image.
+    data_url = _file_to_data_url(file, filename)
 
-    Until OCR_API_URL and OCR_API_KEY are configured, returns empty string.
-    """
+    response = client.responses.create(
+        model="gpt-4.1-mini",
+        input=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": """
+Extract any visible text from this image.
 
-    if not OCR_API_URL or not OCR_API_KEY:
-        return ""
-
-    file.seek(0)
-
-    files = {
-        "file": (filename, file)
-    }
-
-    response = requests.post(
-        OCR_API_URL,
-        headers={
-            "Authorization": f"Bearer {OCR_API_KEY}"
-        },
-        files=files,
-        timeout=60
+Return only the visible text.
+If there is no visible text, return an empty string.
+"""
+                    },
+                    {
+                        "type": "input_image",
+                        "image_url": data_url
+                    }
+                ]
+            }
+        ]
     )
 
-    response.raise_for_status()
-    result = response.json()
-
-    return result.get("text", "")
+    return response.output_text or ""

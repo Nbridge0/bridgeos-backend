@@ -10,3 +10,4 @@ python-multipart
 openai
 pypdf
 python-docx
+TXT
