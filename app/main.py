@@ -321,6 +321,147 @@ async def upload_img(
         uploaded_by=crew["id"]
     )
 
+@app.post("/assets")
+async def upload_asset_api(
+    request: Request,
+    file: UploadFile = File(...),
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    crew = services.get_crew(user["sub"])
+
+    if not crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    if crew["security_level"] != 1:
+        raise HTTPException(
+            status_code=403,
+            detail="Only security level 1 can upload assets"
+        )
+
+    return services.upload_asset(
+        file=file.file,
+        filename=file.filename,
+        mime_type=file.content_type,
+        yacht_id=crew["yacht_id"],
+        uploaded_by=crew["id"]
+    )
+
+@app.post("/assets/batch")
+async def upload_assets_batch_api(
+    request: Request,
+    files: list[UploadFile] = File(...),
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    crew = services.get_crew(user["sub"])
+
+    if not crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    if crew["security_level"] != 1:
+        raise HTTPException(
+            status_code=403,
+            detail="Only security level 1 can upload assets"
+        )
+
+    results = []
+
+    for file in files:
+        result = services.upload_asset(
+            file=file.file,
+            filename=file.filename,
+            mime_type=file.content_type,
+            yacht_id=crew["yacht_id"],
+            uploaded_by=crew["id"]
+        )
+
+        results.append(result)
+
+    return {
+        "message": "Batch upload completed",
+        "count": len(results),
+        "results": results
+    }
+
+
+@app.get("/assets/admin")
+async def list_assets_admin(
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.list_assets_for_admin(admin_crew)
+
+@app.get("/assets/my")
+async def list_my_assets(
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    crew = services.get_crew(user["sub"])
+
+    if not crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.list_my_assets(crew)
+
+@app.get("/assets/{asset_id}/status")
+async def asset_status(
+    asset_id: str,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    crew = services.get_crew(user["sub"])
+
+    if not crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.get_asset_status(
+        asset_id=asset_id,
+        yacht_id=crew["yacht_id"]
+    )
+
+@app.post("/assets/{asset_id}/authorize")
+async def authorize_asset(
+    asset_id: str,
+    body: AuthorizeAssetRequest,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    if admin_crew["security_level"] != 1:
+        raise HTTPException(
+            status_code=403,
+            detail="Only security level 1 can authorize assets"
+        )
+
+    return services.authorize_asset_access(
+        asset_id=asset_id,
+        target_crew_id=body.crew_id,
+        granted_by=admin_crew["id"],
+        yacht_id=admin_crew["yacht_id"]
+    )
+
+
+
 
 # ------------------------
 # CHAT

@@ -5,38 +5,37 @@ from app.config import EMBEDDING_API_URL, EMBEDDING_API_KEY
 
 def embed(text: str):
     """
-    Temporary behavior:
-    - If EMBEDDING_API_URL and EMBEDDING_API_KEY exist, call your embedding API.
-    - Otherwise return a fake 1536-dimension vector.
+    Creates a real embedding for semantic search.
 
-    IMPORTANT:
-    The fake vector is only for development.
-    Real semantic search will NOT work properly until you connect a real embedding API.
+    Production rule:
+    Do NOT use fake embeddings. Fake embeddings make search useless.
     """
 
     if not text:
         text = ""
 
-    if EMBEDDING_API_URL and EMBEDDING_API_KEY:
-        response = requests.post(
-            EMBEDDING_API_URL,
-            json={"input": text},
-            headers={
-                "Authorization": f"Bearer {EMBEDDING_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            timeout=30
+    if not EMBEDDING_API_URL or not EMBEDDING_API_KEY:
+        raise RuntimeError(
+            "Embedding API is not configured. Real embeddings are required for chatbot search."
         )
 
-        response.raise_for_status()
-        data = response.json()
+    response = requests.post(
+        EMBEDDING_API_URL,
+        json={"input": text},
+        headers={
+            "Authorization": f"Bearer {EMBEDDING_API_KEY}",
+            "Content-Type": "application/json"
+        },
+        timeout=30
+    )
 
-        if "embedding" in data:
-            return data["embedding"]
+    response.raise_for_status()
+    data = response.json()
 
-        if "data" in data and len(data["data"]) > 0 and "embedding" in data["data"][0]:
-            return data["data"][0]["embedding"]
+    if "embedding" in data:
+        return data["embedding"]
 
-        raise ValueError("Embedding API response does not contain an embedding")
+    if "data" in data and len(data["data"]) > 0 and "embedding" in data["data"][0]:
+        return data["data"][0]["embedding"]
 
-    return [0.0] * 1536
+    raise ValueError("Embedding API response does not contain an embedding")

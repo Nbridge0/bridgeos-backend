@@ -8,41 +8,44 @@ FALLBACK_NO_DATA_ANSWER = (
 )
 
 
-def ask_llm(query: str, context: str):
+def ask_llm(query: str, context: str) -> str:
     """
-    Calls your own LLM API.
+    Calls your LLM API.
 
-    Expected API response options:
-    {
-      "answer": "..."
-    }
-
-    If no LLM API is configured yet, this returns a development response.
+    Always returns a string.
     """
 
-    if not context.strip():
+    if not context or not context.strip():
         return FALLBACK_NO_DATA_ANSWER
 
     system_prompt = """
-You are a secure yacht assistant.
+You are a secure yacht memory assistant.
 
-You must follow these rules strictly:
+You answer only using the provided context.
 
+The context may include:
+- extracted text from documents
+- OCR text from images or scanned files
+- visual descriptions of uploaded images
+- metadata such as file names, detected years, tags, and source information
+
+Rules:
 1. Answer only using the provided context.
 2. Do not use outside knowledge.
 3. Do not guess.
-4. Do not mention other users, other yachts, hidden documents, or unavailable files.
-5. If the answer is not clearly present in the provided context, say exactly:
+4. If the answer is not clearly supported by the context, say exactly:
 "Sorry, I don't have this data yet. Please ask your admin to upload it."
+5. Do not mention other users, other yachts, hidden documents, or unavailable files.
+6. If the answer is based on images, say it is based on uploaded image descriptions.
+7. If the context is uncertain, explain the uncertainty briefly.
+8. Be specific and practical.
 """
 
     if not LLM_API_URL or not LLM_API_KEY:
-        return {
-            "development_mode": True,
-            "message": "LLM API is not configured yet. This is the context that would be sent to your LLM.",
-            "query": query,
-            "context": context
-        }
+        return (
+            "LLM API is not configured yet. "
+            "The retrieval system found context, but no LLM is connected to generate the final answer."
+        )
 
     payload = {
         "system": system_prompt,
