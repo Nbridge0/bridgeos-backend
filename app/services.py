@@ -316,25 +316,32 @@ def upload_asset(
     original_relative_path: str | None = None
 ):
     """
-    Uploads any messy file:
-    - image
-    - txt
-    - pdf
-    - docx
-    - unknown
-
-    Then processes it into searchable chunks.
+    Uploads any file, stores it in Supabase Storage, creates an asset row,
+    extracts/processes it, creates chunks and embeddings.
     """
 
     clean_filename = safe_filename(filename)
     file_type = detect_file_type(clean_filename, mime_type)
-    file_hash = calculate_file_hash(file)
 
-    existing = supabase.table("assets") \
-        .select("*") \
-        .eq("yacht_id", yacht_id) \
-        .eq("file_hash", file_hash) \
-        .execute()
+    try:
+        file_hash = calculate_file_hash(file)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not calculate file hash: {str(e)}"
+        )
+
+    try:
+        existing = supabase.table("assets") \
+            .select("*") \
+            .eq("yacht_id", yacht_id) \
+            .eq("file_hash", file_hash) \
+            .execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not check duplicate asset: {str(e)}"
+        )
 
     if existing.data:
         return {
@@ -345,56 +352,104 @@ def upload_asset(
 
     path = f"{yacht_id}/assets/{clean_filename}"
 
-    file.seek(0)
+    try:
+        file.seek(0)
+        file_bytes = file.read()
+        file.seek(0)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not read uploaded file: {str(e)}"
+        )
 
-    supabase.storage.from_(BUCKET_NAME).upload(
-        path,
-        file,
-        file_options={"upsert": "true"}
-    )
+    try:
+        supabase.storage.from_(BUCKET_NAME).upload(
+            path,
+            file_bytes,
+            file_options={
+                "content-type": mime_type or "application/octet-stream",
+                "upsert": "true"
+            }
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Supabase Storage upload failed. Check bucket '{BUCKET_NAME}'. Error: {str(e)}"
+        )
 
-    url = supabase.storage.from_(BUCKET_NAME).get_public_url(path)
+    try:
+        url = supabase.storage.from_(BUCKET_NAME).get_public_url(path)
+    except Exception:
+        url = None
 
-    asset_res = supabase.table("assets").insert({
-        "yacht_id": yacht_id,
-        "uploaded_by": uploaded_by,
-        "file_name": clean_filename,
-        "original_file_name": filename,
-        "original_relative_path": original_relative_path,
-        "file_hash": file_hash,
-        "file_type": file_type,
-        "mime_type": mime_type,
-        "storage_path": path,
-        "file_url": url,
-        "processing_status": "pending"
-    }).execute()
+    try:
+        asset_res = supabase.table("assets").insert({
+            "yacht_id": yacht_id,
+            "uploaded_by": uploaded_by,
+            "file_name": clean_filename,
+            "original_file_name": filename,
+            "original_relative_path": original_relative_path,
+            "file_hash": file_hash,
+            "file_type": file_type,
+            "mime_type": mime_type,
+            "storage_path": path,
+            "file_url": url,
+            "processing_status": "pending"
+        }).execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not insert asset row. Check assets table columns. Error: {str(e)}"
+        )
 
     if not asset_res.data:
-        raise HTTPException(status_code=400, detail="Could not save asset")
+        raise HTTPException(status_code=500, detail="Could not save asset. Supabase returned no data.")
 
     asset = asset_res.data[0]
 
-    file.seek(0)
+    try:
+        import io
+        processing_file = io.BytesIO(file_bytes)
 
-    process_uploaded_asset(
-        asset_id=asset["id"],
-        file=file,
-        filename=clean_filename,
-        file_type=file_type,
-        yacht_id=yacht_id
-    )
+        process_uploaded_asset(
+            asset_id=asset["id"],
+            file=processing_file,
+            filename=clean_filename,
+            file_type=file_type,
+            yacht_id=yacht_id
+        )
+    except Exception as e:
+        supabase.table("assets").update({
+            "processing_status": "failed",
+            "processing_error": f"{type(e).__name__}: {str(e)}"
+        }).eq("id", asset["id"]).execute()
 
-    updated = supabase.table("assets") \
-        .select("*") \
-        .eq("id", asset["id"]) \
-        .single() \
-        .execute()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Asset was uploaded but processing failed: {type(e).__name__}: {str(e)}"
+        )
 
-    return {
-        "message": "Asset uploaded successfully",
-        "asset": updated.data,
-        "duplicate": False
-    }
+    try:
+        updated = supabase.table("assets") \
+            .select("*") \
+            .eq("id", asset["id"]) \
+            .single() \
+            .execute()
+
+        return {
+            "message": "Asset uploaded and processed successfully",
+            "asset": updated.data,
+            "duplicate": False
+        }
+
+    except Exception:
+        return {
+            "message": "Asset uploaded and processed successfully",
+            "asset": asset,
+            "duplicate": False
+        }
+
+
 
 def process_uploaded_asset(
     asset_id: str,
