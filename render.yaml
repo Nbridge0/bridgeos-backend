@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: yacht-secure-chatbot-api
+    name: bridgeos-backend
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
