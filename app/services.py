@@ -21,6 +21,13 @@ from app.image_ai import (
     extract_ocr_from_image
 )
 
+
+import time
+import uuid
+import jwt as pyjwt
+
+from app.config import SUPABASE_JWT_SECRET
+
 # ------------------------
 # YACHT
 # ------------------------
@@ -152,47 +159,74 @@ def create_crew_user(
     security_level: int
 ):
     """
-    Admin creates a crew user for the same yacht.
-    Only security level 1 can create users.
+    Main admin creates a sub account under the SAME yacht.
+
+    The main admin decides the sub account security_level.
+
+    security_level:
+    1 = admin/sub-admin, can see all yacht data
+    2 = trusted crew, limited unless asset access is granted
+    3 = limited crew, limited unless asset access is granted
     """
 
-    if admin_crew["security_level"] != 1:
-        raise HTTPException(status_code=403, detail="Only security level 1 can create users")
+    if int(admin_crew["security_level"]) != 1:
+        raise HTTPException(
+            status_code=403,
+            detail="Only security level 1 admins can create users"
+        )
 
     security_level = int(security_level)
 
-    if security_level not in [2, 3]:
-        raise HTTPException(status_code=400, detail="Crew security level must be 2 or 3")
+    if security_level not in [1, 2, 3]:
+        raise HTTPException(
+            status_code=400,
+            detail="security_level must be 1, 2, or 3"
+        )
 
-    auth_res = supabase.auth.admin.create_user({
-        "email": email,
-        "password": password,
-        "email_confirm": True
-    })
+    try:
+        auth_res = supabase.auth.admin.create_user({
+            "email": email,
+            "password": password,
+            "email_confirm": True
+        })
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not create Supabase Auth user: {str(e)}"
+        )
 
     if not auth_res.user:
         raise HTTPException(status_code=400, detail="Could not create user")
 
     user_id = auth_res.user.id
 
-    crew_res = supabase.table("crew").insert({
-        "id": user_id,
-        "email": email,
-        "full_name": full_name,
-        "yacht_id": admin_crew["yacht_id"],
-        "security_level": security_level,
-        "created_by": admin_crew["id"]
-    }).execute()
+    try:
+        crew_res = supabase.table("crew").insert({
+            "id": user_id,
+            "email": email,
+            "full_name": full_name,
+            "yacht_id": admin_crew["yacht_id"],
+            "security_level": security_level,
+            "created_by": admin_crew["id"]
+        }).execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not create crew profile: {str(e)}"
+        )
 
     if not crew_res.data:
         raise HTTPException(status_code=400, detail="Could not create crew profile")
 
     return {
-        "message": "Crew user created successfully",
-        "user_id": user_id,
+        "message": "Sub account created successfully",
+        "account_type": "sub_account",
+        "created_by_main_account": admin_crew["id"],
+        "yacht_id": admin_crew["yacht_id"],
+        "sub_user_id": user_id,
+        "sub_security_level": security_level,
         "crew": crew_res.data[0]
     }
-
 
 def list_crew_for_yacht(admin_crew: dict):
     """
@@ -958,13 +992,6 @@ def chat(query: str, crew_id: str, yacht_id: str, security_level: int):
 # TEMP DEMO LOGIN FOR TESTING ONLY
 # Remove before production.
 # ------------------------
-
-import time
-import uuid
-import jwt as pyjwt
-
-from app.config import SUPABASE_JWT_SECRET
-
 
 def dev_demo_login(email: str = "demo@bridgeos.com"):
     """
