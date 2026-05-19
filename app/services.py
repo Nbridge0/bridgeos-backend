@@ -159,20 +159,18 @@ def create_crew_user(
     security_level: int
 ):
     """
-    Main admin creates a sub account under the SAME yacht.
+    MAIN account creates SUB accounts under the SAME yacht.
 
-    The main admin decides the sub account security_level.
-
-    security_level:
-    1 = admin/sub-admin, can see all yacht data
-    2 = trusted crew, limited unless asset access is granted
-    3 = limited crew, limited unless asset access is granted
+    MAIN decides security_level:
+    1 = can access all yacht assets/docs
+    2 = limited, only explicitly granted assets/docs
+    3 = limited, only explicitly granted assets/docs
     """
 
     if int(admin_crew["security_level"]) != 1:
         raise HTTPException(
             status_code=403,
-            detail="Only security level 1 admins can create users"
+            detail="Only security level 1 main accounts can create sub accounts"
         )
 
     security_level = int(security_level)
@@ -196,7 +194,7 @@ def create_crew_user(
         )
 
     if not auth_res.user:
-        raise HTTPException(status_code=400, detail="Could not create user")
+        raise HTTPException(status_code=400, detail="Could not create Supabase Auth user")
 
     user_id = auth_res.user.id
 
@@ -221,13 +219,12 @@ def create_crew_user(
     return {
         "message": "Sub account created successfully",
         "account_type": "sub_account",
-        "created_by_main_account": admin_crew["id"],
+        "main_account_id": admin_crew["id"],
         "yacht_id": admin_crew["yacht_id"],
         "sub_user_id": user_id,
         "sub_security_level": security_level,
         "crew": crew_res.data[0]
     }
-
 def list_crew_for_yacht(admin_crew: dict):
     """
     Admin can see all crew for their yacht.
