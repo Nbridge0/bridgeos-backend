@@ -34,6 +34,9 @@ class SignupAdminRequest(BaseModel):
     full_name: str
     yacht_name: str
 
+class AuthorizeAssetRequest(BaseModel):
+    crew_id: str
+
 
 class LoginRequest(BaseModel):
     email: EmailStr
@@ -64,9 +67,9 @@ class AuthorizeDocumentRequest(BaseModel):
     crew_id: str
 
 
-
 class AuthorizeAssetRequest(BaseModel):
     crew_id: str
+
 
 class ChatRequest(BaseModel):
     query: Optional[str] = None
@@ -94,7 +97,12 @@ async def root():
 
 @app.post("/auth/signup-admin")
 async def signup_admin(body: SignupAdminRequest):
-    return services.test_login_response()
+    return services.signup_admin(
+        email=body.email,
+        password=body.password,
+        full_name=body.full_name,
+        yacht_name=body.yacht_name
+    )
 
 
 # ------------------------
@@ -103,17 +111,10 @@ async def signup_admin(body: SignupAdminRequest):
 
 @app.post("/auth/login")
 async def login(body: LoginRequest):
-    return services.test_login_response()
-
-
-# ------------------------
-# TEMP DEV LOGIN
-# Remove before production.
-# ------------------------
-
-@app.post("/auth/dev-login")
-async def dev_login():
-    return services.dev_demo_login()
+    return services.login(
+        email=body.email,
+        password=body.password
+    )
 
 
 # ------------------------
@@ -336,8 +337,7 @@ async def upload_img(
 @app.post("/assets")
 async def upload_asset_api(
     request: Request,
-    file: UploadFile = File(...),
-    token: HTTPAuthorizationCredentials = Depends(security)
+    file: UploadFile = File(...)
 ):
     user = get_user(request)
 
@@ -346,20 +346,26 @@ async def upload_asset_api(
     if not crew:
         raise HTTPException(status_code=403, detail="No access")
 
-    if crew["security_level"] != 1:
+    if int(crew["security_level"]) != 1:
         raise HTTPException(
             status_code=403,
             detail="Only security level 1 can upload assets"
         )
 
-    return services.upload_asset(
-        file=file.file,
-        filename=file.filename,
-        mime_type=file.content_type,
-        yacht_id=crew["yacht_id"],
-        uploaded_by=crew["id"]
-    )
+    try:
+        return services.upload_asset(
+            file=file.file,
+            filename=file.filename,
+            mime_type=file.content_type,
+            yacht_id=crew["yacht_id"],
+            uploaded_by=crew["id"]
+        )
 
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Asset upload failed: {type(e).__name__}: {str(e)}"
+        )
 @app.post("/assets/batch")
 async def upload_assets_batch_api(
     request: Request,

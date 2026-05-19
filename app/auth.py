@@ -1,14 +1,7 @@
 from fastapi import Request, HTTPException
+import jwt as pyjwt
 
-# TEMP TEST TOKEN.
-# This is only for development/testing.
-# Remove before production.
-DEV_ACCESS_TOKEN = "bridgeos-dev-token"
-
-# Deterministic demo user id.
-# Must be a valid UUID string because your database uses UUID ids.
-DEV_USER_ID = "11111111-1111-1111-1111-111111111111"
-DEV_EMAIL = "demo@bridgeos.com"
+from app.config import SUPABASE_JWT_SECRET
 
 
 def get_user(request: Request):
@@ -25,13 +18,31 @@ def get_user(request: Request):
     if not token:
         raise HTTPException(status_code=401, detail="Empty authorization token")
 
-    # TEMP DEV MODE.
-    # Accept our test token so frontend upload/chat can work immediately.
-    if token == DEV_ACCESS_TOKEN:
+    try:
+        payload = pyjwt.decode(
+            token,
+            SUPABASE_JWT_SECRET,
+            algorithms=["HS256"],
+            audience="authenticated"
+        )
+
+        user_id = payload.get("sub")
+        email = payload.get("email")
+
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Token missing user id")
+
         return {
-            "sub": DEV_USER_ID,
-            "email": DEV_EMAIL,
-            "role": "authenticated"
+            "sub": user_id,
+            "email": email,
+            "role": payload.get("role", "authenticated")
         }
 
-    raise HTTPException(status_code=401, detail="Invalid test token")
+    except pyjwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+
+    except pyjwt.InvalidAudienceError:
+        raise HTTPException(status_code=401, detail="Invalid token audience")
+
+    except pyjwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
