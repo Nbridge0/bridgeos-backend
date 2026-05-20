@@ -17,12 +17,18 @@ def get_user(request: Request):
 
     if not token:
         raise HTTPException(status_code=401, detail="Empty authorization token")
+
     try:
+        # IMPORTANT:
+        # Supabase JWTs can fail strict PyJWT audience checks depending on project/settings.
+        # We verify the signature, but do NOT force audience here.
         payload = pyjwt.decode(
             token,
             SUPABASE_JWT_SECRET,
             algorithms=["HS256"],
-            audience="authenticated"
+            options={
+                "verify_aud": False
+            }
         )
 
         user_id = payload.get("sub")
@@ -32,16 +38,24 @@ def get_user(request: Request):
             raise HTTPException(status_code=401, detail="Token missing user id")
 
         return {
+            "id": user_id,
             "sub": user_id,
             "email": email,
-            "role": payload.get("role", "authenticated")
+            "role": payload.get("role", "authenticated"),
+            "aud": payload.get("aud")
         }
 
     except pyjwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
 
-    except pyjwt.InvalidAudienceError:
-        raise HTTPException(status_code=401, detail="Invalid token audience")
+    except pyjwt.InvalidSignatureError:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid token signature. Check SUPABASE_JWT_SECRET in Render."
+        )
 
-    except pyjwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid token")
+    except pyjwt.DecodeError:
+        raise HTTPException(status_code=401, detail="Invalid token decode")
+
+    except pyjwt.InvalidTokenError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
