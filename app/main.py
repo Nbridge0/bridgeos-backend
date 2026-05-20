@@ -79,6 +79,13 @@ class ChatRequest(BaseModel):
 class CreateChatRequest(BaseModel):
     title: Optional[str] = "New Chat"
 
+class DevCreateAdminRequest(BaseModel):
+    email: EmailStr
+    password: str
+    full_name: str = "Test Admin"
+    yacht_name: str = "Test Yacht"
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -102,6 +109,16 @@ async def root():
 @app.post("/auth/signup-admin")
 async def signup_admin(body: SignupAdminRequest):
     return services.signup_admin(
+        email=body.email,
+        password=body.password,
+        full_name=body.full_name,
+        yacht_name=body.yacht_name
+    )
+
+
+@app.post("/auth/dev-create-admin")
+async def dev_create_admin(body: DevCreateAdminRequest):
+    return services.dev_create_admin(
         email=body.email,
         password=body.password,
         full_name=body.full_name,

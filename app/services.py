@@ -91,6 +91,75 @@ def signup_admin(email: str, password: str, full_name: str, yacht_name: str):
         "crew": crew_res.data[0]
     }
 
+def dev_create_admin(email: str, password: str, full_name: str, yacht_name: str):
+    """
+    DEV ONLY.
+
+    Creates a Supabase Auth user, yacht, and crew profile.
+    Use a new email each time while testing.
+
+    If the email already exists, it returns a clear error.
+    """
+
+    try:
+        auth_res = supabase.auth.admin.create_user({
+            "email": email,
+            "password": password,
+            "email_confirm": True
+        })
+    except Exception as e:
+        error_text = str(e)
+
+        if "already been registered" in error_text or "already exists" in error_text:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This email already exists in Supabase Auth. "
+                    "Use a new email or delete this user from Supabase Auth first."
+                )
+            )
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not create Supabase Auth user: {error_text}"
+        )
+
+    if not auth_res.user:
+        raise HTTPException(status_code=500, detail="Supabase did not return a user")
+
+    user_id = auth_res.user.id
+
+    yacht_res = supabase.table("yachts").insert({
+        "name": yacht_name,
+        "owner_id": user_id
+    }).execute()
+
+    if not yacht_res.data:
+        raise HTTPException(status_code=500, detail="Could not create yacht row")
+
+    yacht = yacht_res.data[0]
+
+    crew_res = supabase.table("crew").insert({
+        "id": user_id,
+        "email": email,
+        "full_name": full_name,
+        "yacht_id": yacht["id"],
+        "security_level": 1,
+        "created_by": user_id
+    }).execute()
+
+    if not crew_res.data:
+        raise HTTPException(status_code=500, detail="Could not create crew row")
+
+    return {
+        "message": "Dev admin created successfully",
+        "email": email,
+        "password": password,
+        "user_id": user_id,
+        "yacht": yacht,
+        "crew": crew_res.data[0]
+    }
+
 
 def login(email: str, password: str):
     """
