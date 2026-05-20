@@ -17,7 +17,6 @@ def get_user(request: Request):
 
     if not token:
         raise HTTPException(status_code=401, detail="Empty authorization token")
-
     try:
         payload = pyjwt.decode(
             token,

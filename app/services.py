@@ -141,6 +141,46 @@ def get_crew(user_id: str):
 
     return res.data[0]
 
+def create_chat(crew_id: str, yacht_id: str, title: str = "New Chat"):
+    res = supabase.table("chats").insert({
+        "crew_id": crew_id,
+        "yacht_id": yacht_id,
+        "title": title or "New Chat"
+    }).execute()
+
+    if not res.data:
+        raise HTTPException(status_code=500, detail="Could not create chat")
+
+    chat = res.data[0]
+
+    return {
+        "chat_id": chat["id"],
+        "chat": chat
+    }
+
+
+def list_my_chats(crew_id: str, yacht_id: str):
+    return supabase.table("chats") \
+        .select("*") \
+        .eq("crew_id", crew_id) \
+        .eq("yacht_id", yacht_id) \
+        .order("updated_at", desc=True) \
+        .execute()
+
+
+def verify_chat_access(chat_id: str, crew_id: str, yacht_id: str):
+    res = supabase.table("chats") \
+        .select("*") \
+        .eq("id", chat_id) \
+        .eq("crew_id", crew_id) \
+        .eq("yacht_id", yacht_id) \
+        .execute()
+
+    if not res.data:
+        raise HTTPException(status_code=403, detail="Chat not found or not yours")
+
+    return res.data[0]
+
 
 def create_crew(data: dict):
     """
@@ -344,7 +384,8 @@ def upload_asset(
     yacht_id: str,
     uploaded_by: str,
     mime_type: str | None = None,
-    original_relative_path: str | None = None
+    original_relative_path: str | None = None,
+    chat_id: str | None = None
 ):
     """
     Uploads any file, stores it in Supabase Storage, creates an asset row,
@@ -353,6 +394,12 @@ def upload_asset(
 
     clean_filename = safe_filename(filename)
     file_type = detect_file_type(clean_filename, mime_type)
+    if chat_id:
+        verify_chat_access(
+            chat_id=chat_id,
+            crew_id=uploaded_by,
+            yacht_id=yacht_id
+        )
 
     try:
         file_hash = calculate_file_hash(file)
@@ -363,11 +410,17 @@ def upload_asset(
         )
 
     try:
-        existing = supabase.table("assets") \
+        existing_query = supabase.table("assets") \
             .select("*") \
             .eq("yacht_id", yacht_id) \
-            .eq("file_hash", file_hash) \
-            .execute()
+            .eq("file_hash", file_hash)
+
+        if chat_id:
+            existing_query = existing_query.eq("chat_id", chat_id)
+        else:
+            existing_query = existing_query.is_("chat_id", "null")
+
+        existing = existing_query.execute()
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -381,7 +434,12 @@ def upload_asset(
             "duplicate": True
         }
 
-    path = f"{yacht_id}/assets/{clean_filename}"
+    unique_id = str(uuid.uuid4())
+
+    if chat_id:
+        path = f"{yacht_id}/chats/{chat_id}/assets/{unique_id}-{clean_filename}"
+    else:
+        path = f"{yacht_id}/assets/{unique_id}-{clean_filename}"
 
     try:
         file.seek(0)
@@ -416,6 +474,7 @@ def upload_asset(
     try:
         asset_res = supabase.table("assets").insert({
             "yacht_id": yacht_id,
+            "chat_id": chat_id,
             "uploaded_by": uploaded_by,
             "file_name": clean_filename,
             "original_file_name": filename,
@@ -447,7 +506,8 @@ def upload_asset(
             file=processing_file,
             filename=clean_filename,
             file_type=file_type,
-            yacht_id=yacht_id
+            yacht_id=yacht_id,
+            chat_id=chat_id
         )
     except Exception as e:
         supabase.table("assets").update({
@@ -487,7 +547,8 @@ def process_uploaded_asset(
     file,
     filename: str,
     file_type: str,
-    yacht_id: str
+    yacht_id: str,
+    chat_id: str | None = None
 ):
     """
     Converts a raw uploaded file into searchable memory.
@@ -562,6 +623,7 @@ def process_uploaded_asset(
         create_asset_chunks(
             asset_id=asset_id,
             yacht_id=yacht_id,
+            chat_id=chat_id,
             filename=filename,
             file_type=file_type,
             extracted_text=extracted_text,
@@ -583,6 +645,7 @@ def process_uploaded_asset(
 def create_asset_chunks(
     asset_id: str,
     yacht_id: str,
+    chat_id: str | None,
     filename: str,
     file_type: str,
     extracted_text: str = "",
@@ -609,6 +672,7 @@ Tags: {", ".join(tags)}
     rows.append({
         "asset_id": asset_id,
         "yacht_id": yacht_id,
+        "chat_id": chat_id,
         "content": metadata_content,
         "content_type": "metadata",
         "chunk_index": 0,
@@ -631,6 +695,7 @@ Tags: {", ".join(tags)}
         rows.append({
             "asset_id": asset_id,
             "yacht_id": yacht_id,
+            "chat_id": chat_id,
             "content": content,
             "content_type": "image_caption",
             "chunk_index": 0,
@@ -645,6 +710,7 @@ Tags: {", ".join(tags)}
             rows.append({
                 "asset_id": asset_id,
                 "yacht_id": yacht_id,
+                "chat_id": chat_id,
                 "content": chunk,
                 "content_type": "ocr",
                 "chunk_index": index,
@@ -659,6 +725,7 @@ Tags: {", ".join(tags)}
             rows.append({
                 "asset_id": asset_id,
                 "yacht_id": yacht_id,
+                "chat_id": chat_id,
                 "content": chunk,
                 "content_type": "text",
                 "chunk_index": index,
@@ -926,17 +993,25 @@ def upload_image(file, filename: str, yacht_id: str, uploaded_by: str):
 # ------------------------
 # CHAT SECURE
 # ------------------------
-
-def chat(query: str, crew_id: str, yacht_id: str, security_level: int):
+def chat(
+    query: str,
+    crew_id: str,
+    yacht_id: str,
+    security_level: int,
+    chat_id: str
+):
     """
-    Secure chatbot flow:
-
-    1. Find assets the user can access.
-    2. Detect query filters, like year = 2015.
-    3. Search only authorized asset chunks.
-    4. Send only authorized context to the LLM.
-    5. Return answer plus sources.
+    Secure chat flow:
+    1. Verify this chat belongs to this crew and yacht.
+    2. Search only assets uploaded to this chat.
+    3. Answer only from this chat's files.
     """
+
+    verify_chat_access(
+        chat_id=chat_id,
+        crew_id=crew_id,
+        yacht_id=yacht_id
+    )
 
     accessible_asset_ids = get_accessible_asset_ids(
         crew_id=crew_id,
@@ -950,6 +1025,29 @@ def chat(query: str, crew_id: str, yacht_id: str, security_level: int):
             "sources": []
         }
 
+    chat_assets = supabase.table("assets") \
+        .select("id") \
+        .eq("yacht_id", yacht_id) \
+        .eq("chat_id", chat_id) \
+        .in_("id", accessible_asset_ids) \
+        .execute()
+
+    accessible_asset_ids = [asset["id"] for asset in chat_assets.data]
+
+    if not accessible_asset_ids:
+        return {
+            "answer": FALLBACK_NO_DATA_ANSWER,
+            "sources": []
+        }
+
+    supabase.table("messages").insert({
+        "chat_id": chat_id,
+        "yacht_id": yacht_id,
+        "crew_id": crew_id,
+        "role": "user",
+        "content": query
+    }).execute()
+
     filters = extract_query_filters(query)
     year_filter = filters.get("year")
 
@@ -957,7 +1055,8 @@ def chat(query: str, crew_id: str, yacht_id: str, security_level: int):
         "query_embedding": embed(query),
         "match_count": 12,
         "allowed_asset_ids": accessible_asset_ids,
-        "year_filter": year_filter
+        "year_filter": year_filter,
+        "chat_filter": chat_id
     }).execute()
 
     if not results.data:
@@ -978,6 +1077,18 @@ def chat(query: str, crew_id: str, yacht_id: str, security_level: int):
         query=query,
         context=context
     )
+
+    supabase.table("messages").insert({
+        "chat_id": chat_id,
+        "yacht_id": yacht_id,
+        "crew_id": crew_id,
+        "role": "assistant",
+        "content": answer
+    }).execute()
+
+    supabase.table("chats").update({
+        "updated_at": "now()"
+    }).eq("id", chat_id).eq("crew_id", crew_id).eq("yacht_id", yacht_id).execute()
 
     sources = build_sources_from_asset_results(results.data)
 

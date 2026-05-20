@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, UploadFile, File, HTTPException, Depends
+from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
 from fastapi.middleware.cors import CORSMiddleware
@@ -72,8 +72,12 @@ class AuthorizeAssetRequest(BaseModel):
 
 
 class ChatRequest(BaseModel):
+    chat_id: Optional[str] = None
     query: Optional[str] = None
     message: Optional[str] = None
+
+class CreateChatRequest(BaseModel):
+    title: Optional[str] = "New Chat"
 
 @app.get("/health")
 async def health():
@@ -337,7 +341,9 @@ async def upload_img(
 @app.post("/assets")
 async def upload_asset_api(
     request: Request,
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
+    chat_id: Optional[str] = Form(None),
+    token: HTTPAuthorizationCredentials = Depends(security)
 ):
     user = get_user(request)
 
@@ -358,7 +364,8 @@ async def upload_asset_api(
             filename=file.filename,
             mime_type=file.content_type,
             yacht_id=crew["yacht_id"],
-            uploaded_by=crew["id"]
+            uploaded_by=crew["id"],
+            chat_id=chat_id
         )
 
     except Exception as e:
@@ -370,6 +377,7 @@ async def upload_asset_api(
 async def upload_assets_batch_api(
     request: Request,
     files: list[UploadFile] = File(...),
+    chat_id: Optional[str] = Form(None),
     token: HTTPAuthorizationCredentials = Depends(security)
 ):
     user = get_user(request)
@@ -393,7 +401,8 @@ async def upload_assets_batch_api(
             filename=file.filename,
             mime_type=file.content_type,
             yacht_id=crew["yacht_id"],
-            uploaded_by=crew["id"]
+            uploaded_by=crew["id"],
+            chat_id=chat_id
         )
 
         results.append(result)
@@ -480,10 +489,46 @@ async def authorize_asset(
 
 
 
-
 # ------------------------
 # CHAT
 # ------------------------
+
+@app.post("/chats/new")
+async def create_chat_api(
+    body: CreateChatRequest,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    crew = services.get_crew(user["sub"])
+
+    if not crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.create_chat(
+        crew_id=crew["id"],
+        yacht_id=crew["yacht_id"],
+        title=body.title or "New Chat"
+    )
+
+
+@app.get("/chats/my")
+async def list_my_chats_api(
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    crew = services.get_crew(user["sub"])
+
+    if not crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.list_my_chats(
+        crew_id=crew["id"],
+        yacht_id=crew["yacht_id"]
+    )
 
 @app.post("/chat")
 async def chat_api(
@@ -503,9 +548,13 @@ async def chat_api(
     if not query:
         raise HTTPException(status_code=422, detail="Missing query")
 
+    if not body.chat_id:
+        raise HTTPException(status_code=422, detail="Missing chat_id")
+
     return services.chat(
         query=query,
         crew_id=crew["id"],
         yacht_id=crew["yacht_id"],
-        security_level=crew["security_level"]
+        security_level=crew["security_level"],
+        chat_id=body.chat_id
     )
