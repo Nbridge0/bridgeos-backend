@@ -382,7 +382,9 @@ def create_crew_user(
     email: str,
     password: str,
     full_name: str,
-    security_level: int
+    security_level: int,
+    position: str | None = None,
+    phone_number: str | None = None
 ):
     """
     MAIN account creates SUB accounts under the SAME yacht.
@@ -431,6 +433,8 @@ def create_crew_user(
             "full_name": full_name,
             "yacht_id": admin_crew["yacht_id"],
             "security_level": security_level,
+            "position": position,
+            "phone_number": phone_number,
             "created_by": admin_crew["id"]
         }).execute()
     except Exception as e:

@@ -52,7 +52,8 @@ class CreateCrewUserRequest(BaseModel):
     password: str
     full_name: str
     security_level: int
-
+    position: Optional[str] = None
+    phone_number: Optional[str] = None
 
 class CreateCrewRequest(BaseModel):
     id: Optional[str] = None
@@ -210,7 +211,9 @@ async def create_crew_user(
         email=body.email,
         password=body.password,
         full_name=body.full_name,
-        security_level=body.security_level
+        security_level=body.security_level,
+        position=body.position,
+        phone_number=body.phone_number
     )
 
 
