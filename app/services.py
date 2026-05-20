@@ -196,7 +196,87 @@ def login(email: str, password: str):
         }
     }
 
+def dev_login(email: str, full_name: str = "Test Admin", yacht_name: str = "Test Yacht"):
+    """
+    DEV LOGIN ONLY.
 
+    This bypasses Supabase Auth.
+    It creates/repairs:
+    - yacht
+    - crew profile
+    - JWT token your own auth.py can read
+
+    Remove this before production.
+    """
+
+    user_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, email.lower().strip()))
+
+    crew_res = supabase.table("crew") \
+        .select("*") \
+        .eq("id", user_id) \
+        .execute()
+
+    if crew_res.data:
+        crew = crew_res.data[0]
+    else:
+        yacht_res = supabase.table("yachts") \
+            .select("*") \
+            .eq("owner_id", user_id) \
+            .limit(1) \
+            .execute()
+
+        if yacht_res.data:
+            yacht = yacht_res.data[0]
+        else:
+            yacht_insert = supabase.table("yachts").insert({
+                "name": yacht_name,
+                "owner_id": user_id
+            }).execute()
+
+            if not yacht_insert.data:
+                raise HTTPException(status_code=500, detail="Could not create yacht")
+
+            yacht = yacht_insert.data[0]
+
+        crew_insert = supabase.table("crew").upsert({
+            "id": user_id,
+            "email": email,
+            "full_name": full_name,
+            "yacht_id": yacht["id"],
+            "security_level": 1,
+            "created_by": user_id
+        }).execute()
+
+        if not crew_insert.data:
+            raise HTTPException(status_code=500, detail="Could not create crew profile")
+
+        crew = crew_insert.data[0]
+
+    now = int(time.time())
+
+    token = pyjwt.encode(
+        {
+            "sub": user_id,
+            "email": email,
+            "aud": "authenticated",
+            "role": "authenticated",
+            "iat": now,
+            "exp": now + 60 * 60 * 24 * 30
+        },
+        SUPABASE_JWT_SECRET,
+        algorithm="HS256"
+    )
+
+    return {
+        "access_token": token,
+        "refresh_token": None,
+        "token_type": "bearer",
+        "user": {
+            "id": user_id,
+            "email": email
+        },
+        "crew": crew
+    }
 
 # ------------------------
 # CREW

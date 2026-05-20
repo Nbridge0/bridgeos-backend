@@ -85,6 +85,20 @@ class DevCreateAdminRequest(BaseModel):
     full_name: str = "Test Admin"
     yacht_name: str = "Test Yacht"
 
+class DevLoginRequest(BaseModel):
+    email: EmailStr
+    full_name: Optional[str] = "Test Admin"
+    yacht_name: Optional[str] = "Test Yacht"
+
+
+@app.post("/auth/dev-login")
+async def dev_login(body: DevLoginRequest):
+    return services.dev_login(
+        email=body.email,
+        full_name=body.full_name or "Test Admin",
+        yacht_name=body.yacht_name or "Test Yacht"
+    )
+
 
 @app.get("/health")
 async def health():
