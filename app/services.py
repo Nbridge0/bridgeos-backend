@@ -221,7 +221,7 @@ def dev_login(email: str, full_name: str = "Test Admin", yacht_name: str = "Test
     else:
         yacht_res = supabase.table("yachts") \
             .select("*") \
-            .eq("owner_id", user_id) \
+            .eq("name", yacht_name) \
             .limit(1) \
             .execute()
 
@@ -290,7 +290,14 @@ def get_crew(user_id: str):
 
     return res.data[0]
 
+
+
 def create_chat(crew_id: str, yacht_id: str, title: str = "New Chat"):
+    """
+    Creates a private chat owned by this exact crew member.
+    Even if two users have the same yacht_id, they get separate chats.
+    """
+
     res = supabase.table("chats").insert({
         "crew_id": crew_id,
         "yacht_id": yacht_id,
@@ -309,6 +316,11 @@ def create_chat(crew_id: str, yacht_id: str, title: str = "New Chat"):
 
 
 def list_my_chats(crew_id: str, yacht_id: str):
+    """
+    Lists only chats owned by this logged-in crew member.
+    Same yacht users cannot see each other's chats.
+    """
+
     return supabase.table("chats") \
         .select("*") \
         .eq("crew_id", crew_id) \
@@ -318,6 +330,11 @@ def list_my_chats(crew_id: str, yacht_id: str):
 
 
 def verify_chat_access(chat_id: str, crew_id: str, yacht_id: str):
+    """
+    Blocks access unless the chat belongs to this exact crew member.
+    This is the main privacy check.
+    """
+
     res = supabase.table("chats") \
         .select("*") \
         .eq("id", chat_id) \
@@ -329,6 +346,26 @@ def verify_chat_access(chat_id: str, crew_id: str, yacht_id: str):
         raise HTTPException(status_code=403, detail="Chat not found or not yours")
 
     return res.data[0]
+
+
+def get_chat_messages(chat_id: str, crew_id: str, yacht_id: str):
+    """
+    Loads saved messages only if this chat belongs to this crew member.
+    """
+
+    verify_chat_access(
+        chat_id=chat_id,
+        crew_id=crew_id,
+        yacht_id=yacht_id
+    )
+
+    return supabase.table("messages") \
+        .select("*") \
+        .eq("chat_id", chat_id) \
+        .eq("crew_id", crew_id) \
+        .eq("yacht_id", yacht_id) \
+        .order("created_at") \
+        .execute()
 
 
 def create_crew(data: dict):
@@ -1150,17 +1187,34 @@ def chat(
     chat_id: str
 ):
     """
-    Secure chat flow:
-    1. Verify this chat belongs to this crew and yacht.
-    2. Search only assets uploaded to this chat.
-    3. Answer only from this chat's files.
+    Private saved chat flow:
+
+    - Verifies chat belongs to this crew_id.
+    - Saves user message.
+    - Searches only files attached to this chat.
+    - Saves assistant answer.
+    - Other users on the same yacht cannot see or use this chat.
     """
 
-    verify_chat_access(
+    chat_row = verify_chat_access(
         chat_id=chat_id,
         crew_id=crew_id,
         yacht_id=yacht_id
     )
+
+    supabase.table("messages").insert({
+        "chat_id": chat_id,
+        "yacht_id": yacht_id,
+        "crew_id": crew_id,
+        "role": "user",
+        "content": query
+    }).execute()
+
+    if chat_row.get("title") == "New Chat":
+        supabase.table("chats").update({
+            "title": query[:60],
+            "updated_at": "now()"
+        }).eq("id", chat_id).eq("crew_id", crew_id).eq("yacht_id", yacht_id).execute()
 
     accessible_asset_ids = get_accessible_asset_ids(
         crew_id=crew_id,
@@ -1169,8 +1223,18 @@ def chat(
     )
 
     if not accessible_asset_ids:
+        answer = FALLBACK_NO_DATA_ANSWER
+
+        supabase.table("messages").insert({
+            "chat_id": chat_id,
+            "yacht_id": yacht_id,
+            "crew_id": crew_id,
+            "role": "assistant",
+            "content": answer
+        }).execute()
+
         return {
-            "answer": FALLBACK_NO_DATA_ANSWER,
+            "answer": answer,
             "sources": []
         }
 
@@ -1184,18 +1248,20 @@ def chat(
     accessible_asset_ids = [asset["id"] for asset in chat_assets.data]
 
     if not accessible_asset_ids:
+        answer = FALLBACK_NO_DATA_ANSWER
+
+        supabase.table("messages").insert({
+            "chat_id": chat_id,
+            "yacht_id": yacht_id,
+            "crew_id": crew_id,
+            "role": "assistant",
+            "content": answer
+        }).execute()
+
         return {
-            "answer": FALLBACK_NO_DATA_ANSWER,
+            "answer": answer,
             "sources": []
         }
-
-    supabase.table("messages").insert({
-        "chat_id": chat_id,
-        "yacht_id": yacht_id,
-        "crew_id": crew_id,
-        "role": "user",
-        "content": query
-    }).execute()
 
     filters = extract_query_filters(query)
     year_filter = filters.get("year")
@@ -1209,16 +1275,36 @@ def chat(
     }).execute()
 
     if not results.data:
+        answer = FALLBACK_NO_DATA_ANSWER
+
+        supabase.table("messages").insert({
+            "chat_id": chat_id,
+            "yacht_id": yacht_id,
+            "crew_id": crew_id,
+            "role": "assistant",
+            "content": answer
+        }).execute()
+
         return {
-            "answer": FALLBACK_NO_DATA_ANSWER,
+            "answer": answer,
             "sources": []
         }
 
     context = build_context_from_asset_results(results.data)
 
     if not context.strip():
+        answer = FALLBACK_NO_DATA_ANSWER
+
+        supabase.table("messages").insert({
+            "chat_id": chat_id,
+            "yacht_id": yacht_id,
+            "crew_id": crew_id,
+            "role": "assistant",
+            "content": answer
+        }).execute()
+
         return {
-            "answer": FALLBACK_NO_DATA_ANSWER,
+            "answer": answer,
             "sources": []
         }
 

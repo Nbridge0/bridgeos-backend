@@ -63,10 +63,6 @@ class CreateCrewRequest(BaseModel):
     security_level: Optional[int] = 1
 
 
-class AuthorizeDocumentRequest(BaseModel):
-    crew_id: str
-
-
 class AuthorizeAssetRequest(BaseModel):
     crew_id: str
 
@@ -523,7 +519,6 @@ async def authorize_asset(
 # ------------------------
 # CHAT
 # ------------------------
-
 @app.post("/chats/new")
 async def create_chat_api(
     body: CreateChatRequest,
@@ -561,6 +556,26 @@ async def list_my_chats_api(
         yacht_id=crew["yacht_id"]
     )
 
+
+@app.get("/chats/{chat_id}/messages")
+async def get_chat_messages_api(
+    chat_id: str,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    crew = services.get_crew(user["sub"])
+
+    if not crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.get_chat_messages(
+        chat_id=chat_id,
+        crew_id=crew["id"],
+        yacht_id=crew["yacht_id"]
+    )
+    
 @app.post("/chat")
 async def chat_api(
     body: ChatRequest,
