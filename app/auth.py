@@ -1,7 +1,6 @@
 from fastapi import Request, HTTPException
-import jwt as pyjwt
 
-from app.config import SUPABASE_JWT_SECRET
+from app.database import supabase
 
 
 def get_user(request: Request):
@@ -19,43 +18,26 @@ def get_user(request: Request):
         raise HTTPException(status_code=401, detail="Empty authorization token")
 
     try:
-        # IMPORTANT:
-        # Supabase JWTs can fail strict PyJWT audience checks depending on project/settings.
-        # We verify the signature, but do NOT force audience here.
-        payload = pyjwt.decode(
-            token,
-            SUPABASE_JWT_SECRET,
-            algorithms=["HS256"],
-            options={
-                "verify_aud": False
-            }
-        )
+        auth_res = supabase.auth.get_user(token)
 
-        user_id = payload.get("sub")
-        email = payload.get("email")
+        if not auth_res or not auth_res.user:
+            raise HTTPException(status_code=401, detail="Invalid Supabase user token")
 
-        if not user_id:
-            raise HTTPException(status_code=401, detail="Token missing user id")
+        user = auth_res.user
 
         return {
-            "id": user_id,
-            "sub": user_id,
-            "email": email,
-            "role": payload.get("role", "authenticated"),
-            "aud": payload.get("aud")
+            "id": user.id,
+            "sub": user.id,
+            "email": user.email,
+            "role": "authenticated",
+            "aud": "authenticated"
         }
 
-    except pyjwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
+    except HTTPException:
+        raise
 
-    except pyjwt.InvalidSignatureError:
+    except Exception as e:
         raise HTTPException(
             status_code=401,
-            detail="Invalid token signature. Check SUPABASE_JWT_SECRET in Render."
+            detail=f"Could not verify Supabase token: {str(e)}"
         )
-
-    except pyjwt.DecodeError:
-        raise HTTPException(status_code=401, detail="Invalid token decode")
-
-    except pyjwt.InvalidTokenError as e:
-        raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
