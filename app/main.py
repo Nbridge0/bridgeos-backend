@@ -93,6 +93,17 @@ class DevLoginRequest(BaseModel):
     full_name: Optional[str] = "Test Admin"
     yacht_name: Optional[str] = "Test Yacht"
 
+class UpdateCrewUserRequest(BaseModel):
+    email: Optional[EmailStr] = None
+    full_name: Optional[str] = None
+    security_level: Optional[int] = None
+    position: Optional[str] = None
+    phone_number: Optional[str] = None
+
+
+class ResetCrewPasswordRequest(BaseModel):
+    password: str
+
 
 @app.post("/auth/dev-login")
 async def dev_login(body: DevLoginRequest):
@@ -247,6 +258,69 @@ async def repair_admin_login(body: RepairAdminLoginRequest):
         yacht_name=body.yacht_name
     )
 
+@app.patch("/crew/{crew_id}")
+async def update_crew_user_api(
+    crew_id: str,
+    body: UpdateCrewUserRequest,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.update_crew_user(
+        admin_crew=admin_crew,
+        target_crew_id=crew_id,
+        email=body.email,
+        full_name=body.full_name,
+        security_level=body.security_level,
+        position=body.position,
+        phone_number=body.phone_number
+    )
+
+
+@app.post("/crew/{crew_id}/reset-password")
+async def reset_crew_password_api(
+    crew_id: str,
+    body: ResetCrewPasswordRequest,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.reset_crew_password(
+        admin_crew=admin_crew,
+        target_crew_id=crew_id,
+        new_password=body.password
+    )
+
+
+@app.delete("/crew/{crew_id}")
+async def delete_crew_user_api(
+    crew_id: str,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.delete_crew_user(
+        admin_crew=admin_crew,
+        target_crew_id=crew_id
+    )
 
 # ------------------------
 # AUTHORIZE DOCUMENT ACCESS

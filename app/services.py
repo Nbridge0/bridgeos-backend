@@ -614,6 +614,217 @@ def list_crew_for_yacht(admin_crew: dict):
         .eq("yacht_id", admin_crew["yacht_id"]) \
         .execute()
 
+def _require_admin_level_1(admin_crew: dict):
+    if int(admin_crew["security_level"]) != 1:
+        raise HTTPException(
+            status_code=403,
+            detail="Only Tier 1 admins can manage users"
+        )
+
+
+def _get_target_crew_for_admin(admin_crew: dict, target_crew_id: str):
+    target_res = supabase.table("crew") \
+        .select("*") \
+        .eq("id", target_crew_id) \
+        .eq("yacht_id", admin_crew["yacht_id"]) \
+        .execute()
+
+    if not target_res.data:
+        raise HTTPException(
+            status_code=404,
+            detail="Crew member not found for this yacht"
+        )
+
+    return target_res.data[0]
+
+
+def update_crew_user(
+    admin_crew: dict,
+    target_crew_id: str,
+    email: str | None = None,
+    full_name: str | None = None,
+    security_level: int | None = None,
+    position: str | None = None,
+    phone_number: str | None = None
+):
+    """
+    Tier 1 admin updates a crew user's profile.
+    Also updates Supabase Auth email if email is changed.
+    """
+
+    _require_admin_level_1(admin_crew)
+
+    target_crew = _get_target_crew_for_admin(
+        admin_crew=admin_crew,
+        target_crew_id=target_crew_id
+    )
+
+    updates = {}
+
+    if email is not None:
+        updates["email"] = email
+
+    if full_name is not None:
+        updates["full_name"] = full_name
+
+    if security_level is not None:
+        security_level = int(security_level)
+
+        if security_level not in [1, 2, 3]:
+            raise HTTPException(
+                status_code=400,
+                detail="security_level must be 1, 2, or 3"
+            )
+
+        updates["security_level"] = security_level
+
+    if position is not None:
+        updates["position"] = position
+
+    if phone_number is not None:
+        updates["phone_number"] = phone_number
+
+    if not updates:
+        return {
+            "message": "No changes provided",
+            "crew": target_crew
+        }
+
+    if email is not None:
+        try:
+            supabase.auth.admin.update_user_by_id(
+                target_crew_id,
+                {
+                    "email": email,
+                    "email_confirm": True
+                }
+            )
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Could not update Supabase Auth email: {str(e)}"
+            )
+
+    try:
+        crew_res = supabase.table("crew") \
+            .update(updates) \
+            .eq("id", target_crew_id) \
+            .eq("yacht_id", admin_crew["yacht_id"]) \
+            .execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not update crew profile: {str(e)}"
+        )
+
+    if not crew_res.data:
+        raise HTTPException(
+            status_code=400,
+            detail="Could not update crew profile"
+        )
+
+    return {
+        "message": "User updated successfully",
+        "crew": crew_res.data[0]
+    }
+
+
+def reset_crew_password(
+    admin_crew: dict,
+    target_crew_id: str,
+    new_password: str
+):
+    """
+    Tier 1 admin resets a crew user's Supabase Auth password.
+    """
+
+    _require_admin_level_1(admin_crew)
+
+    _get_target_crew_for_admin(
+        admin_crew=admin_crew,
+        target_crew_id=target_crew_id
+    )
+
+    if not new_password or len(new_password) < 8:
+        raise HTTPException(
+            status_code=400,
+            detail="Password must be at least 8 characters"
+        )
+
+    try:
+        supabase.auth.admin.update_user_by_id(
+            target_crew_id,
+            {
+                "password": new_password
+            }
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not reset password: {str(e)}"
+        )
+
+    return {
+        "message": "Password reset successfully"
+    }
+
+
+def delete_crew_user(
+    admin_crew: dict,
+    target_crew_id: str
+):
+    """
+    Tier 1 admin deletes a crew user from:
+    1. crew table
+    2. Supabase Auth
+
+    Admin cannot delete themselves.
+    """
+
+    _require_admin_level_1(admin_crew)
+
+    if target_crew_id == admin_crew["id"]:
+        raise HTTPException(
+            status_code=400,
+            detail="You cannot delete your own admin account"
+        )
+
+    target_crew = _get_target_crew_for_admin(
+        admin_crew=admin_crew,
+        target_crew_id=target_crew_id
+    )
+
+    try:
+        supabase.table("crew") \
+            .delete() \
+            .eq("id", target_crew_id) \
+            .eq("yacht_id", admin_crew["yacht_id"]) \
+            .execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not delete crew profile: {str(e)}"
+        )
+
+    try:
+        supabase.auth.admin.delete_user(target_crew_id)
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Crew profile was deleted, but Supabase Auth user could not be deleted: "
+                f"{str(e)}"
+            )
+        )
+
+    return {
+        "message": "User deleted successfully",
+        "deleted_user": {
+            "id": target_crew_id,
+            "email": target_crew.get("email")
+        }
+    }
+
 def get_accessible_asset_ids(crew_id: str, yacht_id: str, security_level: int):
     """
     Level 1:
