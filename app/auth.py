@@ -1,6 +1,7 @@
 from fastapi import Request, HTTPException
+from supabase import create_client
 
-from app.database import supabase
+from app.config import SUPABASE_URL, SUPABASE_SERVICE_KEY
 
 
 def get_user(request: Request):
@@ -18,7 +19,11 @@ def get_user(request: Request):
         raise HTTPException(status_code=401, detail="Empty authorization token")
 
     try:
-        auth_res = supabase.auth.get_user(token)
+        # Separate client used ONLY for checking the incoming access token.
+        # Do not import or use app.database.supabase here.
+        auth_client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+
+        auth_res = auth_client.auth.get_user(token)
 
         if not auth_res or not auth_res.user:
             raise HTTPException(status_code=401, detail="Invalid Supabase user token")
