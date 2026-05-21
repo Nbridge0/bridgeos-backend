@@ -63,6 +63,12 @@ class CreateCrewRequest(BaseModel):
     role: Optional[str] = "crew"
     security_level: Optional[int] = 1
 
+class RepairAdminLoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+    full_name: str
+    yacht_name: str
+
 
 class AuthorizeAssetRequest(BaseModel):
     crew_id: str
@@ -231,6 +237,15 @@ async def list_crew(request: Request):
         raise HTTPException(status_code=403, detail="No access")
 
     return services.list_crew_for_yacht(admin_crew)
+
+@app.post("/auth/repair-admin-login")
+async def repair_admin_login(body: RepairAdminLoginRequest):
+    return services.repair_admin_login(
+        email=body.email,
+        password=body.password,
+        full_name=body.full_name,
+        yacht_name=body.yacht_name
+    )
 
 
 # ------------------------

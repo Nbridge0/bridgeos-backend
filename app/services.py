@@ -414,6 +414,105 @@ def get_chat_messages(chat_id: str, crew_id: str, yacht_id: str):
         .order("created_at") \
         .execute()
 
+def repair_admin_login(email: str, password: str, full_name: str, yacht_name: str):
+    """
+    TEMP SETUP / REPAIR LOGIN.
+
+    Use when Supabase Auth user exists, but crew/yacht rows are missing.
+
+    It:
+    1. Logs in with Supabase Auth
+    2. Gets the real Supabase user id
+    3. Creates or reuses yacht
+    4. Creates or repairs crew profile with security_level = 1
+    5. Returns the normal Supabase access token
+
+    Remove or protect this route after setup.
+    """
+
+    try:
+        auth_res = supabase.auth.sign_in_with_password({
+            "email": email,
+            "password": password
+        })
+    except Exception as e:
+        raise HTTPException(
+            status_code=401,
+            detail=f"Supabase login failed: {str(e)}"
+        )
+
+    if not auth_res or not getattr(auth_res, "session", None):
+        raise HTTPException(status_code=401, detail="No Supabase session returned")
+
+    if not auth_res.user:
+        raise HTTPException(status_code=401, detail="No Supabase user returned")
+
+    user_id = auth_res.user.id
+
+    crew_res = supabase.table("crew") \
+        .select("*") \
+        .eq("id", user_id) \
+        .execute()
+
+    if crew_res.data:
+        crew = crew_res.data[0]
+
+        return {
+            "message": "Login successful. Crew profile already exists.",
+            "access_token": auth_res.session.access_token,
+            "refresh_token": auth_res.session.refresh_token,
+            "token_type": "bearer",
+            "user": {
+                "id": user_id,
+                "email": auth_res.user.email or email
+            },
+            "crew": crew
+        }
+
+    yacht_res = supabase.table("yachts") \
+        .select("*") \
+        .eq("owner_id", user_id) \
+        .limit(1) \
+        .execute()
+
+    if yacht_res.data:
+        yacht = yacht_res.data[0]
+    else:
+        yacht_insert = supabase.table("yachts").insert({
+            "name": yacht_name,
+            "owner_id": user_id
+        }).execute()
+
+        if not yacht_insert.data:
+            raise HTTPException(status_code=500, detail="Could not create yacht row")
+
+        yacht = yacht_insert.data[0]
+
+    crew_insert = supabase.table("crew").insert({
+        "id": user_id,
+        "email": email,
+        "full_name": full_name,
+        "yacht_id": yacht["id"],
+        "security_level": 1,
+        "created_by": user_id
+    }).execute()
+
+    if not crew_insert.data:
+        raise HTTPException(status_code=500, detail="Could not create crew row")
+
+    return {
+        "message": "Login successful. Admin crew profile repaired.",
+        "access_token": auth_res.session.access_token,
+        "refresh_token": auth_res.session.refresh_token,
+        "token_type": "bearer",
+        "user": {
+            "id": user_id,
+            "email": auth_res.user.email or email
+        },
+        "crew": crew_insert.data[0],
+        "yacht": yacht
+    }
+
 
 def create_crew(data: dict):
     """
