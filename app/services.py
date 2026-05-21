@@ -281,16 +281,28 @@ def dev_login(email: str, full_name: str = "Test Admin", yacht_name: str = "Test
 # ------------------------
 # CREW
 # ------------------------
-
 def get_crew(user_id: str):
-    res = supabase.table("crew").select("*").eq("id", user_id).execute()
+    crew_res = supabase.table("crew") \
+        .select("*") \
+        .eq("id", user_id) \
+        .execute()
 
-    if not res.data:
+    if not crew_res.data:
         return None
 
-    return res.data[0]
+    crew = crew_res.data[0]
 
+    yacht_res = supabase.table("yachts") \
+        .select("name") \
+        .eq("id", crew["yacht_id"]) \
+        .execute()
 
+    crew["yacht_name"] = None
+
+    if yacht_res.data:
+        crew["yacht_name"] = yacht_res.data[0].get("name")
+
+    return crew
 
 def create_chat(crew_id: str, yacht_id: str, title: str = "New Chat"):
     """
