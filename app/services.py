@@ -1003,7 +1003,8 @@ def seed_text_asset(
     file_name: str,
     content: str,
     yacht_id: str,
-    uploaded_by: str
+    uploaded_by: str,
+    security_level: int = 1
 ):
     """
     TEMP DEV FUNCTION.
@@ -1018,6 +1019,14 @@ def seed_text_asset(
 
     if not content or not content.strip():
         raise HTTPException(status_code=400, detail="Content is required")
+
+    security_level = int(security_level)
+
+    if security_level not in [1, 2, 3]:
+        raise HTTPException(
+            status_code=400,
+            detail="security_level must be 1, 2, or 3"
+        )
 
     clean_filename = safe_filename(file_name or "seeded_asset.txt")
     unique_id = str(uuid.uuid4())
@@ -1056,6 +1065,7 @@ def seed_text_asset(
             "yacht_id": yacht_id,
             "chat_id": None,
             "uploaded_by": uploaded_by,
+            "security_level": security_level,
             "file_name": clean_filename,
             "original_file_name": clean_filename,
             "original_relative_path": None,
@@ -1102,6 +1112,7 @@ Tags: {", ".join(tags)}
         "asset_id": asset["id"],
         "yacht_id": yacht_id,
         "chat_id": None,
+        "security_level": security_level,
         "content": metadata_content,
         "content_type": "metadata",
         "chunk_index": 0,
@@ -1116,6 +1127,7 @@ Tags: {", ".join(tags)}
             "asset_id": asset["id"],
             "yacht_id": yacht_id,
             "chat_id": None,
+            "security_level": security_level,
             "content": chunk,
             "content_type": "text",
             "chunk_index": index,
@@ -1152,7 +1164,8 @@ def upload_asset(
     uploaded_by: str,
     mime_type: str | None = None,
     original_relative_path: str | None = None,
-    chat_id: str | None = None
+    chat_id: str | None = None,
+    security_level: int = 1
 ):
     """
     Uploads any file, stores it in Supabase Storage, creates an asset row,
@@ -1161,6 +1174,14 @@ def upload_asset(
 
     clean_filename = safe_filename(filename)
     file_type = detect_file_type(clean_filename, mime_type)
+    security_level = int(security_level)
+
+    if security_level not in [1, 2, 3]:
+        raise HTTPException(
+            status_code=400,
+            detail="security_level must be 1, 2, or 3"
+        )
+        
     if chat_id:
         verify_chat_access(
             chat_id=chat_id,
@@ -1255,6 +1276,7 @@ def upload_asset(
             "yacht_id": yacht_id,
             "chat_id": chat_id,
             "uploaded_by": uploaded_by,
+            "security_level": security_level,
             "file_name": clean_filename,
             "original_file_name": filename,
             "original_relative_path": original_relative_path,
@@ -1286,7 +1308,8 @@ def upload_asset(
             filename=clean_filename,
             file_type=file_type,
             yacht_id=yacht_id,
-            chat_id=chat_id
+            chat_id=chat_id,
+            security_level=security_level
         )
     except Exception as e:
         supabase.table("assets").update({
@@ -1327,7 +1350,8 @@ def process_uploaded_asset(
     filename: str,
     file_type: str,
     yacht_id: str,
-    chat_id: str | None = None
+    chat_id: str | None = None,
+    security_level: int = 1
 ):
     """
     Converts a raw uploaded file into searchable memory.
@@ -1410,7 +1434,8 @@ def process_uploaded_asset(
             ocr_text=ocr_text,
             detected_date=detected_date,
             detected_year=detected_year,
-            tags=tags
+            tags=tags,
+            security_level=security_level
         )
 
     except Exception as e:
@@ -1432,7 +1457,8 @@ def create_asset_chunks(
     ocr_text: str = "",
     detected_date=None,
     detected_year: int | None = None,
-    tags: list[str] | None = None
+    tags: list[str] | None = None,
+    security_level: int = 1
 ):
     """
     Creates searchable chunks for asset metadata, text, OCR, and image captions.
@@ -1452,6 +1478,7 @@ Tags: {", ".join(tags)}
         "asset_id": asset_id,
         "yacht_id": yacht_id,
         "chat_id": chat_id,
+        "security_level": security_level,
         "content": metadata_content,
         "content_type": "metadata",
         "chunk_index": 0,
@@ -1475,6 +1502,7 @@ Tags: {", ".join(tags)}
             "asset_id": asset_id,
             "yacht_id": yacht_id,
             "chat_id": chat_id,
+            "security_level": security_level,
             "content": content,
             "content_type": "image_caption",
             "chunk_index": 0,
@@ -1490,6 +1518,7 @@ Tags: {", ".join(tags)}
                 "asset_id": asset_id,
                 "yacht_id": yacht_id,
                 "chat_id": chat_id,
+                "security_level": security_level,
                 "content": chunk,
                 "content_type": "ocr",
                 "chunk_index": index,
@@ -1505,6 +1534,7 @@ Tags: {", ".join(tags)}
                 "asset_id": asset_id,
                 "yacht_id": yacht_id,
                 "chat_id": chat_id,
+                "security_level": security_level,
                 "content": chunk,
                 "content_type": "text",
                 "chunk_index": index,
@@ -1620,33 +1650,51 @@ def authorize_document_access(
     }).execute()
 
 
-def get_accessible_document_ids(crew_id: str, yacht_id: str, security_level: int):
+def get_accessible_asset_ids(crew_id: str, yacht_id: str, security_level: int):
     """
-    Level 1:
-        Can access all documents for the yacht.
+    File security model:
 
-    Level 2 and 3:
-        Can only access documents explicitly granted in document_access.
+    User Tier 1:
+        Can access files with security_level 1, 2, or 3.
+
+    User Tier 2:
+        Can access files with security_level 2 or 3.
+
+    User Tier 3:
+        Can access files with security_level 3 only.
+
+    Extra explicit access:
+        Level 2/3 users may also access assets granted in asset_access.
     """
 
     security_level = int(security_level)
 
-    if security_level == 1:
-        docs = supabase.table("documents") \
-            .select("id") \
-            .eq("yacht_id", yacht_id) \
-            .execute()
+    if security_level not in [1, 2, 3]:
+        return []
 
-        return [doc["id"] for doc in docs.data]
-
-    access = supabase.table("document_access") \
-        .select("document_id, documents!inner(yacht_id)") \
-        .eq("crew_id", crew_id) \
-        .eq("documents.yacht_id", yacht_id) \
+    # Tier rule:
+    # lower number = more powerful user
+    # lower number file = more sensitive file
+    base_assets = supabase.table("assets") \
+        .select("id") \
+        .eq("yacht_id", yacht_id) \
+        .gte("security_level", security_level) \
         .execute()
 
-    return [row["document_id"] for row in access.data]
+    allowed_ids = {asset["id"] for asset in (base_assets.data or [])}
 
+    # Optional explicit grants.
+    # Useful if a Tier 3 user needs one specific Tier 1 or Tier 2 file.
+    access = supabase.table("asset_access") \
+        .select("asset_id, assets!inner(yacht_id)") \
+        .eq("crew_id", crew_id) \
+        .eq("assets.yacht_id", yacht_id) \
+        .execute()
+
+    for row in access.data or []:
+        allowed_ids.add(row["asset_id"])
+
+    return list(allowed_ids)
 
 def list_documents_for_admin(admin_crew: dict):
     """

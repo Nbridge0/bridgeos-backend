@@ -110,7 +110,7 @@ class ResetCrewPasswordRequest(BaseModel):
 class SeedAssetRequest(BaseModel):
     file_name: str
     content: str
-
+    security_level: int = 1
 
 @app.post("/auth/dev-login")
 async def dev_login(body: DevLoginRequest):
@@ -469,6 +469,7 @@ async def upload_asset_api(
     request: Request,
     file: UploadFile = File(...),
     chat_id: Optional[str] = Form(None),
+    security_level: int = Form(1),
     token: HTTPAuthorizationCredentials = Depends(security)
 ):
     user = get_user(request)
@@ -491,9 +492,9 @@ async def upload_asset_api(
             mime_type=file.content_type,
             yacht_id=crew["yacht_id"],
             uploaded_by=crew["id"],
-            chat_id=chat_id
+            chat_id=chat_id,
+            security_level=security_level
         )
-
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -504,6 +505,7 @@ async def upload_assets_batch_api(
     request: Request,
     files: list[UploadFile] = File(...),
     chat_id: Optional[str] = Form(None),
+    security_level: int = Form(1),
     token: HTTPAuthorizationCredentials = Depends(security)
 ):
     user = get_user(request)
@@ -528,9 +530,9 @@ async def upload_assets_batch_api(
             mime_type=file.content_type,
             yacht_id=crew["yacht_id"],
             uploaded_by=crew["id"],
-            chat_id=chat_id
+            chat_id=chat_id,
+            security_level=security_level
         )
-
         results.append(result)
 
     return {
@@ -654,9 +656,9 @@ async def seed_asset_api(
         file_name=body.file_name,
         content=body.content,
         yacht_id=crew["yacht_id"],
-        uploaded_by=crew["id"]
+        uploaded_by=crew["id"],
+        security_level=body.security_level
     )
-
 # ------------------------
 # CHAT
 # ------------------------
