@@ -999,6 +999,152 @@ def create_asset_signed_url(asset_id: str, crew: dict):
         "signed_url": signed_url
     }
 
+def seed_text_asset(
+    file_name: str,
+    content: str,
+    yacht_id: str,
+    uploaded_by: str
+):
+    """
+    TEMP DEV FUNCTION.
+
+    Creates a searchable text asset directly in the database,
+    without using file upload or Supabase Storage.
+
+    Remove before production.
+    """
+
+    import hashlib
+
+    if not content or not content.strip():
+        raise HTTPException(status_code=400, detail="Content is required")
+
+    clean_filename = safe_filename(file_name or "seeded_asset.txt")
+    unique_id = str(uuid.uuid4())
+
+    file_hash = hashlib.sha256(
+        f"{yacht_id}:{clean_filename}:{content}".encode("utf-8")
+    ).hexdigest()
+
+    detected_year = extract_year_from_text(content)
+    detected_event = detect_event(content)
+    tags = generate_basic_tags(content)
+
+    storage_path = f"{yacht_id}/seeded/{unique_id}-{clean_filename}"
+
+    try:
+        existing = supabase.table("assets") \
+            .select("*") \
+            .eq("yacht_id", yacht_id) \
+            .eq("file_hash", file_hash) \
+            .execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not check duplicate seeded asset: {str(e)}"
+        )
+
+    if existing.data:
+        return {
+            "message": "Seeded asset already exists",
+            "asset": existing.data[0],
+            "duplicate": True
+        }
+
+    try:
+        asset_res = supabase.table("assets").insert({
+            "yacht_id": yacht_id,
+            "chat_id": None,
+            "uploaded_by": uploaded_by,
+            "file_name": clean_filename,
+            "original_file_name": clean_filename,
+            "original_relative_path": None,
+            "file_hash": file_hash,
+            "file_type": "text",
+            "mime_type": "text/plain",
+            "storage_path": storage_path,
+            "file_url": None,
+            "extracted_text": content,
+            "visual_description": None,
+            "ocr_text": None,
+            "detected_date": None,
+            "detected_year": detected_year,
+            "detected_month": None,
+            "detected_day": None,
+            "date_source": None,
+            "detected_event": detected_event,
+            "tags": tags,
+            "summary": content[:1500],
+            "processing_status": "processed",
+            "processing_error": None
+        }).execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not insert seeded asset row: {str(e)}"
+        )
+
+    if not asset_res.data:
+        raise HTTPException(status_code=500, detail="Could not save seeded asset")
+
+    asset = asset_res.data[0]
+
+    rows = []
+
+    metadata_content = f"""
+File name: {clean_filename}
+File type: text
+Detected year: {detected_year or ""}
+Tags: {", ".join(tags)}
+""".strip()
+
+    rows.append({
+        "asset_id": asset["id"],
+        "yacht_id": yacht_id,
+        "chat_id": None,
+        "content": metadata_content,
+        "content_type": "metadata",
+        "chunk_index": 0,
+        "detected_date": None,
+        "detected_year": detected_year,
+        "tags": tags,
+        "embedding": embed(metadata_content)
+    })
+
+    for index, chunk in enumerate(chunk_text(content)):
+        rows.append({
+            "asset_id": asset["id"],
+            "yacht_id": yacht_id,
+            "chat_id": None,
+            "content": chunk,
+            "content_type": "text",
+            "chunk_index": index,
+            "detected_date": None,
+            "detected_year": detected_year,
+            "tags": tags,
+            "embedding": embed(chunk)
+        })
+
+    try:
+        supabase.table("asset_chunks").insert(rows).execute()
+    except Exception as e:
+        supabase.table("assets").update({
+            "processing_status": "failed",
+            "processing_error": f"Could not insert seeded chunks: {str(e)}"
+        }).eq("id", asset["id"]).execute()
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not insert seeded asset chunks: {str(e)}"
+        )
+
+    return {
+        "message": "Seeded asset created successfully",
+        "asset": asset,
+        "chunks_created": len(rows),
+        "duplicate": False
+    }
+
 def upload_asset(
     file,
     filename: str,

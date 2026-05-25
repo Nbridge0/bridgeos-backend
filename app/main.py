@@ -107,6 +107,10 @@ class UpdateCrewUserRequest(BaseModel):
 class ResetCrewPasswordRequest(BaseModel):
     password: str
 
+class SeedAssetRequest(BaseModel):
+    file_name: str
+    content: str
+
 
 @app.post("/auth/dev-login")
 async def dev_login(body: DevLoginRequest):
@@ -627,7 +631,31 @@ async def authorize_asset(
         yacht_id=admin_crew["yacht_id"]
     )
 
+@app.post("/dev/seed-asset")
+async def seed_asset_api(
+    body: SeedAssetRequest,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
 
+    crew = services.get_crew(user["sub"])
+
+    if not crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    if int(crew["security_level"]) != 1:
+        raise HTTPException(
+            status_code=403,
+            detail="Only security level 1 can seed assets"
+        )
+
+    return services.seed_text_asset(
+        file_name=body.file_name,
+        content=body.content,
+        yacht_id=crew["yacht_id"],
+        uploaded_by=crew["id"]
+    )
 
 # ------------------------
 # CHAT
