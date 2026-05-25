@@ -26,7 +26,10 @@ import time
 import uuid
 import jwt as pyjwt
 
-from app.config import SUPABASE_JWT_SECRET
+from app.config import SUPABASE_JWT_SECRET, SUPABASE_URL, SUPABASE_ANON_KEY
+from supabase import create_client
+
+auth_supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
 # ------------------------
 # YACHT
@@ -54,7 +57,7 @@ def signup_admin(email: str, password: str, full_name: str, yacht_name: str):
     """
 
     try:
-        auth_res = supabase.auth.sign_up({
+        auth_res = auth_supabase.auth.sign_up({
             "email": email,
             "password": password
         })
