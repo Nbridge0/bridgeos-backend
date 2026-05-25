@@ -4,6 +4,9 @@ from supabase import create_client
 from app.config import SUPABASE_URL, SUPABASE_SERVICE_KEY
 
 
+auth_client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+
+
 def get_user(request: Request):
     auth_header = request.headers.get("Authorization")
 
@@ -13,16 +16,12 @@ def get_user(request: Request):
     if not auth_header.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid authorization header")
 
-    token = auth_header.replace("Bearer ", "").strip()
+    token = auth_header.replace("Bearer ", "", 1).strip()
 
     if not token:
         raise HTTPException(status_code=401, detail="Empty authorization token")
 
     try:
-        # Separate client used ONLY for checking the incoming access token.
-        # Do not import or use app.database.supabase here.
-        auth_client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-
         auth_res = auth_client.auth.get_user(token)
 
         if not auth_res or not auth_res.user:
@@ -41,8 +40,8 @@ def get_user(request: Request):
     except HTTPException:
         raise
 
-    except Exception as e:
+    except Exception:
         raise HTTPException(
             status_code=401,
-            detail=f"Could not verify Supabase token: {str(e)}"
+            detail="Could not verify Supabase token"
         )

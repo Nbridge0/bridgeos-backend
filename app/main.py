@@ -82,6 +82,9 @@ class ChatRequest(BaseModel):
 class CreateChatRequest(BaseModel):
     title: Optional[str] = "New Chat"
 
+class AuthorizeDocumentRequest(BaseModel):
+    crew_id: str
+
 class DevCreateAdminRequest(BaseModel):
     email: EmailStr
     password: str
@@ -577,6 +580,24 @@ async def asset_status(
     return services.get_asset_status(
         asset_id=asset_id,
         yacht_id=crew["yacht_id"]
+    )
+
+@app.get("/assets/{asset_id}/signed-url")
+async def get_asset_signed_url_api(
+    asset_id: str,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    crew = services.get_crew(user["sub"])
+
+    if not crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.create_asset_signed_url(
+        asset_id=asset_id,
+        crew=crew
     )
 
 @app.post("/assets/{asset_id}/authorize")

@@ -925,6 +925,54 @@ def get_asset_status(asset_id: str, yacht_id: str):
 
     return res.data[0]
 
+def create_asset_signed_url(asset_id: str, crew: dict):
+    """
+    Creates a temporary signed URL for a private asset.
+
+    Security:
+    - Checks the asset is accessible to this crew member.
+    - Checks the asset belongs to the same yacht.
+    - Does not expose permanent public URLs.
+    """
+
+    accessible_asset_ids = get_accessible_asset_ids(
+        crew_id=crew["id"],
+        yacht_id=crew["yacht_id"],
+        security_level=crew["security_level"]
+    )
+
+    if asset_id not in accessible_asset_ids:
+        raise HTTPException(status_code=403, detail="No access to this asset")
+
+    asset_res = supabase.table("assets") \
+        .select("id, yacht_id, storage_path") \
+        .eq("id", asset_id) \
+        .eq("yacht_id", crew["yacht_id"]) \
+        .execute()
+
+    if not asset_res.data:
+        raise HTTPException(status_code=404, detail="Asset not found")
+
+    asset = asset_res.data[0]
+
+    signed = supabase.storage.from_(BUCKET_NAME).create_signed_url(
+        asset["storage_path"],
+        60 * 5
+    )
+
+    signed_url = signed.get("signedURL") or signed.get("signed_url")
+
+    if not signed_url:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not create signed URL"
+        )
+
+    return {
+        "asset_id": asset_id,
+        "signed_url": signed_url
+    }
+
 def upload_asset(
     file,
     filename: str,
@@ -1014,9 +1062,21 @@ def upload_asset(
         )
 
     try:
-        url = supabase.storage.from_(BUCKET_NAME).get_public_url(path)
-    except Exception:
-        url = None
+        supabase.storage.from_(BUCKET_NAME).upload(
+            path,
+            file_bytes,
+            file_options={
+                "content-type": mime_type or "application/octet-stream",
+                "upsert": "true"
+            }
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Supabase Storage upload failed. Check bucket '{BUCKET_NAME}'. Error: {str(e)}"
+        )
+
+    url = None
 
     try:
         asset_res = supabase.table("assets").insert({
@@ -1286,6 +1346,15 @@ Tags: {", ".join(tags)}
         supabase.table("asset_chunks").insert(rows).execute()
 
 def build_context_from_asset_results(results: list[dict]) -> str:
+    """
+    Builds the private context sent to the LLM.
+
+    Important:
+    - Do not include file_url.
+    - Do not include storage_path.
+    - Only include text/chunks that already passed yacht/user access checks.
+    """
+
     parts = []
 
     for index, row in enumerate(results, start=1):
@@ -1295,7 +1364,6 @@ File name: {row.get("file_name")}
 File type: {row.get("file_type")}
 Content type: {row.get("content_type")}
 Detected year: {row.get("detected_year")}
-File URL: {row.get("file_url")}
 
 Content:
 {row.get("content")}
@@ -1305,8 +1373,17 @@ Content:
 
     return "\n\n---\n\n".join(parts)
 
-
 def build_sources_from_asset_results(results: list[dict]) -> list[dict]:
+    """
+    Builds the sources returned to the frontend.
+
+    Important:
+    - Do not return file_url.
+    - Do not return storage_path.
+    - The frontend should only receive safe metadata.
+    - If the frontend needs to open the file, it must call the signed-url endpoint.
+    """
+
     seen = set()
     sources = []
 
@@ -1322,15 +1399,12 @@ def build_sources_from_asset_results(results: list[dict]) -> list[dict]:
             "asset_id": asset_id,
             "file_name": row.get("file_name"),
             "file_type": row.get("file_type"),
-            "file_url": row.get("file_url"),
-            "storage_path": row.get("storage_path"),
             "content_type": row.get("content_type"),
             "detected_year": row.get("detected_year"),
             "matched_content": row.get("content")
         })
 
     return sources
-
 
 # ------------------------
 # DOCUMENT ACCESS
@@ -1548,13 +1622,14 @@ def chat(
     chat_id: str
 ):
     """
-    Private saved chat flow:
+    Secure yacht-isolated chat flow.
 
-    - Verifies chat belongs to this crew_id.
-    - Saves user message.
-    - Searches only files attached to this chat.
-    - Saves assistant answer.
-    - Other users on the same yacht cannot see or use this chat.
+    Rules:
+    - The chat must belong to this exact crew member.
+    - The user can only search assets from their own yacht.
+    - Security level 1 can search all yacht assets.
+    - Security level 2/3 can search only explicitly authorized assets.
+    - No user can search another yacht's files.
     """
 
     chat_row = verify_chat_access(
@@ -1599,16 +1674,15 @@ def chat(
             "sources": []
         }
 
-    chat_assets = supabase.table("assets") \
+    assets_res = supabase.table("assets") \
         .select("id") \
         .eq("yacht_id", yacht_id) \
-        .eq("chat_id", chat_id) \
         .in_("id", accessible_asset_ids) \
         .execute()
 
-    accessible_asset_ids = [asset["id"] for asset in chat_assets.data]
+    allowed_asset_ids = [asset["id"] for asset in assets_res.data]
 
-    if not accessible_asset_ids:
+    if not allowed_asset_ids:
         answer = FALLBACK_NO_DATA_ANSWER
 
         supabase.table("messages").insert({
@@ -1630,9 +1704,9 @@ def chat(
     results = supabase.rpc("match_asset_chunks_secure", {
         "query_embedding": embed(query),
         "match_count": 12,
-        "allowed_asset_ids": accessible_asset_ids,
-        "year_filter": year_filter,
-        "chat_filter": chat_id
+        "allowed_asset_ids": allowed_asset_ids,
+        "yacht_filter": yacht_id,
+        "year_filter": year_filter
     }).execute()
 
     if not results.data:
@@ -1655,24 +1729,11 @@ def chat(
 
     if not context.strip():
         answer = FALLBACK_NO_DATA_ANSWER
-
-        supabase.table("messages").insert({
-            "chat_id": chat_id,
-            "yacht_id": yacht_id,
-            "crew_id": crew_id,
-            "role": "assistant",
-            "content": answer
-        }).execute()
-
-        return {
-            "answer": answer,
-            "sources": []
-        }
-
-    answer = ask_llm(
-        query=query,
-        context=context
-    )
+    else:
+        answer = ask_llm(
+            query=query,
+            context=context
+        )
 
     supabase.table("messages").insert({
         "chat_id": chat_id,
