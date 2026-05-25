@@ -44,25 +44,31 @@ def create_yacht(user_id: str, name: str):
 # ------------------------
 def signup_admin(email: str, password: str, full_name: str, yacht_name: str):
     """
-    Creates the MAIN admin account:
+    Creates the MAIN admin account using normal Supabase signup:
     1. Supabase Auth user
     2. Yacht row
     3. Crew profile with security_level = 1
+
+    This avoids supabase.auth.admin.create_user(), which can fail with:
+    'User not allowed'
     """
 
     try:
-        auth_res = supabase.auth.admin.create_user({
+        auth_res = supabase.auth.sign_up({
             "email": email,
-            "password": password,
-            "email_confirm": True
+            "password": password
         })
     except Exception as e:
         error_text = str(e)
 
-        if "already been registered" in error_text or "already exists" in error_text:
+        if (
+            "already been registered" in error_text
+            or "already exists" in error_text
+            or "User already registered" in error_text
+        ):
             raise HTTPException(
                 status_code=409,
-                detail="This email already exists. Use another email or delete the user from Supabase Auth first."
+                detail="This email already exists. Try logging in or use another email."
             )
 
         raise HTTPException(
@@ -77,6 +83,23 @@ def signup_admin(email: str, password: str, full_name: str, yacht_name: str):
         )
 
     user_id = auth_res.user.id
+
+    try:
+        existing_crew = supabase.table("crew") \
+            .select("*") \
+            .eq("id", user_id) \
+            .execute()
+
+        if existing_crew.data:
+            return {
+                "message": "Admin account already exists",
+                "account_type": "main_admin",
+                "email": email,
+                "user_id": user_id,
+                "crew": existing_crew.data[0]
+            }
+    except Exception:
+        pass
 
     try:
         yacht_res = supabase.table("yachts").insert({
@@ -126,6 +149,7 @@ def signup_admin(email: str, password: str, full_name: str, yacht_name: str):
         "yacht": yacht,
         "crew": crew_res.data[0]
     }
+    
 def dev_create_admin(email: str, password: str, full_name: str, yacht_name: str):
     """
     DEV ONLY.
@@ -556,10 +580,9 @@ def create_crew_user(
         )
 
     try:
-        auth_res = supabase.auth.admin.create_user({
+        auth_res = supabase.auth.sign_up({
             "email": email,
-            "password": password,
-            "email_confirm": True
+            "password": password
         })
     except Exception as e:
         raise HTTPException(
@@ -571,7 +594,6 @@ def create_crew_user(
         raise HTTPException(status_code=400, detail="Could not create Supabase Auth user")
 
     user_id = auth_res.user.id
-
     try:
         crew_res = supabase.table("crew").insert({
             "id": user_id,
