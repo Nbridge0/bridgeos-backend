@@ -423,6 +423,67 @@ async def list_my_documents(
 
     return services.list_my_documents(crew)
 
+@app.post("/pending-documents")
+async def upload_pending_document_api(
+    request: Request,
+    file: UploadFile = File(...),
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    crew = services.get_crew(user["sub"])
+
+    if not crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    if int(crew["security_level"]) != 1:
+        raise HTTPException(
+            status_code=403,
+            detail="Only Tier 1 admins can upload pending documents"
+        )
+
+    return services.upload_pending_document(
+        file=file.file,
+        filename=file.filename,
+        mime_type=file.content_type,
+        yacht_id=crew["yacht_id"],
+        uploaded_by=crew["id"]
+    )
+
+
+@app.get("/pending-documents/admin")
+async def list_pending_documents_api(
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.list_pending_documents(admin_crew)
+
+
+@app.get("/pending-documents/{pending_document_id}/signed-url")
+async def pending_document_signed_url_api(
+    pending_document_id: str,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.create_pending_document_signed_url(
+        pending_document_id=pending_document_id,
+        admin_crew=admin_crew
+    )
+
 
 # ------------------------
 # UPLOAD DOCUMENT

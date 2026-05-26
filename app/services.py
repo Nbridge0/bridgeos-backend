@@ -1320,6 +1320,138 @@ Tags: {", ".join(tags)}
         "duplicate": False
     }
 
+def upload_pending_document(
+    file,
+    filename: str,
+    mime_type: str | None,
+    yacht_id: str,
+    uploaded_by: str
+):
+    """
+    Uploads a Yacht Documentation file into the gray zone only.
+
+    This does NOT:
+    - create an assets row
+    - create asset_chunks
+    - create embeddings
+    - make the file searchable by the chatbot
+    """
+
+    clean_filename = safe_filename(filename or "pending-document")
+    unique_id = str(uuid.uuid4())
+
+    try:
+        file.seek(0)
+        file_bytes = file.read()
+        file.seek(0)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not read uploaded file: {str(e)}"
+        )
+
+    storage_path = f"{yacht_id}/pending-documents/{unique_id}-{clean_filename}"
+
+    try:
+        supabase.storage.from_(BUCKET_NAME).upload(
+            storage_path,
+            file_bytes,
+            file_options={
+                "content-type": mime_type or "application/octet-stream",
+                "upsert": "false"
+            }
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not upload pending document to storage: {str(e)}"
+        )
+
+    try:
+        res = supabase.table("pending_documents").insert({
+            "yacht_id": yacht_id,
+            "uploaded_by": uploaded_by,
+            "file_name": clean_filename,
+            "original_file_name": filename,
+            "mime_type": mime_type,
+            "storage_path": storage_path,
+            "file_size": len(file_bytes),
+            "status": "pending"
+        }).execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not save pending document row: {str(e)}"
+        )
+
+    if not res.data:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not save pending document. Supabase returned no data."
+        )
+
+    return {
+        "message": "Document uploaded to gray zone for review",
+        "pending_document": res.data[0]
+    }
+
+
+def list_pending_documents(admin_crew: dict):
+    if int(admin_crew["security_level"]) != 1:
+        raise HTTPException(
+            status_code=403,
+            detail="Only Tier 1 admins can list pending documents"
+        )
+
+    return supabase.table("pending_documents") \
+        .select("*") \
+        .eq("yacht_id", admin_crew["yacht_id"]) \
+        .order("created_at", desc=True) \
+        .execute()
+
+
+def create_pending_document_signed_url(
+    pending_document_id: str,
+    admin_crew: dict
+):
+    if int(admin_crew["security_level"]) != 1:
+        raise HTTPException(
+            status_code=403,
+            detail="Only Tier 1 admins can download pending documents"
+        )
+
+    res = supabase.table("pending_documents") \
+        .select("*") \
+        .eq("id", pending_document_id) \
+        .eq("yacht_id", admin_crew["yacht_id"]) \
+        .execute()
+
+    if not res.data:
+        raise HTTPException(
+            status_code=404,
+            detail="Pending document not found"
+        )
+
+    pending_doc = res.data[0]
+
+    signed = supabase.storage.from_(BUCKET_NAME).create_signed_url(
+        pending_doc["storage_path"],
+        60 * 5
+    )
+
+    signed_url = signed.get("signedURL") or signed.get("signed_url")
+
+    if not signed_url:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not create signed URL"
+        )
+
+    return {
+        "pending_document_id": pending_document_id,
+        "signed_url": signed_url
+    }
+
 def upload_asset(
     file,
     filename: str,
