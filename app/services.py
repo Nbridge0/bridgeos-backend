@@ -25,6 +25,7 @@ from app.image_ai import (
 import time
 import uuid
 import jwt as pyjwt
+from datetime import datetime, timezone
 
 from app.config import SUPABASE_JWT_SECRET, SUPABASE_URL, SUPABASE_SERVICE_KEY
 from supabase import create_client
@@ -846,6 +847,73 @@ def update_crew_user(
 
     return {
         "message": "User updated successfully",
+        "crew": crew_res.data[0]
+    }
+
+def reset_my_password(
+    crew: dict,
+    new_password: str
+):
+    """
+    Logged-in user resets their own password.
+
+    This updates:
+    1. Supabase Auth password
+    2. crew.password_updated_at in the database
+    3. crew.password_updated_by in the database
+
+    Do NOT store the actual password in the database.
+    """
+
+    if not new_password or len(new_password) < 8:
+        raise HTTPException(
+            status_code=400,
+            detail="Password must be at least 8 characters"
+        )
+
+    crew_id = crew["id"]
+    now = datetime.now(timezone.utc).isoformat()
+
+    try:
+        supabase.auth.admin.update_user_by_id(
+            crew_id,
+            {
+                "password": new_password
+            }
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not update password in Supabase Auth: {str(e)}"
+        )
+
+    try:
+        crew_res = supabase.table("crew") \
+            .update({
+                "password_updated_at": now,
+                "password_updated_by": crew_id
+            }) \
+            .eq("id", crew_id) \
+            .eq("yacht_id", crew["yacht_id"]) \
+            .execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Password was updated in Supabase Auth, but database sync failed: "
+                f"{str(e)}"
+            )
+        )
+
+    if not crew_res.data:
+        raise HTTPException(
+            status_code=400,
+            detail="Password was updated, but crew database sync returned no data"
+        )
+
+    return {
+        "message": "Password reset successfully",
+        "password_updated_at": now,
         "crew": crew_res.data[0]
     }
 

@@ -110,6 +110,9 @@ class UpdateCrewUserRequest(BaseModel):
 class ResetCrewPasswordRequest(BaseModel):
     password: str
 
+class ResetMyPasswordRequest(BaseModel):
+    password: str
+
 class SeedAssetRequest(BaseModel):
     file_name: str
     content: str
@@ -193,6 +196,24 @@ async def me(
         raise HTTPException(status_code=403, detail="No crew profile found")
 
     return crew
+
+@app.post("/me/reset-password")
+async def reset_my_password_api(
+    body: ResetMyPasswordRequest,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    crew = services.get_crew(user["sub"])
+
+    if not crew:
+        raise HTTPException(status_code=403, detail="No crew profile found")
+
+    return services.reset_my_password(
+        crew=crew,
+        new_password=body.password
+    )
 
 
 # ------------------------
