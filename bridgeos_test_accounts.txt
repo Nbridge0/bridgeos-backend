@@ -1,0 +1,65 @@
+NEW FRONTEND TEST ACCOUNTS
+
+Hola Yacht:
+Email: new-hola-1779714613@example.com
+Password: StrongPassword123
+
+Bueno Yacht:
+Email: new-bueno-1779714613@example.com
+Password: StrongPassword123
+
+TEST IN FRONTEND
+
+1. Login as Hola Yacht.
+Ask:
+What is the emergency tender code?
+
+Expected:
+HOLA-1111
+
+Ask:
+What is the secret storage locker code?
+
+Expected:
+HOLA-LOCKER-77
+
+Ask:
+What is the preferred guest welcome drink?
+
+Expected:
+sparkling elderflower with lime
+
+2. Log out.
+
+3. Login as Bueno Yacht.
+Ask:
+What is the emergency tender code?
+
+Expected:
+BUENO-2222
+
+Ask:
+What is the secret storage locker code?
+
+Expected:
+BUENO-LOCKER-88
+
+Ask:
+What is the preferred guest welcome drink?
+
+Expected:
+mint lemonade with cucumber
+
+LEAKAGE TEST
+
+While logged in as Hola, ask:
+What is New Bueno Yacht emergency tender code?
+
+It must NOT answer:
+BUENO-2222
+
+While logged in as Bueno, ask:
+What is New Hola Yacht emergency tender code?
+
+It must NOT answer:
+HOLA-1111

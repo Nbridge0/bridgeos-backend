@@ -25,6 +25,8 @@ from app.image_ai import (
 import time
 import uuid
 import jwt as pyjwt
+import io
+from urllib.parse import quote
 from datetime import datetime, timezone
 
 from app.config import SUPABASE_JWT_SECRET, SUPABASE_URL, SUPABASE_SERVICE_KEY
@@ -1404,12 +1406,23 @@ def list_pending_documents(admin_crew: dict):
         )
 
     return supabase.table("pending_documents") \
-        .select("*") \
+        .select("""
+            *,
+            yachts:yacht_id (
+                id,
+                name
+            ),
+            crew:uploaded_by (
+                id,
+                email,
+                full_name,
+                security_level
+            )
+        """) \
         .eq("yacht_id", admin_crew["yacht_id"]) \
         .order("created_at", desc=True) \
         .execute()
-
-
+    
 def create_pending_document_signed_url(
     pending_document_id: str,
     admin_crew: dict
@@ -1451,6 +1464,46 @@ def create_pending_document_signed_url(
         "pending_document_id": pending_document_id,
         "signed_url": signed_url
     }
+
+def get_pending_document_for_download(
+    pending_document_id: str,
+    admin_crew: dict
+):
+    """
+    Gets a pending document only if it belongs to the admin's yacht.
+    Used by the download endpoint.
+    """
+
+    if int(admin_crew["security_level"]) != 1:
+        raise HTTPException(
+            status_code=403,
+            detail="Only Tier 1 admins can download pending documents"
+        )
+
+    res = supabase.table("pending_documents") \
+        .select("""
+            *,
+            yachts:yacht_id (
+                id,
+                name
+            ),
+            crew:uploaded_by (
+                id,
+                email,
+                full_name
+            )
+        """) \
+        .eq("id", pending_document_id) \
+        .eq("yacht_id", admin_crew["yacht_id"]) \
+        .execute()
+
+    if not res.data:
+        raise HTTPException(
+            status_code=404,
+            detail="Pending document not found"
+        )
+
+    return res.data[0]
 
 def upload_asset(
     file,

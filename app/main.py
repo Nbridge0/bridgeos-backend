@@ -1,4 +1,7 @@
 from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException, Depends
+from fastapi.responses import StreamingResponse
+import io
+from urllib.parse import quote
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
 from fastapi.middleware.cors import CORSMiddleware
@@ -482,6 +485,47 @@ async def pending_document_signed_url_api(
     return services.create_pending_document_signed_url(
         pending_document_id=pending_document_id,
         admin_crew=admin_crew
+    )
+
+@app.get("/pending-documents/{pending_document_id}/download")
+async def download_pending_document_api(
+    pending_document_id: str,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    pending_doc = services.get_pending_document_for_download(
+        pending_document_id=pending_document_id,
+        admin_crew=admin_crew
+    )
+
+    try:
+        file_bytes = services.supabase.storage.from_(services.BUCKET_NAME).download(
+            pending_doc["storage_path"]
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not download pending document from storage: {str(e)}"
+        )
+
+    filename = pending_doc.get("original_file_name") or pending_doc.get("file_name") or "pending-document"
+    mime_type = pending_doc.get("mime_type") or "application/octet-stream"
+
+    safe_download_name = quote(filename)
+
+    return StreamingResponse(
+        io.BytesIO(file_bytes),
+        media_type=mime_type,
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{safe_download_name}"
+        }
     )
 
 
