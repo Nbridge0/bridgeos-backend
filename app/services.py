@@ -421,6 +421,101 @@ def verify_chat_access(chat_id: str, crew_id: str, yacht_id: str):
 
     return res.data[0]
 
+def update_chat_title(chat_id: str, crew_id: str, yacht_id: str, title: str):
+    """
+    Renames a chat only if it belongs to this exact crew member.
+    """
+
+    clean_title = (title or "").strip()
+
+    if not clean_title:
+        raise HTTPException(status_code=400, detail="Chat title cannot be empty")
+
+    if len(clean_title) > 120:
+        clean_title = clean_title[:120]
+
+    verify_chat_access(
+        chat_id=chat_id,
+        crew_id=crew_id,
+        yacht_id=yacht_id
+    )
+
+    try:
+        res = supabase.table("chats") \
+            .update({
+                "title": clean_title,
+                "updated_at": "now()"
+            }) \
+            .eq("id", chat_id) \
+            .eq("crew_id", crew_id) \
+            .eq("yacht_id", yacht_id) \
+            .execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not rename chat: {str(e)}"
+        )
+
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Chat not found")
+
+    return {
+        "message": "Chat renamed successfully",
+        "chat": res.data[0]
+    }
+
+
+def delete_chat(chat_id: str, crew_id: str, yacht_id: str):
+    """
+    Deletes a chat only if it belongs to this exact crew member.
+    Also removes its messages first.
+
+    Chat-linked assets are kept, but detached from the deleted chat.
+    """
+
+    verify_chat_access(
+        chat_id=chat_id,
+        crew_id=crew_id,
+        yacht_id=yacht_id
+    )
+
+    try:
+        supabase.table("messages") \
+            .delete() \
+            .eq("chat_id", chat_id) \
+            .eq("crew_id", crew_id) \
+            .eq("yacht_id", yacht_id) \
+            .execute()
+
+        supabase.table("assets") \
+            .update({
+                "chat_id": None
+            }) \
+            .eq("chat_id", chat_id) \
+            .eq("yacht_id", yacht_id) \
+            .execute()
+
+        res = supabase.table("chats") \
+            .delete() \
+            .eq("id", chat_id) \
+            .eq("crew_id", crew_id) \
+            .eq("yacht_id", yacht_id) \
+            .execute()
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not delete chat: {str(e)}"
+        )
+
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Chat not found")
+
+    return {
+        "message": "Chat deleted successfully",
+        "deleted_chat_id": chat_id
+    }
+
 
 def get_chat_messages(chat_id: str, crew_id: str, yacht_id: str):
     """

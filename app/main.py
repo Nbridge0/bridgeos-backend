@@ -82,6 +82,9 @@ class ChatRequest(BaseModel):
 class CreateChatRequest(BaseModel):
     title: Optional[str] = "New Chat"
 
+class UpdateChatRequest(BaseModel):
+    title: str
+
 class AuthorizeDocumentRequest(BaseModel):
     crew_id: str
 
@@ -695,6 +698,47 @@ async def list_my_chats_api(
         raise HTTPException(status_code=403, detail="No access")
 
     return services.list_my_chats(
+        crew_id=crew["id"],
+        yacht_id=crew["yacht_id"]
+    )
+
+@app.patch("/chats/{chat_id}")
+async def update_chat_api(
+    chat_id: str,
+    body: UpdateChatRequest,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    crew = services.get_crew(user["sub"])
+
+    if not crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.update_chat_title(
+        chat_id=chat_id,
+        crew_id=crew["id"],
+        yacht_id=crew["yacht_id"],
+        title=body.title
+    )
+
+
+@app.delete("/chats/{chat_id}")
+async def delete_chat_api(
+    chat_id: str,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    crew = services.get_crew(user["sub"])
+
+    if not crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.delete_chat(
+        chat_id=chat_id,
         crew_id=crew["id"],
         yacht_id=crew["yacht_id"]
     )
