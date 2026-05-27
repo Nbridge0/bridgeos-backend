@@ -1602,21 +1602,6 @@ def upload_asset(
             detail=f"Supabase Storage upload failed. Check bucket '{BUCKET_NAME}'. Error: {str(e)}"
         )
 
-    try:
-        supabase.storage.from_(BUCKET_NAME).upload(
-            path,
-            file_bytes,
-            file_options={
-                "content-type": mime_type or "application/octet-stream",
-                "upsert": "true"
-            }
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Supabase Storage upload failed. Check bucket '{BUCKET_NAME}'. Error: {str(e)}"
-        )
-
     url = None
 
     try:
