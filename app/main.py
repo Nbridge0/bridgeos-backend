@@ -781,6 +781,52 @@ async def download_asset_api(
         }
     )
 
+@app.get("/assets/{asset_id}/download")
+async def download_asset_api(
+    asset_id: str,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    crew = services.get_crew(user["sub"])
+
+    if not crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    asset = services.get_asset_for_download(
+        asset_id=asset_id,
+        crew=crew
+    )
+
+    try:
+        file_bytes = services.storage_admin.storage.from_(services.BUCKET_NAME).download(
+            asset["storage_path"]
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not download asset from storage: {str(e)}"
+        )
+
+    filename = (
+        asset.get("original_file_name")
+        or asset.get("file_name")
+        or "asset-download"
+    )
+
+    mime_type = asset.get("mime_type") or "application/octet-stream"
+
+    safe_download_name = quote(filename)
+
+    return StreamingResponse(
+        io.BytesIO(file_bytes),
+        media_type=mime_type,
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{safe_download_name}"
+        }
+    )
+
 @app.post("/assets/{asset_id}/authorize")
 async def authorize_asset(
     asset_id: str,
