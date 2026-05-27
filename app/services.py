@@ -1366,7 +1366,7 @@ def upload_pending_document(
             file_bytes,
             file_options={
                 "content-type": mime_type or "application/octet-stream",
-                "upsert": False
+                "upsert": "false"
             }
         )
     except Exception as e:
@@ -1599,7 +1599,7 @@ def upload_asset(
             file_bytes,
             file_options={
                 "content-type": mime_type or "application/octet-stream",
-                "upsert": True
+                "upsert": "true"
             }
         )
     except Exception as e:
