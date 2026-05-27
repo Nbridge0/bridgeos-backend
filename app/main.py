@@ -888,7 +888,7 @@ async def get_chat_messages_api(
         crew_id=crew["id"],
         yacht_id=crew["yacht_id"]
     )
-    
+
 @app.post("/chat")
 async def chat_api(
     body: ChatRequest,
