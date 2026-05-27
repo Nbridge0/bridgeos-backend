@@ -1196,32 +1196,6 @@ def get_asset_for_download(asset_id: str, crew: dict):
 
     return res.data[0]
 
-def get_asset_for_download(asset_id: str, crew: dict):
-    """
-    Gets an asset only if this crew member has access to it.
-    Used by the asset download endpoint.
-    """
-
-    accessible_asset_ids = get_accessible_asset_ids(
-        crew_id=crew["id"],
-        yacht_id=crew["yacht_id"],
-        security_level=crew["security_level"]
-    )
-
-    if asset_id not in accessible_asset_ids:
-        raise HTTPException(status_code=403, detail="No access to this asset")
-
-    res = supabase.table("assets") \
-        .select("*") \
-        .eq("id", asset_id) \
-        .eq("yacht_id", crew["yacht_id"]) \
-        .execute()
-
-    if not res.data:
-        raise HTTPException(status_code=404, detail="Asset not found")
-
-    return res.data[0]
-
 def seed_text_asset(
     file_name: str,
     content: str,
