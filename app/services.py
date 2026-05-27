@@ -33,6 +33,12 @@ from app.config import SUPABASE_JWT_SECRET, SUPABASE_URL, SUPABASE_SERVICE_KEY
 from supabase import create_client
 
 auth_admin = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+
+storage_admin = create_client(
+    SUPABASE_URL,
+    SUPABASE_SERVICE_KEY
+)
+
 # ------------------------
 # YACHT
 # ------------------------
@@ -1146,7 +1152,7 @@ def create_asset_signed_url(asset_id: str, crew: dict):
 
     asset = asset_res.data[0]
 
-    signed = supabase.storage.from_(BUCKET_NAME).create_signed_url(
+    signed = storage_admin.storage.from_(BUCKET_NAME).create_signed_url(
         asset["storage_path"],
         60 * 5
     )
@@ -1355,12 +1361,12 @@ def upload_pending_document(
     storage_path = f"{yacht_id}/pending-documents/{unique_id}-{clean_filename}"
 
     try:
-        supabase.storage.from_(BUCKET_NAME).upload(
+        storage_admin.storage.from_(BUCKET_NAME).upload(
             storage_path,
             file_bytes,
             file_options={
                 "content-type": mime_type or "application/octet-stream",
-                "upsert": "false"
+                "upsert": False
             }
         )
     except Exception as e:
@@ -1447,7 +1453,7 @@ def create_pending_document_signed_url(
 
     pending_doc = res.data[0]
 
-    signed = supabase.storage.from_(BUCKET_NAME).create_signed_url(
+    signed = storage_admin.storage.from_(BUCKET_NAME).create_signed_url(
         pending_doc["storage_path"],
         60 * 5
     )
@@ -1588,18 +1594,23 @@ def upload_asset(
         )
 
     try:
-        supabase.storage.from_(BUCKET_NAME).upload(
+        storage_admin.storage.from_(BUCKET_NAME).upload(
             path,
             file_bytes,
             file_options={
                 "content-type": mime_type or "application/octet-stream",
-                "upsert": "true"
+                "upsert": True
             }
         )
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Supabase Storage upload failed. Check bucket '{BUCKET_NAME}'. Error: {str(e)}"
+            detail=(
+                f"Asset upload failed at Supabase Storage. "
+                f"Bucket: {BUCKET_NAME}. "
+                f"Path: {path}. "
+                f"Error: {str(e)}"
+            )
         )
 
     url = None

@@ -506,7 +506,7 @@ async def download_pending_document_api(
     )
 
     try:
-        file_bytes = services.supabase.storage.from_(services.BUCKET_NAME).download(
+        file_bytes = services.storage_admin.storage.from_(services.BUCKET_NAME).download(
             pending_doc["storage_path"]
         )
     except Exception as e:
