@@ -919,6 +919,15 @@ def reset_my_password(
             detail="Password was updated, but crew database sync returned no data"
         )
 
+    log_password_change(
+        crew_id=crew_id,
+        crew_email=crew.get("email"),
+        yacht_id=crew.get("yacht_id"),
+        changed_by=crew_id,
+        changed_by_email=crew.get("email"),
+        change_type="self_reset"
+    )
+
     return {
         "message": "Password reset successfully",
         "password_updated_at": now,
@@ -937,7 +946,7 @@ def reset_crew_password(
 
     _require_admin_level_1(admin_crew)
 
-    _get_target_crew_for_admin(
+    target_crew = _get_target_crew_for_admin(
         admin_crew=admin_crew,
         target_crew_id=target_crew_id
     )
@@ -961,10 +970,18 @@ def reset_crew_password(
             detail=f"Could not reset password: {str(e)}"
         )
 
+    log_password_change(
+        crew_id=target_crew_id,
+        crew_email=target_crew.get("email"),
+        yacht_id=admin_crew.get("yacht_id"),
+        changed_by=admin_crew.get("id"),
+        changed_by_email=admin_crew.get("email"),
+        change_type="admin_reset"
+    )
+
     return {
         "message": "Password reset successfully"
     }
-
 
 def delete_crew_user(
     admin_crew: dict,
@@ -1079,6 +1096,44 @@ def authorize_asset_access(
         "crew_id": target_crew_id,
         "granted_by": granted_by
     }).execute()
+
+def log_password_change(
+    crew_id: str,
+    crew_email: str | None,
+    yacht_id: str | None,
+    changed_by: str,
+    changed_by_email: str | None,
+    change_type: str
+):
+    yacht_name = None
+
+    if yacht_id:
+        try:
+            yacht_res = supabase.table("yachts") \
+                .select("name") \
+                .eq("id", yacht_id) \
+                .execute()
+
+            if yacht_res.data:
+                yacht_name = yacht_res.data[0].get("name")
+        except Exception:
+            yacht_name = None
+
+    try:
+        supabase.table("password_change_logs").insert({
+            "crew_id": crew_id,
+            "crew_email": crew_email,
+            "yacht_id": yacht_id,
+            "yacht_name": yacht_name,
+            "changed_by": changed_by,
+            "changed_by_email": changed_by_email,
+            "change_type": change_type
+        }).execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Password changed, but audit log failed: {str(e)}"
+        )
 
 
 def list_assets_for_admin(admin_crew: dict):
