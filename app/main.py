@@ -199,7 +199,7 @@ async def me(
         raise HTTPException(status_code=403, detail="No crew profile found")
 
     return crew
-
+    
 @app.post("/me/reset-password")
 async def reset_my_password_api(
     body: ResetMyPasswordRequest,

@@ -865,12 +865,10 @@ def reset_my_password(
     """
     Logged-in user resets their own password.
 
-    This updates:
-    1. Supabase Auth password
-    2. crew.password_updated_at in the database
-    3. crew.password_updated_by in the database
-
-    Do NOT store the actual password in the database.
+    Safe behavior:
+    - Updates password in Supabase Auth only.
+    - Does NOT store the real password in your database.
+    - Stores audit metadata in crew table.
     """
 
     if not new_password or len(new_password) < 8:
@@ -883,7 +881,7 @@ def reset_my_password(
     now = datetime.now(timezone.utc).isoformat()
 
     try:
-        supabase.auth.admin.update_user_by_id(
+        auth_admin.auth.admin.update_user_by_id(
             crew_id,
             {
                 "password": new_password
@@ -898,8 +896,11 @@ def reset_my_password(
     try:
         crew_res = supabase.table("crew") \
             .update({
+                "email": crew.get("email"),
                 "password_updated_at": now,
-                "password_updated_by": crew_id
+                "password_updated_by": crew_id,
+                "password_reset_by_role": "self",
+                "must_change_password": False
             }) \
             .eq("id", crew_id) \
             .eq("yacht_id", crew["yacht_id"]) \
@@ -925,7 +926,6 @@ def reset_my_password(
         "crew": crew_res.data[0]
     }
 
-
 def reset_crew_password(
     admin_crew: dict,
     target_crew_id: str,
@@ -933,11 +933,16 @@ def reset_crew_password(
 ):
     """
     Tier 1 admin resets a crew user's Supabase Auth password.
+
+    Safe behavior:
+    - Updates password in Supabase Auth only.
+    - Does NOT store the real password.
+    - Stores audit metadata in crew table.
     """
 
     _require_admin_level_1(admin_crew)
 
-    _get_target_crew_for_admin(
+    target_crew = _get_target_crew_for_admin(
         admin_crew=admin_crew,
         target_crew_id=target_crew_id
     )
@@ -948,8 +953,10 @@ def reset_crew_password(
             detail="Password must be at least 8 characters"
         )
 
+    now = datetime.now(timezone.utc).isoformat()
+
     try:
-        supabase.auth.admin.update_user_by_id(
+        auth_admin.auth.admin.update_user_by_id(
             target_crew_id,
             {
                 "password": new_password
@@ -958,13 +965,40 @@ def reset_crew_password(
     except Exception as e:
         raise HTTPException(
             status_code=400,
-            detail=f"Could not reset password: {str(e)}"
+            detail=f"Could not reset password in Supabase Auth: {str(e)}"
+        )
+
+    try:
+        crew_res = supabase.table("crew") \
+            .update({
+                "password_updated_at": now,
+                "password_updated_by": admin_crew["id"],
+                "password_reset_by_role": "admin",
+                "must_change_password": True
+            }) \
+            .eq("id", target_crew_id) \
+            .eq("yacht_id", admin_crew["yacht_id"]) \
+            .execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Password was reset in Supabase Auth, but crew database sync failed: "
+                f"{str(e)}"
+            )
+        )
+
+    if not crew_res.data:
+        raise HTTPException(
+            status_code=400,
+            detail="Password was reset, but crew database sync returned no data"
         )
 
     return {
-        "message": "Password reset successfully"
+        "message": "Password reset successfully",
+        "password_updated_at": now,
+        "target_crew": crew_res.data[0]
     }
-
 def delete_crew_user(
     admin_crew: dict,
     target_crew_id: str
