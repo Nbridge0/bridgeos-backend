@@ -956,10 +956,8 @@ async def chat_api(
     if not body.chat_id:
         raise HTTPException(status_code=422, detail="Missing chat_id")
 
-    return services.chat(
+    return services.chat_with_runpod_bridgeos(
         query=query,
-        crew_id=crew["id"],
-        yacht_id=crew["yacht_id"],
-        security_level=crew["security_level"],
+        crew=crew,
         chat_id=body.chat_id
     )

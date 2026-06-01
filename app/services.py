@@ -1,8 +1,9 @@
 from fastapi import HTTPException
+import requests
 
 from app.database import supabase
 from app.embeddings import embed
-from app.config import BUCKET_NAME
+from app.config import BUCKET_NAME, RUNPOD_BASE_URL, BRIDGEOS_API_KEY
 from app.llm import ask_llm, FALLBACK_NO_DATA_ANSWER
 from app.file_utils import detect_file_type, calculate_file_hash, safe_filename
 from app.metadata_utils import (
@@ -348,6 +349,152 @@ def dev_login(email: str, full_name: str = "Test Admin", yacht_name: str = "Test
         },
         "crew": crew
     }
+
+def chat_with_runpod_bridgeos(
+    query: str,
+    crew: dict,
+    chat_id: str
+):
+    """
+    Sends the BridgeOS chat request to the new RunPod AI API.
+
+    The frontend still calls this BridgeOS backend.
+    This backend keeps secrets private and sends trusted account context to RunPod.
+    """
+
+    verify_chat_access(
+        chat_id=chat_id,
+        crew_id=crew["id"],
+        yacht_id=crew["yacht_id"]
+    )
+
+    supabase.table("messages").insert({
+        "chat_id": chat_id,
+        "yacht_id": crew["yacht_id"],
+        "crew_id": crew["id"],
+        "role": "user",
+        "content": query
+    }).execute()
+
+    if not RUNPOD_BASE_URL:
+        raise HTTPException(status_code=500, detail="RUNPOD_BASE_URL is not configured")
+
+    if not BRIDGEOS_API_KEY:
+        raise HTTPException(status_code=500, detail="BRIDGEOS_API_KEY is not configured")
+
+    # Load recent chat history from your own DB
+    history_res = supabase.table("messages") \
+        .select("role, content") \
+        .eq("chat_id", chat_id) \
+        .eq("crew_id", crew["id"]) \
+        .eq("yacht_id", crew["yacht_id"]) \
+        .order("created_at", desc=False) \
+        .limit(20) \
+        .execute()
+
+    history = []
+
+    for message in history_res.data or []:
+        role = message.get("role")
+        content = message.get("content")
+
+        if role in ["user", "assistant"] and content:
+            history.append({
+                "role": role,
+                "content": content
+            })
+
+    # Safe BridgeOS account context for the AI
+    backend_context = {
+        "crew": {
+            "id": crew.get("id"),
+            "email": crew.get("email"),
+            "full_name": crew.get("full_name"),
+            "role": crew.get("role"),
+            "position": crew.get("position"),
+            "phone_number": crew.get("phone_number"),
+            "security_level": crew.get("security_level"),
+            "yacht_id": crew.get("yacht_id"),
+            "yacht_name": crew.get("yacht_name")
+        }
+    }
+
+    # Add accessible assets/documents metadata only.
+    # Do not send storage paths or signed URLs here.
+    try:
+        my_assets = list_my_assets(crew)
+
+        safe_assets = []
+
+        for asset in my_assets.get("data", []) if isinstance(my_assets, dict) else getattr(my_assets, "data", []) or []:
+            safe_assets.append({
+                "id": asset.get("id"),
+                "file_name": asset.get("file_name"),
+                "original_file_name": asset.get("original_file_name"),
+                "file_type": asset.get("file_type"),
+                "mime_type": asset.get("mime_type"),
+                "security_level": asset.get("security_level"),
+                "processing_status": asset.get("processing_status"),
+                "detected_year": asset.get("detected_year"),
+                "detected_event": asset.get("detected_event"),
+                "tags": asset.get("tags"),
+                "summary": asset.get("summary")
+            })
+
+        backend_context["assets"] = safe_assets[:50]
+
+    except Exception:
+        backend_context["assets"] = []
+
+    url = f"{RUNPOD_BASE_URL.rstrip('/')}/api/bridgeos/chat"
+
+    try:
+        response = requests.post(
+            url,
+            json={
+                "user_input": query,
+                "history": history,
+                "backend_context": backend_context
+            },
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": BRIDGEOS_API_KEY
+            },
+            timeout=180
+        )
+    except requests.exceptions.Timeout:
+        raise HTTPException(status_code=504, detail="BridgeOS AI request timed out")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"BridgeOS AI request failed: {str(e)}")
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=response.text
+        )
+
+    data = response.json()
+
+    answer = data.get("response") or FALLBACK_NO_DATA_ANSWER
+
+    supabase.table("messages").insert({
+        "chat_id": chat_id,
+        "yacht_id": crew["yacht_id"],
+        "crew_id": crew["id"],
+        "role": "assistant",
+        "content": answer
+    }).execute()
+
+    supabase.table("chats").update({
+        "updated_at": "now()"
+    }).eq("id", chat_id).eq("crew_id", crew["id"]).eq("yacht_id", crew["yacht_id"]).execute()
+
+    return {
+        "answer": answer,
+        "sources": [],
+        "provider": "runpod_bridgeos"
+    }
+
 
 # ------------------------
 # CREW
