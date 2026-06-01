@@ -356,10 +356,13 @@ def chat_with_runpod_bridgeos(
     chat_id: str
 ):
     """
-    Sends the BridgeOS chat request to the new RunPod AI API.
+    Sends the BridgeOS chat request to the RunPod AI API.
 
-    The frontend still calls this BridgeOS backend.
-    This backend keeps secrets private and sends trusted account context to RunPod.
+    Important:
+    - The frontend calls the BridgeOS backend.
+    - The BridgeOS backend calls RunPod.
+    - Users should never see raw Internal Server Error messages.
+    - If RunPod fails, return the normal fallback answer.
     """
 
     verify_chat_access(
@@ -377,12 +380,41 @@ def chat_with_runpod_bridgeos(
     }).execute()
 
     if not RUNPOD_BASE_URL:
-        raise HTTPException(status_code=500, detail="RUNPOD_BASE_URL is not configured")
+        answer = FALLBACK_NO_DATA_ANSWER
+
+        supabase.table("messages").insert({
+            "chat_id": chat_id,
+            "yacht_id": crew["yacht_id"],
+            "crew_id": crew["id"],
+            "role": "assistant",
+            "content": answer
+        }).execute()
+
+        return {
+            "answer": answer,
+            "sources": [],
+            "provider": "runpod_bridgeos",
+            "error": True
+        }
 
     if not BRIDGEOS_API_KEY:
-        raise HTTPException(status_code=500, detail="BRIDGEOS_API_KEY is not configured")
+        answer = FALLBACK_NO_DATA_ANSWER
 
-    # Load recent chat history from your own DB
+        supabase.table("messages").insert({
+            "chat_id": chat_id,
+            "yacht_id": crew["yacht_id"],
+            "crew_id": crew["id"],
+            "role": "assistant",
+            "content": answer
+        }).execute()
+
+        return {
+            "answer": answer,
+            "sources": [],
+            "provider": "runpod_bridgeos",
+            "error": True
+        }
+
     history_res = supabase.table("messages") \
         .select("role, content") \
         .eq("chat_id", chat_id) \
@@ -404,7 +436,6 @@ def chat_with_runpod_bridgeos(
                 "content": content
             })
 
-    # Safe BridgeOS account context for the AI
     backend_context = {
         "crew": {
             "id": crew.get("id"),
@@ -419,14 +450,18 @@ def chat_with_runpod_bridgeos(
         }
     }
 
-    # Add accessible assets/documents metadata only.
-    # Do not send storage paths or signed URLs here.
     try:
         my_assets = list_my_assets(crew)
 
         safe_assets = []
 
-        for asset in my_assets.get("data", []) if isinstance(my_assets, dict) else getattr(my_assets, "data", []) or []:
+        asset_rows = (
+            my_assets.get("data", [])
+            if isinstance(my_assets, dict)
+            else getattr(my_assets, "data", []) or []
+        )
+
+        for asset in asset_rows:
             safe_assets.append({
                 "id": asset.get("id"),
                 "file_name": asset.get("file_name"),
@@ -443,7 +478,8 @@ def chat_with_runpod_bridgeos(
 
         backend_context["assets"] = safe_assets[:50]
 
-    except Exception:
+    except Exception as e:
+        print("ASSET CONTEXT ERROR:", type(e).__name__, str(e))
         backend_context["assets"] = []
 
     url = f"{RUNPOD_BASE_URL.rstrip('/')}/api/bridgeos/chat"
@@ -472,17 +508,103 @@ def chat_with_runpod_bridgeos(
         print("RUNPOD DEBUG: response:", response.text[:500])
 
     except requests.exceptions.Timeout:
-        raise HTTPException(status_code=504, detail="BridgeOS AI request timed out")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"BridgeOS AI request failed: {str(e)}")
-        
-    if response.status_code >= 400:
-        raise HTTPException(
-            status_code=response.status_code,
-            detail=response.text
-        )
+        print("RUNPOD TIMEOUT ERROR")
 
-    data = response.json()
+        answer = FALLBACK_NO_DATA_ANSWER
+
+        supabase.table("messages").insert({
+            "chat_id": chat_id,
+            "yacht_id": crew["yacht_id"],
+            "crew_id": crew["id"],
+            "role": "assistant",
+            "content": answer
+        }).execute()
+
+        supabase.table("chats").update({
+            "updated_at": "now()"
+        }).eq("id", chat_id).eq("crew_id", crew["id"]).eq("yacht_id", crew["yacht_id"]).execute()
+
+        return {
+            "answer": answer,
+            "sources": [],
+            "provider": "runpod_bridgeos",
+            "error": True
+        }
+
+    except Exception as e:
+        print("RUNPOD REQUEST ERROR:", type(e).__name__, str(e))
+
+        answer = FALLBACK_NO_DATA_ANSWER
+
+        supabase.table("messages").insert({
+            "chat_id": chat_id,
+            "yacht_id": crew["yacht_id"],
+            "crew_id": crew["id"],
+            "role": "assistant",
+            "content": answer
+        }).execute()
+
+        supabase.table("chats").update({
+            "updated_at": "now()"
+        }).eq("id", chat_id).eq("crew_id", crew["id"]).eq("yacht_id", crew["yacht_id"]).execute()
+
+        return {
+            "answer": answer,
+            "sources": [],
+            "provider": "runpod_bridgeos",
+            "error": True
+        }
+
+    if response.status_code >= 400:
+        print("RUNPOD ERROR STATUS:", response.status_code)
+        print("RUNPOD ERROR RESPONSE:", response.text[:1000])
+
+        answer = FALLBACK_NO_DATA_ANSWER
+
+        supabase.table("messages").insert({
+            "chat_id": chat_id,
+            "yacht_id": crew["yacht_id"],
+            "crew_id": crew["id"],
+            "role": "assistant",
+            "content": answer
+        }).execute()
+
+        supabase.table("chats").update({
+            "updated_at": "now()"
+        }).eq("id", chat_id).eq("crew_id", crew["id"]).eq("yacht_id", crew["yacht_id"]).execute()
+
+        return {
+            "answer": answer,
+            "sources": [],
+            "provider": "runpod_bridgeos",
+            "error": True
+        }
+
+    try:
+        data = response.json()
+    except Exception:
+        print("RUNPOD JSON PARSE ERROR:", response.text[:1000])
+
+        answer = FALLBACK_NO_DATA_ANSWER
+
+        supabase.table("messages").insert({
+            "chat_id": chat_id,
+            "yacht_id": crew["yacht_id"],
+            "crew_id": crew["id"],
+            "role": "assistant",
+            "content": answer
+        }).execute()
+
+        supabase.table("chats").update({
+            "updated_at": "now()"
+        }).eq("id", chat_id).eq("crew_id", crew["id"]).eq("yacht_id", crew["yacht_id"]).execute()
+
+        return {
+            "answer": answer,
+            "sources": [],
+            "provider": "runpod_bridgeos",
+            "error": True
+        }
 
     answer = data.get("response") or FALLBACK_NO_DATA_ANSWER
 
@@ -501,10 +623,9 @@ def chat_with_runpod_bridgeos(
     return {
         "answer": answer,
         "sources": [],
-        "provider": "runpod_bridgeos"
+        "provider": "runpod_bridgeos",
+        "error": False
     }
-
-
 # ------------------------
 # CREW
 # ------------------------
