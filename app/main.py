@@ -952,11 +952,20 @@ async def chat_api(
     request: Request,
     token: HTTPAuthorizationCredentials = Depends(security)
 ):
-    user = get_user(request)
+    print("CHAT DEBUG: /chat endpoint hit")
+    print("CHAT DEBUG: authorization header present:", bool(request.headers.get("Authorization")))
+
+    try:
+        user = get_user(request)
+        print("CHAT DEBUG: user verified:", user.get("sub"))
+    except Exception as e:
+        print("CHAT DEBUG: get_user failed:", type(e).__name__, str(e))
+        raise
 
     crew = services.get_crew(user["sub"])
 
     if not crew:
+        print("CHAT DEBUG: no crew profile found for:", user["sub"])
         raise HTTPException(status_code=403, detail="No access")
 
     query = body.query or body.message
@@ -966,6 +975,8 @@ async def chat_api(
 
     if not body.chat_id:
         raise HTTPException(status_code=422, detail="Missing chat_id")
+
+    print("CHAT DEBUG: calling RunPod for chat_id:", body.chat_id)
 
     return services.chat_with_runpod_bridgeos(
         query=query,

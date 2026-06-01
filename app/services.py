@@ -449,6 +449,11 @@ def chat_with_runpod_bridgeos(
     url = f"{RUNPOD_BASE_URL.rstrip('/')}/api/bridgeos/chat"
 
     try:
+        print("RUNPOD DEBUG: url:", url)
+        print("RUNPOD DEBUG: key present:", bool(BRIDGEOS_API_KEY))
+        print("RUNPOD DEBUG: key length:", len(BRIDGEOS_API_KEY or ""))
+        print("RUNPOD DEBUG: key last4:", (BRIDGEOS_API_KEY or "")[-4:])
+
         response = requests.post(
             url,
             json={
@@ -462,11 +467,15 @@ def chat_with_runpod_bridgeos(
             },
             timeout=180
         )
+
+        print("RUNPOD DEBUG: status:", response.status_code)
+        print("RUNPOD DEBUG: response:", response.text[:500])
+
     except requests.exceptions.Timeout:
         raise HTTPException(status_code=504, detail="BridgeOS AI request timed out")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"BridgeOS AI request failed: {str(e)}")
-
+        
     if response.status_code >= 400:
         raise HTTPException(
             status_code=response.status_code,
