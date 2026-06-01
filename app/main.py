@@ -186,6 +186,17 @@ async def login(body: LoginRequest):
 # CURRENT USER
 # ------------------------
 
+from app.config import RUNPOD_BASE_URL, BRIDGEOS_API_KEY
+
+@app.get("/debug-ai-config")
+async def debug_ai_config():
+    return {
+        "runpod_base_url": RUNPOD_BASE_URL,
+        "bridgeos_key_present": bool(BRIDGEOS_API_KEY),
+        "bridgeos_key_length": len(BRIDGEOS_API_KEY or ""),
+        "bridgeos_key_last4": (BRIDGEOS_API_KEY or "")[-4:]
+    }
+
 @app.get("/me")
 async def me(
     request: Request,
