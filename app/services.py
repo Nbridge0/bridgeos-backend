@@ -2558,6 +2558,10 @@ def chat(
         yacht_id=yacht_id,
         security_level=security_level
     )
+    print("LOCAL CHAT DEBUG: yacht_id:", yacht_id)
+    print("LOCAL CHAT DEBUG: crew_id:", crew_id)
+    print("LOCAL CHAT DEBUG: security_level:", security_level)
+    print("LOCAL CHAT DEBUG: accessible_asset_ids:", accessible_asset_ids)
 
     if not accessible_asset_ids:
         answer = FALLBACK_NO_DATA_ANSWER
@@ -2609,6 +2613,7 @@ def chat(
         "yacht_filter": yacht_id,
         "year_filter": year_filter
     }).execute()
+    print("LOCAL CHAT DEBUG: matched chunks:", len(results.data or []))
 
     if not results.data:
         answer = FALLBACK_NO_DATA_ANSWER
