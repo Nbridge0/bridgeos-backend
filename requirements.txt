@@ -8,5 +8,6 @@ PyJWT
 pydantic[email]
 python-multipart
 pypdf
+openai
 python-docx
 TXT

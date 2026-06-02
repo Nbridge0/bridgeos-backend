@@ -1,97 +1,49 @@
-import requests
+from openai import OpenAI
 
-from app.config import RUNPOD_BASE_URL, BRIDGEOS_API_KEY
+from app.config import OPENAI_API_KEY
+
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 
 FALLBACK_NO_DATA_ANSWER = (
-    "Sorry, I could not generate a response right now. Please try again."
+    "Sorry, I don't have this data yet. Please ask your admin to upload it."
 )
 
 
-def ask_llm(query: str, context: str = "") -> str:
-    """
-    Calls your own RunPod LLM.
-
-    No OpenAI.
-    Uses a simple payload:
-    {
-      "user_input": "...",
-      "history": [],
-      "backend_context": {...}
-    }
-    """
-
-    if not RUNPOD_BASE_URL:
-        print("RUNPOD LLM ERROR: RUNPOD_BASE_URL missing")
+def ask_llm(query: str, context: str) -> str:
+    if not context or not context.strip():
         return FALLBACK_NO_DATA_ANSWER
 
-    if not BRIDGEOS_API_KEY:
-        print("RUNPOD LLM ERROR: BRIDGEOS_API_KEY missing")
-        return FALLBACK_NO_DATA_ANSWER
-
-    url = f"{RUNPOD_BASE_URL.rstrip('/')}/api/bridgeos/chat"
-
-    if context and context.strip():
-        user_input = f"""
+    system_prompt = """
 You are BridgeOS, a helpful yacht assistant.
 
-Answer the user naturally.
+When context is provided:
+- Use it only if it is relevant to the user's question.
+- If it is not relevant, answer normally.
 
-If the provided context directly answers the question, use it.
-If the provided context is not relevant, answer normally.
+When no context is provided:
+- Answer normally and helpfully.
 
-User question:
+Never claim a document was used unless the answer is actually based on the document context.
+"""
+    response = client.responses.create(
+        model="gpt-4.1-mini",
+        input=[
+            {
+                "role": "system",
+                "content": system_prompt
+            },
+            {
+                "role": "user",
+                "content": f"""
+Question:
 {query}
 
 Context:
 {context}
-""".strip()
-    else:
-        user_input = query
+"""
+            }
+        ]
+    )
 
-    try:
-        print("RUNPOD LLM DEBUG: url:", url)
-        print("RUNPOD LLM DEBUG: key present:", bool(BRIDGEOS_API_KEY))
-        print("RUNPOD LLM DEBUG: key length:", len(BRIDGEOS_API_KEY or ""))
-        print("RUNPOD LLM DEBUG: key last4:", (BRIDGEOS_API_KEY or "")[-4:])
-
-        response = requests.post(
-            url,
-            json={
-                "user_input": user_input,
-                "history": [],
-                "backend_context": {}
-            },
-            headers={
-                "Content-Type": "application/json",
-                "x-api-key": BRIDGEOS_API_KEY
-            },
-            timeout=180
-        )
-
-        print("RUNPOD LLM DEBUG: status:", response.status_code)
-        print("RUNPOD LLM DEBUG: response:", response.text[:1000])
-
-        if response.status_code >= 400:
-            return FALLBACK_NO_DATA_ANSWER
-
-        data = response.json()
-
-        answer = (
-            data.get("response")
-            or data.get("answer")
-            or data.get("message")
-            or data.get("output")
-            or ""
-        )
-
-        answer = str(answer or "").strip()
-
-        if not answer:
-            return FALLBACK_NO_DATA_ANSWER
-
-        return answer
-
-    except Exception as e:
-        print("RUNPOD LLM REQUEST ERROR:", type(e).__name__, str(e))
-        return FALLBACK_NO_DATA_ANSWER
+    return response.output_text or FALLBACK_NO_DATA_ANSWER
