@@ -2512,6 +2512,7 @@ def upload_image(file, filename: str, yacht_id: str, uploaded_by: str):
         mime_type=None
     )
 
+
 # ------------------------
 # CHAT SECURE
 # ------------------------
@@ -2589,77 +2590,86 @@ def chat(
 
             matched_rows = results.data or []
 
-            print("LOCAL CHAT DEBUG: matched chunks:", len(matched_rows))
+            context = ""
+            sources = []
 
             if matched_rows:
                 context = build_context_from_asset_results(matched_rows)
-                sources = build_sources_from_asset_results(matched_rows)
 
-    if context.strip():
-        answer = ask_llm(
-            query=query,
-            context=f"""
-You are BridgeOS.
+            if context.strip():
+                raw_answer = ask_llm(
+                    query=query,
+                    context=f"""
+            You are BridgeOS.
 
-The user asked:
-{query}
+            The user asked:
+            {query}
 
-Use the uploaded document context below to answer the question.
-The uploaded document context has priority over general knowledge.
+            Below is retrieved uploaded document context. It may or may not be relevant.
 
-Important rules:
-- If the answer is in the uploaded documents, answer from the documents.
-- Be clear and natural.
-- Do not say you cannot answer if the document context contains useful information.
-- Do not mention unrelated document content.
-- At the end, include:
-Document reference: <file name>
+            Your job:
+            1. Decide whether the uploaded document context directly answers the user's question.
+            2. If it directly answers the question, answer using the document context.
+            3. If it does not directly answer the question, answer normally from general knowledge.
 
-Uploaded document context:
-{context}
-""".strip()
-        )
+            At the very end of your response, add exactly one hidden routing line:
 
-        if sources:
-            file_names = []
-            for source in sources:
-                name = source.get("file_name")
-                if name and name not in file_names:
-                    file_names.append(name)
+            DOCUMENT_USED: YES
 
-            reference_text = ", ".join(file_names) if file_names else "Uploaded document"
+            or
 
-            if "Document reference:" not in answer:
-                answer = f"{answer}\n\nDocument reference: {reference_text}"
+            DOCUMENT_USED: NO
 
-    else:
-        answer = ask_llm(
-            query=query,
-            context="""
-You are BridgeOS.
+            Rules:
+            - Use DOCUMENT_USED: YES only if the final answer is actually based on the uploaded document context.
+            - Use DOCUMENT_USED: NO for greetings, small talk, general questions, or when the document context is unrelated.
+            - Do not invent document references.
+            - Do not mention document sources unless DOCUMENT_USED is YES.
 
-No relevant uploaded document chunks were found for this question.
-Answer the user normally and helpfully using general knowledge.
-Do not mention document references.
-""".strip()
-        )
+            Uploaded document context:
+            {context}
+            """.strip()
+                )
 
-    supabase.table("messages").insert({
-        "chat_id": chat_id,
-        "yacht_id": yacht_id,
-        "crew_id": crew_id,
-        "role": "assistant",
-        "content": answer
-    }).execute()
+                document_used = "DOCUMENT_USED: YES" in raw_answer
 
-    supabase.table("chats").update({
-        "updated_at": "now()"
-    }).eq("id", chat_id).eq("crew_id", crew_id).eq("yacht_id", yacht_id).execute()
+                answer = (
+                    raw_answer
+                    .replace("DOCUMENT_USED: YES", "")
+                    .replace("DOCUMENT_USED: NO", "")
+                    .strip()
+                )
 
-    return {
-        "answer": answer,
-        "sources": sources
-    }
+                if document_used:
+                    sources = build_sources_from_asset_results(matched_rows)
+
+                    if sources:
+                        file_names = []
+                        for source in sources:
+                            name = source.get("file_name")
+                            if name and name not in file_names:
+                                file_names.append(name)
+
+                        reference_text = ", ".join(file_names) if file_names else "Uploaded document"
+
+                        if "Document reference:" not in answer:
+                            answer = f"{answer}\n\nDocument reference: {reference_text}"
+                else:
+                    sources = []
+
+            else:
+                answer = ask_llm(
+                    query=query,
+                    context="""
+            You are BridgeOS.
+
+            Answer the user normally and helpfully.
+            There is no uploaded document context available for this question.
+            Do not mention documents.
+            Do not include document references.
+            """.strip()
+                )
+                sources = []
 # ------------------------
 # TEMP DEMO LOGIN FOR TESTING ONLY
 # Remove before production.

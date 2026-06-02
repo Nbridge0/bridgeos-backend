@@ -15,19 +15,16 @@ def ask_llm(query: str, context: str) -> str:
         return FALLBACK_NO_DATA_ANSWER
 
     system_prompt = """
-You are BridgeOS, a helpful assistant.
+You are BridgeOS, a helpful yacht assistant.
 
-You can answer normal questions using general knowledge.
+When context is provided:
+- Use it only if it is relevant to the user's question.
+- If it is not relevant, answer normally.
 
-When DATABASE CONTEXT is provided and it directly answers the user's question:
-- Prefer the database context.
-- Use it as the source of truth.
-- End with a document reference.
+When no context is provided:
+- Answer normally and helpfully.
 
-When DATABASE CONTEXT is empty or irrelevant:
-- Answer normally.
-- Do not pretend the answer came from a document.
-- Do not say you cannot answer just because no document was found.
+Never claim a document was used unless the answer is actually based on the document context.
 """
     response = client.responses.create(
         model="gpt-4.1-mini",
