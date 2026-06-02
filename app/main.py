@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException, Depends, Query
+from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException, Depends
 from fastapi.responses import StreamingResponse
 import io
 from urllib.parse import quote
@@ -845,28 +845,6 @@ async def seed_asset_api(
         uploaded_by=crew["id"],
         security_level=body.security_level
     )
-
-@app.get("/assets/{asset_id}/preview")
-async def asset_preview_api(
-    asset_id: str,
-    request: Request,
-    highlight: Optional[str] = Query(None),
-    token: HTTPAuthorizationCredentials = Depends(security)
-):
-    user = get_user(request)
-
-    crew = services.get_crew(user["sub"])
-
-    if not crew:
-        raise HTTPException(status_code=403, detail="No access")
-
-    return services.get_asset_preview(
-        asset_id=asset_id,
-        crew=crew,
-        highlight=highlight
-    )
-
-
 # ------------------------
 # CHAT
 # ------------------------
@@ -980,17 +958,11 @@ async def chat_api(
     try:
         user = get_user(request)
         print("CHAT DEBUG: user verified:", user.get("sub"))
-    except HTTPException:
-        raise
     except Exception as e:
         print("CHAT DEBUG: get_user failed:", type(e).__name__, str(e))
-        raise HTTPException(status_code=401, detail="Could not verify user")
+        raise
 
-    try:
-        crew = services.get_crew(user["sub"])
-    except Exception as e:
-        print("CHAT DEBUG: get_crew failed:", type(e).__name__, str(e))
-        raise HTTPException(status_code=500, detail="Could not load crew profile")
+    crew = services.get_crew(user["sub"])
 
     if not crew:
         print("CHAT DEBUG: no crew profile found for:", user["sub"])
@@ -998,35 +970,16 @@ async def chat_api(
 
     query = body.query or body.message
 
-    if not query or not query.strip():
+    if not query:
         raise HTTPException(status_code=422, detail="Missing query")
 
     if not body.chat_id:
         raise HTTPException(status_code=422, detail="Missing chat_id")
 
-    print("CHAT DEBUG: chat_id:", body.chat_id)
-    print("CHAT DEBUG: crew_id:", crew["id"])
-    print("CHAT DEBUG: yacht_id:", crew["yacht_id"])
-    print("CHAT DEBUG: security_level:", crew["security_level"])
-    print("CHAT DEBUG: query:", query)
+    print("CHAT DEBUG: calling RunPod for chat_id:", body.chat_id)
 
-    try:
-        return services.chat(
-            query=query.strip(),
-            crew_id=crew["id"],
-            yacht_id=crew["yacht_id"],
-            security_level=crew["security_level"],
-            chat_id=body.chat_id
-        )
-
-    except HTTPException:
-        raise
-
-    except Exception as e:
-        print("CHAT DEBUG: services.chat crashed:", type(e).__name__, str(e))
-
-        return {
-            "answer": "I could not generate an answer right now. Please try again.",
-            "sources": [],
-            "error": True
-        }
+    return services.chat_with_runpod_bridgeos(
+        query=query,
+        crew=crew,
+        chat_id=body.chat_id
+    )

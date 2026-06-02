@@ -4,12 +4,7 @@ import requests
 from app.database import supabase
 from app.embeddings import embed
 from app.config import BUCKET_NAME, RUNPOD_BASE_URL, BRIDGEOS_API_KEY
-from app.llm import (
-    ask_llm,
-    ask_general_llm,
-    classify_query_route,
-    FALLBACK_NO_DATA_ANSWER
-)
+from app.llm import ask_llm, FALLBACK_NO_DATA_ANSWER
 from app.file_utils import detect_file_type, calculate_file_hash, safe_filename
 from app.metadata_utils import (
     extract_date_from_filename,
@@ -44,56 +39,6 @@ storage_admin = create_client(
     SUPABASE_URL,
     SUPABASE_SERVICE_KEY
 )
-
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def safe_save_message(
-    chat_id: str,
-    yacht_id: str,
-    crew_id: str,
-    role: str,
-    content: str
-):
-    try:
-        supabase.table("messages").insert({
-            "chat_id": chat_id,
-            "yacht_id": yacht_id,
-            "crew_id": crew_id,
-            "role": role,
-            "content": content
-        }).execute()
-    except Exception as e:
-        print("MESSAGE SAVE ERROR:", type(e).__name__, str(e))
-
-
-def safe_touch_chat(
-    chat_id: str,
-    crew_id: str,
-    yacht_id: str
-):
-    try:
-        supabase.table("chats").update({
-            "updated_at": utc_now_iso()
-        }).eq("id", chat_id).eq("crew_id", crew_id).eq("yacht_id", yacht_id).execute()
-    except Exception as e:
-        print("CHAT TOUCH ERROR:", type(e).__name__, str(e))
-
-
-def safe_update_chat_title(
-    chat_id: str,
-    crew_id: str,
-    yacht_id: str,
-    title: str
-):
-    try:
-        supabase.table("chats").update({
-            "title": (title or "New Chat")[:60],
-            "updated_at": utc_now_iso()
-        }).eq("id", chat_id).eq("crew_id", crew_id).eq("yacht_id", yacht_id).execute()
-    except Exception as e:
-        print("CHAT TITLE UPDATE ERROR:", type(e).__name__, str(e))
 
 # ------------------------
 # YACHT
@@ -218,8 +163,6 @@ def signup_admin(email: str, password: str, full_name: str, yacht_name: str):
         "crew": crew_res.data[0]
     }
     
-
-
 def dev_create_admin(email: str, password: str, full_name: str, yacht_name: str):
     """
     DEV ONLY.
@@ -406,8 +349,6 @@ def dev_login(email: str, full_name: str = "Test Admin", yacht_name: str = "Test
         },
         "crew": crew
     }
-
-
 
 def chat_with_runpod_bridgeos(
     query: str,
@@ -733,43 +674,6 @@ def create_chat(crew_id: str, yacht_id: str, title: str = "New Chat"):
         "chat": chat
     }
 
-
-def answer_uses_database_context(answer: str, context: str) -> bool:
-    """
-    Decides whether sources should be shown.
-
-    Sources should only appear when:
-    - there was retrieved database context
-    - the assistant did not return the no-data fallback
-    - the answer is not a generic conversational answer
-    """
-
-    clean_answer = (answer or "").strip()
-    clean_context = (context or "").strip()
-
-    if not clean_answer:
-        return False
-
-    if not clean_context:
-        return False
-
-    if clean_answer == FALLBACK_NO_DATA_ANSWER:
-        return False
-
-    generic_answers = {
-        "hi",
-        "hello",
-        "hey",
-        "hi! how can i help you?",
-        "hello! how can i help you?",
-        "how can i help you today?",
-        "hi! how can i help you with your yacht documents or operations today?"
-    }
-
-    if clean_answer.lower() in generic_answers:
-        return False
-
-    return True
 
 def list_my_chats(crew_id: str, yacht_id: str):
     """
@@ -1603,75 +1507,6 @@ def get_asset_for_download(asset_id: str, crew: dict):
 
     return res.data[0]
 
-def get_asset_preview(asset_id: str, crew: dict, highlight: str | None = None):
-    """
-    Returns safe preview data for an asset.
-
-    Security:
-    - Checks the asset is accessible to this crew member.
-    - Checks same yacht.
-    - Returns extracted text / OCR / image description only.
-    - Does not expose storage_path or file_url.
-    """
-
-    accessible_asset_ids = get_accessible_asset_ids(
-        crew_id=crew["id"],
-        yacht_id=crew["yacht_id"],
-        security_level=crew["security_level"]
-    )
-
-    if asset_id not in accessible_asset_ids:
-        raise HTTPException(status_code=403, detail="No access to this asset")
-
-    res = supabase.table("assets") \
-        .select("""
-            id,
-            yacht_id,
-            file_name,
-            original_file_name,
-            file_type,
-            mime_type,
-            extracted_text,
-            visual_description,
-            ocr_text,
-            summary,
-            detected_year,
-            detected_event,
-            tags,
-            processing_status
-        """) \
-        .eq("id", asset_id) \
-        .eq("yacht_id", crew["yacht_id"]) \
-        .execute()
-
-    if not res.data:
-        raise HTTPException(status_code=404, detail="Asset not found")
-
-    asset = res.data[0]
-
-    preview_text = "\n\n".join([
-        asset.get("extracted_text") or "",
-        asset.get("ocr_text") or "",
-        asset.get("visual_description") or ""
-    ]).strip()
-
-    if not preview_text:
-        preview_text = asset.get("summary") or ""
-
-    return {
-        "asset_id": asset["id"],
-        "file_name": asset.get("file_name"),
-        "original_file_name": asset.get("original_file_name"),
-        "file_type": asset.get("file_type"),
-        "mime_type": asset.get("mime_type"),
-        "detected_year": asset.get("detected_year"),
-        "detected_event": asset.get("detected_event"),
-        "tags": asset.get("tags"),
-        "processing_status": asset.get("processing_status"),
-        "preview_text": preview_text,
-        "highlight_text": highlight or ""
-    }
-
 def seed_text_asset(
     file_name: str,
     content: str,
@@ -2421,47 +2256,39 @@ Content:
 
     return "\n\n---\n\n".join(parts)
 
-def _short_excerpt(text: str | None, max_length: int = 500) -> str:
-    if not text:
-        return ""
-
-    clean = " ".join(str(text).split())
-
-    if len(clean) <= max_length:
-        return clean
-
-    return clean[:max_length].rstrip() + "..."
-
-
 def build_sources_from_asset_results(results: list[dict]) -> list[dict]:
     """
     Builds the sources returned to the frontend.
 
-    Each source includes:
-    - asset_id: used to open preview
-    - file_name: displayed to user
-    - matched_content: exact chunk used for the answer
-    - highlight_text: text frontend can highlight in preview
+    Important:
+    - Do not return file_url.
+    - Do not return storage_path.
+    - The frontend should only receive safe metadata.
+    - If the frontend needs to open the file, it must call the signed-url endpoint.
     """
 
+    seen = set()
     sources = []
 
     for row in results:
-        matched_content = row.get("content") or ""
+        asset_id = row.get("asset_id")
+
+        if asset_id in seen:
+            continue
+
+        seen.add(asset_id)
 
         sources.append({
-            "asset_id": row.get("asset_id"),
+            "asset_id": asset_id,
             "file_name": row.get("file_name"),
             "file_type": row.get("file_type"),
             "content_type": row.get("content_type"),
             "detected_year": row.get("detected_year"),
-            "chunk_index": row.get("chunk_index"),
-            "matched_content": matched_content,
-            "excerpt": _short_excerpt(matched_content, 350),
-            "highlight_text": _short_excerpt(matched_content, 220)
+            "matched_content": row.get("content")
         })
 
     return sources
+
 # ------------------------
 # DOCUMENT ACCESS
 # ------------------------
@@ -2696,272 +2523,137 @@ def chat(
     chat_id: str
 ):
     """
-    Chat rules:
-    - General questions use normal AI and return no sources.
-    - Database/yacht-document questions search Supabase and may return sources.
-    - Backend errors return JSON, not frontend load failure.
+    Secure yacht-isolated chat flow.
+
+    Rules:
+    - The chat must belong to this exact crew member.
+    - The user can only search assets from their own yacht.
+    - Security level 1 can search all yacht assets.
+    - Security level 2/3 can search only explicitly authorized assets.
+    - No user can search another yacht's files.
     """
 
-    clean_query = (query or "").strip()
-
-    if not clean_query:
-        return {
-            "answer": "Please enter a question.",
-            "sources": []
-        }
-
-    try:
-        chat_row = verify_chat_access(
-            chat_id=chat_id,
-            crew_id=crew_id,
-            yacht_id=yacht_id
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        print("CHAT ERROR: verify_chat_access failed:", type(e).__name__, str(e))
-        raise HTTPException(status_code=403, detail="Chat not found or not yours")
-
-    safe_save_message(
+    chat_row = verify_chat_access(
         chat_id=chat_id,
-        yacht_id=yacht_id,
         crew_id=crew_id,
-        role="user",
-        content=clean_query
+        yacht_id=yacht_id
     )
 
+    supabase.table("messages").insert({
+        "chat_id": chat_id,
+        "yacht_id": yacht_id,
+        "crew_id": crew_id,
+        "role": "user",
+        "content": query
+    }).execute()
+
     if chat_row.get("title") == "New Chat":
-        safe_update_chat_title(
-            chat_id=chat_id,
-            crew_id=crew_id,
-            yacht_id=yacht_id,
-            title=clean_query
-        )
+        supabase.table("chats").update({
+            "title": query[:60],
+            "updated_at": "now()"
+        }).eq("id", chat_id).eq("crew_id", crew_id).eq("yacht_id", yacht_id).execute()
 
-    route = classify_query_route(clean_query)
-
-    print("CHAT ROUTE:", route)
-
-    # GENERAL AI ANSWER
-    # Important: no Supabase search and no sources.
-    if route == "general":
-        answer = ask_general_llm(clean_query)
-
-        safe_save_message(
-            chat_id=chat_id,
-            yacht_id=yacht_id,
-            crew_id=crew_id,
-            role="assistant",
-            content=answer
-        )
-
-        safe_touch_chat(
-            chat_id=chat_id,
-            crew_id=crew_id,
-            yacht_id=yacht_id
-        )
-
-        return {
-            "answer": answer,
-            "sources": [],
-            "route": "general"
-        }
-
-    # DATABASE / DOCUMENT ANSWER
-    try:
-        accessible_asset_ids = get_accessible_asset_ids(
-            crew_id=crew_id,
-            yacht_id=yacht_id,
-            security_level=security_level
-        )
-
-        print("LOCAL CHAT DEBUG: yacht_id:", yacht_id)
-        print("LOCAL CHAT DEBUG: crew_id:", crew_id)
-        print("LOCAL CHAT DEBUG: security_level:", security_level)
-        print("LOCAL CHAT DEBUG: accessible_asset_ids:", accessible_asset_ids)
-
-    except Exception as e:
-        print("CHAT ERROR: get_accessible_asset_ids failed:", type(e).__name__, str(e))
-
-        answer = FALLBACK_NO_DATA_ANSWER
-
-        safe_save_message(
-            chat_id=chat_id,
-            yacht_id=yacht_id,
-            crew_id=crew_id,
-            role="assistant",
-            content=answer
-        )
-
-        safe_touch_chat(chat_id, crew_id, yacht_id)
-
-        return {
-            "answer": answer,
-            "sources": [],
-            "route": "database",
-            "error": True
-        }
+    accessible_asset_ids = get_accessible_asset_ids(
+        crew_id=crew_id,
+        yacht_id=yacht_id,
+        security_level=security_level
+    )
 
     if not accessible_asset_ids:
         answer = FALLBACK_NO_DATA_ANSWER
 
-        safe_save_message(
-            chat_id=chat_id,
-            yacht_id=yacht_id,
-            crew_id=crew_id,
-            role="assistant",
-            content=answer
-        )
-
-        safe_touch_chat(chat_id, crew_id, yacht_id)
+        supabase.table("messages").insert({
+            "chat_id": chat_id,
+            "yacht_id": yacht_id,
+            "crew_id": crew_id,
+            "role": "assistant",
+            "content": answer
+        }).execute()
 
         return {
             "answer": answer,
-            "sources": [],
-            "route": "database"
+            "sources": []
         }
 
-    try:
-        assets_res = supabase.table("assets") \
-            .select("id") \
-            .eq("yacht_id", yacht_id) \
-            .in_("id", accessible_asset_ids) \
-            .execute()
+    assets_res = supabase.table("assets") \
+        .select("id") \
+        .eq("yacht_id", yacht_id) \
+        .in_("id", accessible_asset_ids) \
+        .execute()
 
-        allowed_asset_ids = [asset["id"] for asset in (assets_res.data or [])]
-
-    except Exception as e:
-        print("CHAT ERROR: assets lookup failed:", type(e).__name__, str(e))
-
-        answer = FALLBACK_NO_DATA_ANSWER
-
-        safe_save_message(
-            chat_id=chat_id,
-            yacht_id=yacht_id,
-            crew_id=crew_id,
-            role="assistant",
-            content=answer
-        )
-
-        safe_touch_chat(chat_id, crew_id, yacht_id)
-
-        return {
-            "answer": answer,
-            "sources": [],
-            "route": "database",
-            "error": True
-        }
+    allowed_asset_ids = [asset["id"] for asset in assets_res.data]
 
     if not allowed_asset_ids:
         answer = FALLBACK_NO_DATA_ANSWER
 
-        safe_save_message(
-            chat_id=chat_id,
-            yacht_id=yacht_id,
-            crew_id=crew_id,
-            role="assistant",
-            content=answer
-        )
-
-        safe_touch_chat(chat_id, crew_id, yacht_id)
-
-        return {
-            "answer": answer,
-            "sources": [],
-            "route": "database"
-        }
-
-    try:
-        filters = extract_query_filters(clean_query)
-        year_filter = filters.get("year")
-
-        results = supabase.rpc("match_asset_chunks_secure", {
-            "query_embedding": embed(clean_query),
-            "match_count": 12,
-            "allowed_asset_ids": allowed_asset_ids,
-            "yacht_filter": yacht_id,
-            "year_filter": year_filter
+        supabase.table("messages").insert({
+            "chat_id": chat_id,
+            "yacht_id": yacht_id,
+            "crew_id": crew_id,
+            "role": "assistant",
+            "content": answer
         }).execute()
 
-        matched_rows = results.data or []
+        return {
+            "answer": answer,
+            "sources": []
+        }
 
-        print("LOCAL CHAT DEBUG: matched chunks:", len(matched_rows))
+    filters = extract_query_filters(query)
+    year_filter = filters.get("year")
 
-    except Exception as e:
-        print("CHAT ERROR: vector search failed:", type(e).__name__, str(e))
+    results = supabase.rpc("match_asset_chunks_secure", {
+        "query_embedding": embed(query),
+        "match_count": 12,
+        "allowed_asset_ids": allowed_asset_ids,
+        "yacht_filter": yacht_id,
+        "year_filter": year_filter
+    }).execute()
 
+    if not results.data:
         answer = FALLBACK_NO_DATA_ANSWER
 
-        safe_save_message(
-            chat_id=chat_id,
-            yacht_id=yacht_id,
-            crew_id=crew_id,
-            role="assistant",
-            content=answer
-        )
-
-        safe_touch_chat(chat_id, crew_id, yacht_id)
+        supabase.table("messages").insert({
+            "chat_id": chat_id,
+            "yacht_id": yacht_id,
+            "crew_id": crew_id,
+            "role": "assistant",
+            "content": answer
+        }).execute()
 
         return {
             "answer": answer,
-            "sources": [],
-            "route": "database",
-            "error": True
+            "sources": []
         }
 
-    if not matched_rows:
-        answer = FALLBACK_NO_DATA_ANSWER
-
-        safe_save_message(
-            chat_id=chat_id,
-            yacht_id=yacht_id,
-            crew_id=crew_id,
-            role="assistant",
-            content=answer
-        )
-
-        safe_touch_chat(chat_id, crew_id, yacht_id)
-
-        return {
-            "answer": answer,
-            "sources": [],
-            "route": "database"
-        }
-
-    context = build_context_from_asset_results(matched_rows)
+    context = build_context_from_asset_results(results.data)
 
     if not context.strip():
         answer = FALLBACK_NO_DATA_ANSWER
     else:
         answer = ask_llm(
-            query=clean_query,
+            query=query,
             context=context
         )
 
-    sources = []
+    supabase.table("messages").insert({
+        "chat_id": chat_id,
+        "yacht_id": yacht_id,
+        "crew_id": crew_id,
+        "role": "assistant",
+        "content": answer
+    }).execute()
 
-    if answer_uses_database_context(
-        answer=answer,
-        context=context
-    ):
-        sources = build_sources_from_asset_results(matched_rows)
+    supabase.table("chats").update({
+        "updated_at": "now()"
+    }).eq("id", chat_id).eq("crew_id", crew_id).eq("yacht_id", yacht_id).execute()
 
-    safe_save_message(
-        chat_id=chat_id,
-        yacht_id=yacht_id,
-        crew_id=crew_id,
-        role="assistant",
-        content=answer
-    )
-
-    safe_touch_chat(chat_id, crew_id, yacht_id)
+    sources = build_sources_from_asset_results(results.data)
 
     return {
         "answer": answer,
-        "sources": sources,
-        "route": "database"
+        "sources": sources
     }
-    
 # ------------------------
 # TEMP DEMO LOGIN FOR TESTING ONLY
 # Remove before production.
@@ -3131,3 +2823,4 @@ def test_login_response():
         },
         "crew": crew
     }
+ 
