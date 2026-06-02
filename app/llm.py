@@ -10,24 +10,37 @@ FALLBACK_NO_DATA_ANSWER = (
 
 def ask_llm(query: str, context: str = "") -> str:
     """
-    Calls your own BridgeOS / RunPod LLM.
+    Calls your own RunPod LLM.
 
     No OpenAI.
-    Uses the same RunPod payload style that was already working in services.py.
+    Uses a simple payload:
+    {
+      "user_input": "...",
+      "history": [],
+      "backend_context": {...}
+    }
     """
 
     if not RUNPOD_BASE_URL:
-        print("LLM ERROR: RUNPOD_BASE_URL is missing")
+        print("RUNPOD LLM ERROR: RUNPOD_BASE_URL missing")
         return FALLBACK_NO_DATA_ANSWER
 
     if not BRIDGEOS_API_KEY:
-        print("LLM ERROR: BRIDGEOS_API_KEY is missing")
+        print("RUNPOD LLM ERROR: BRIDGEOS_API_KEY missing")
         return FALLBACK_NO_DATA_ANSWER
 
     url = f"{RUNPOD_BASE_URL.rstrip('/')}/api/bridgeos/chat"
 
     if context and context.strip():
         user_input = f"""
+You are BridgeOS, a helpful yacht assistant.
+
+Answer the user naturally.
+
+If the provided context directly answers the question, use it.
+If the provided context is not relevant, answer normally.
+
+User question:
 {query}
 
 Context:
@@ -47,10 +60,7 @@ Context:
             json={
                 "user_input": user_input,
                 "history": [],
-                "backend_context": {
-                    "source": "bridgeos_backend",
-                    "has_document_context": bool(context and context.strip())
-                }
+                "backend_context": {}
             },
             headers={
                 "Content-Type": "application/json",
@@ -78,14 +88,9 @@ Context:
         answer = str(answer or "").strip()
 
         if not answer:
-            print("RUNPOD LLM ERROR: empty answer from response json:", data)
             return FALLBACK_NO_DATA_ANSWER
 
         return answer
-
-    except requests.exceptions.Timeout:
-        print("RUNPOD LLM TIMEOUT")
-        return FALLBACK_NO_DATA_ANSWER
 
     except Exception as e:
         print("RUNPOD LLM REQUEST ERROR:", type(e).__name__, str(e))
