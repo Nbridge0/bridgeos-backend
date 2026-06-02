@@ -2525,12 +2525,11 @@ def chat(
     """
     Hybrid chat flow.
 
-    Behavior:
-    - Always answers normally.
-    - Searches the yacht database first.
-    - If the database has a relevant answer, database content has priority.
-    - If no good database match exists, answer normally from the model.
-    - If a document was used, return sources and append a document reference.
+    Correct behavior:
+    - Search uploaded yacht documents/assets first.
+    - If matching chunks are found, answer using those chunks.
+    - If no document chunks are found, answer normally.
+    - When documents are used, return sources and add document reference.
     """
 
     chat_row = verify_chat_access(
@@ -2559,9 +2558,13 @@ def chat(
         security_level=security_level
     )
 
-    results = None
-    sources = []
+    print("LOCAL CHAT DEBUG: yacht_id:", yacht_id)
+    print("LOCAL CHAT DEBUG: crew_id:", crew_id)
+    print("LOCAL CHAT DEBUG: security_level:", security_level)
+    print("LOCAL CHAT DEBUG: accessible_asset_ids:", accessible_asset_ids)
+
     context = ""
+    sources = []
 
     if accessible_asset_ids:
         assets_res = supabase.table("assets") \
@@ -2578,7 +2581,7 @@ def chat(
 
             results = supabase.rpc("match_asset_chunks_secure", {
                 "query_embedding": embed(query),
-                "match_count": 6,
+                "match_count": 12,
                 "allowed_asset_ids": allowed_asset_ids,
                 "yacht_filter": yacht_id,
                 "year_filter": year_filter
@@ -2586,28 +2589,11 @@ def chat(
 
             matched_rows = results.data or []
 
-            # IMPORTANT:
-            # Only use database context when the match is actually relevant.
-            # Adjust threshold if your Supabase function returns similarity/distance differently.
-            relevant_rows = []
-            for row in matched_rows:
-                similarity = row.get("similarity")
-                distance = row.get("distance")
+            print("LOCAL CHAT DEBUG: matched chunks:", len(matched_rows))
 
-                if similarity is not None:
-                    if float(similarity) >= 0.72:
-                        relevant_rows.append(row)
-                elif distance is not None:
-                    if float(distance) <= 0.35:
-                        relevant_rows.append(row)
-                else:
-                    # If your RPC does not return similarity/distance,
-                    # keep the row, but limit the number of chunks.
-                    relevant_rows.append(row)
-
-            if relevant_rows:
-                context = build_context_from_asset_results(relevant_rows[:4])
-                sources = build_sources_from_asset_results(relevant_rows[:4])
+            if matched_rows:
+                context = build_context_from_asset_results(matched_rows)
+                sources = build_sources_from_asset_results(matched_rows)
 
     if context.strip():
         answer = ask_llm(
@@ -2615,37 +2601,46 @@ def chat(
             context=f"""
 You are BridgeOS.
 
-Answer the user's question naturally.
+The user asked:
+{query}
 
-Use the DATABASE CONTEXT below only if it directly answers the question.
-The database has priority over general knowledge when it is relevant.
-Do not force database context into unrelated questions.
-If you use database context, end the answer with:
+Use the uploaded document context below to answer the question.
+The uploaded document context has priority over general knowledge.
 
+Important rules:
+- If the answer is in the uploaded documents, answer from the documents.
+- Be clear and natural.
+- Do not say you cannot answer if the document context contains useful information.
+- Do not mention unrelated document content.
+- At the end, include:
 Document reference: <file name>
 
-DATABASE CONTEXT:
+Uploaded document context:
 {context}
 """.strip()
         )
 
         if sources:
-            first_source = sources[0]
-            file_name = first_source.get("file_name") or "Uploaded document"
+            file_names = []
+            for source in sources:
+                name = source.get("file_name")
+                if name and name not in file_names:
+                    file_names.append(name)
+
+            reference_text = ", ".join(file_names) if file_names else "Uploaded document"
 
             if "Document reference:" not in answer:
-                answer = f"{answer}\n\nDocument reference: {file_name}"
+                answer = f"{answer}\n\nDocument reference: {reference_text}"
 
     else:
-        # No useful database match: answer normally.
         answer = ask_llm(
             query=query,
             context="""
 You are BridgeOS.
 
-Answer the user's question normally and helpfully.
-There is no relevant yacht database/document context for this question.
-Do not mention documents or sources.
+No relevant uploaded document chunks were found for this question.
+Answer the user normally and helpfully using general knowledge.
+Do not mention document references.
 """.strip()
         )
 
