@@ -163,6 +163,8 @@ def signup_admin(email: str, password: str, full_name: str, yacht_name: str):
         "crew": crew_res.data[0]
     }
     
+
+
 def dev_create_admin(email: str, password: str, full_name: str, yacht_name: str):
     """
     DEV ONLY.
@@ -349,6 +351,8 @@ def dev_login(email: str, full_name: str = "Test Admin", yacht_name: str = "Test
         },
         "crew": crew
     }
+
+
 
 def chat_with_runpod_bridgeos(
     query: str,
@@ -674,6 +678,43 @@ def create_chat(crew_id: str, yacht_id: str, title: str = "New Chat"):
         "chat": chat
     }
 
+
+def answer_uses_database_context(answer: str, context: str) -> bool:
+    """
+    Decides whether sources should be shown.
+
+    Sources should only appear when:
+    - there was retrieved database context
+    - the assistant did not return the no-data fallback
+    - the answer is not a generic conversational answer
+    """
+
+    clean_answer = (answer or "").strip()
+    clean_context = (context or "").strip()
+
+    if not clean_answer:
+        return False
+
+    if not clean_context:
+        return False
+
+    if clean_answer == FALLBACK_NO_DATA_ANSWER:
+        return False
+
+    generic_answers = {
+        "hi",
+        "hello",
+        "hey",
+        "hi! how can i help you?",
+        "hello! how can i help you?",
+        "how can i help you today?",
+        "hi! how can i help you with your yacht documents or operations today?"
+    }
+
+    if clean_answer.lower() in generic_answers:
+        return False
+
+    return True
 
 def list_my_chats(crew_id: str, yacht_id: str):
     """
@@ -2624,6 +2665,26 @@ def chat(
         "content": query
     }).execute()
 
+    if is_small_talk_query(query):
+        answer = "Hi! How can I help you with your yacht documents or operations today?"
+
+        supabase.table("messages").insert({
+            "chat_id": chat_id,
+            "yacht_id": yacht_id,
+            "crew_id": crew_id,
+            "role": "assistant",
+            "content": answer
+        }).execute()
+
+        supabase.table("chats").update({
+            "updated_at": "now()"
+        }).eq("id", chat_id).eq("crew_id", crew_id).eq("yacht_id", yacht_id).execute()
+
+        return {
+            "answer": answer,
+            "sources": []
+        }
+
     if chat_row.get("title") == "New Chat":
         supabase.table("chats").update({
             "title": query[:60],
@@ -2719,6 +2780,16 @@ def chat(
             context=context
         )
 
+    should_show_sources = answer_uses_database_context(
+        answer=answer,
+        context=context
+    )
+
+    sources = []
+
+    if should_show_sources:
+        sources = build_sources_from_asset_results(results.data)
+
     supabase.table("messages").insert({
         "chat_id": chat_id,
         "yacht_id": yacht_id,
@@ -2730,8 +2801,6 @@ def chat(
     supabase.table("chats").update({
         "updated_at": "now()"
     }).eq("id", chat_id).eq("crew_id", crew_id).eq("yacht_id", yacht_id).execute()
-
-    sources = build_sources_from_asset_results(results.data)
 
     return {
         "answer": answer,
