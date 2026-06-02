@@ -2523,14 +2523,14 @@ def chat(
     chat_id: str
 ):
     """
-    Secure yacht-isolated chat flow.
+    Hybrid chat flow.
 
-    Rules:
-    - The chat must belong to this exact crew member.
-    - The user can only search assets from their own yacht.
-    - Security level 1 can search all yacht assets.
-    - Security level 2/3 can search only explicitly authorized assets.
-    - No user can search another yacht's files.
+    Behavior:
+    - Always answers normally.
+    - Searches the yacht database first.
+    - If the database has a relevant answer, database content has priority.
+    - If no good database match exists, answer normally from the model.
+    - If a document was used, return sources and append a document reference.
     """
 
     chat_row = verify_chat_access(
@@ -2558,87 +2558,95 @@ def chat(
         yacht_id=yacht_id,
         security_level=security_level
     )
-    print("LOCAL CHAT DEBUG: yacht_id:", yacht_id)
-    print("LOCAL CHAT DEBUG: crew_id:", crew_id)
-    print("LOCAL CHAT DEBUG: security_level:", security_level)
-    print("LOCAL CHAT DEBUG: accessible_asset_ids:", accessible_asset_ids)
 
-    if not accessible_asset_ids:
-        answer = FALLBACK_NO_DATA_ANSWER
+    results = None
+    sources = []
+    context = ""
 
-        supabase.table("messages").insert({
-            "chat_id": chat_id,
-            "yacht_id": yacht_id,
-            "crew_id": crew_id,
-            "role": "assistant",
-            "content": answer
-        }).execute()
+    if accessible_asset_ids:
+        assets_res = supabase.table("assets") \
+            .select("id") \
+            .eq("yacht_id", yacht_id) \
+            .in_("id", accessible_asset_ids) \
+            .execute()
 
-        return {
-            "answer": answer,
-            "sources": []
-        }
+        allowed_asset_ids = [asset["id"] for asset in (assets_res.data or [])]
 
-    assets_res = supabase.table("assets") \
-        .select("id") \
-        .eq("yacht_id", yacht_id) \
-        .in_("id", accessible_asset_ids) \
-        .execute()
+        if allowed_asset_ids:
+            filters = extract_query_filters(query)
+            year_filter = filters.get("year")
 
-    allowed_asset_ids = [asset["id"] for asset in assets_res.data]
+            results = supabase.rpc("match_asset_chunks_secure", {
+                "query_embedding": embed(query),
+                "match_count": 6,
+                "allowed_asset_ids": allowed_asset_ids,
+                "yacht_filter": yacht_id,
+                "year_filter": year_filter
+            }).execute()
 
-    if not allowed_asset_ids:
-        answer = FALLBACK_NO_DATA_ANSWER
+            matched_rows = results.data or []
 
-        supabase.table("messages").insert({
-            "chat_id": chat_id,
-            "yacht_id": yacht_id,
-            "crew_id": crew_id,
-            "role": "assistant",
-            "content": answer
-        }).execute()
+            # IMPORTANT:
+            # Only use database context when the match is actually relevant.
+            # Adjust threshold if your Supabase function returns similarity/distance differently.
+            relevant_rows = []
+            for row in matched_rows:
+                similarity = row.get("similarity")
+                distance = row.get("distance")
 
-        return {
-            "answer": answer,
-            "sources": []
-        }
+                if similarity is not None:
+                    if float(similarity) >= 0.72:
+                        relevant_rows.append(row)
+                elif distance is not None:
+                    if float(distance) <= 0.35:
+                        relevant_rows.append(row)
+                else:
+                    # If your RPC does not return similarity/distance,
+                    # keep the row, but limit the number of chunks.
+                    relevant_rows.append(row)
 
-    filters = extract_query_filters(query)
-    year_filter = filters.get("year")
+            if relevant_rows:
+                context = build_context_from_asset_results(relevant_rows[:4])
+                sources = build_sources_from_asset_results(relevant_rows[:4])
 
-    results = supabase.rpc("match_asset_chunks_secure", {
-        "query_embedding": embed(query),
-        "match_count": 12,
-        "allowed_asset_ids": allowed_asset_ids,
-        "yacht_filter": yacht_id,
-        "year_filter": year_filter
-    }).execute()
-    print("LOCAL CHAT DEBUG: matched chunks:", len(results.data or []))
-
-    if not results.data:
-        answer = FALLBACK_NO_DATA_ANSWER
-
-        supabase.table("messages").insert({
-            "chat_id": chat_id,
-            "yacht_id": yacht_id,
-            "crew_id": crew_id,
-            "role": "assistant",
-            "content": answer
-        }).execute()
-
-        return {
-            "answer": answer,
-            "sources": []
-        }
-
-    context = build_context_from_asset_results(results.data)
-
-    if not context.strip():
-        answer = FALLBACK_NO_DATA_ANSWER
-    else:
+    if context.strip():
         answer = ask_llm(
             query=query,
-            context=context
+            context=f"""
+You are BridgeOS.
+
+Answer the user's question naturally.
+
+Use the DATABASE CONTEXT below only if it directly answers the question.
+The database has priority over general knowledge when it is relevant.
+Do not force database context into unrelated questions.
+If you use database context, end the answer with:
+
+Document reference: <file name>
+
+DATABASE CONTEXT:
+{context}
+""".strip()
+        )
+
+        if sources:
+            first_source = sources[0]
+            file_name = first_source.get("file_name") or "Uploaded document"
+
+            if "Document reference:" not in answer:
+                answer = f"{answer}\n\nDocument reference: {file_name}"
+
+    else:
+        # No useful database match: answer normally.
+        answer = ask_llm(
+            query=query,
+            context="""
+You are BridgeOS.
+
+Answer the user's question normally and helpfully.
+There is no relevant yacht database/document context for this question.
+Do not mention documents or sources.
+""".strip()
         )
 
     supabase.table("messages").insert({
@@ -2652,8 +2660,6 @@ def chat(
     supabase.table("chats").update({
         "updated_at": "now()"
     }).eq("id", chat_id).eq("crew_id", crew_id).eq("yacht_id", yacht_id).execute()
-
-    sources = build_sources_from_asset_results(results.data)
 
     return {
         "answer": answer,
