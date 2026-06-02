@@ -1507,6 +1507,75 @@ def get_asset_for_download(asset_id: str, crew: dict):
 
     return res.data[0]
 
+def get_asset_preview(asset_id: str, crew: dict, highlight: str | None = None):
+    """
+    Returns safe preview data for an asset.
+
+    Security:
+    - Checks the asset is accessible to this crew member.
+    - Checks same yacht.
+    - Returns extracted text / OCR / image description only.
+    - Does not expose storage_path or file_url.
+    """
+
+    accessible_asset_ids = get_accessible_asset_ids(
+        crew_id=crew["id"],
+        yacht_id=crew["yacht_id"],
+        security_level=crew["security_level"]
+    )
+
+    if asset_id not in accessible_asset_ids:
+        raise HTTPException(status_code=403, detail="No access to this asset")
+
+    res = supabase.table("assets") \
+        .select("""
+            id,
+            yacht_id,
+            file_name,
+            original_file_name,
+            file_type,
+            mime_type,
+            extracted_text,
+            visual_description,
+            ocr_text,
+            summary,
+            detected_year,
+            detected_event,
+            tags,
+            processing_status
+        """) \
+        .eq("id", asset_id) \
+        .eq("yacht_id", crew["yacht_id"]) \
+        .execute()
+
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Asset not found")
+
+    asset = res.data[0]
+
+    preview_text = "\n\n".join([
+        asset.get("extracted_text") or "",
+        asset.get("ocr_text") or "",
+        asset.get("visual_description") or ""
+    ]).strip()
+
+    if not preview_text:
+        preview_text = asset.get("summary") or ""
+
+    return {
+        "asset_id": asset["id"],
+        "file_name": asset.get("file_name"),
+        "original_file_name": asset.get("original_file_name"),
+        "file_type": asset.get("file_type"),
+        "mime_type": asset.get("mime_type"),
+        "detected_year": asset.get("detected_year"),
+        "detected_event": asset.get("detected_event"),
+        "tags": asset.get("tags"),
+        "processing_status": asset.get("processing_status"),
+        "preview_text": preview_text,
+        "highlight_text": highlight or ""
+    }
+
 def seed_text_asset(
     file_name: str,
     content: str,
@@ -2256,39 +2325,47 @@ Content:
 
     return "\n\n---\n\n".join(parts)
 
+def _short_excerpt(text: str | None, max_length: int = 500) -> str:
+    if not text:
+        return ""
+
+    clean = " ".join(str(text).split())
+
+    if len(clean) <= max_length:
+        return clean
+
+    return clean[:max_length].rstrip() + "..."
+
+
 def build_sources_from_asset_results(results: list[dict]) -> list[dict]:
     """
     Builds the sources returned to the frontend.
 
-    Important:
-    - Do not return file_url.
-    - Do not return storage_path.
-    - The frontend should only receive safe metadata.
-    - If the frontend needs to open the file, it must call the signed-url endpoint.
+    Each source includes:
+    - asset_id: used to open preview
+    - file_name: displayed to user
+    - matched_content: exact chunk used for the answer
+    - highlight_text: text frontend can highlight in preview
     """
 
-    seen = set()
     sources = []
 
     for row in results:
-        asset_id = row.get("asset_id")
-
-        if asset_id in seen:
-            continue
-
-        seen.add(asset_id)
+        matched_content = row.get("content") or ""
 
         sources.append({
-            "asset_id": asset_id,
+            "asset_id": row.get("asset_id"),
             "file_name": row.get("file_name"),
             "file_type": row.get("file_type"),
             "content_type": row.get("content_type"),
             "detected_year": row.get("detected_year"),
-            "matched_content": row.get("content")
+            "chunk_index": row.get("chunk_index"),
+            "matched_content": matched_content,
+            "excerpt": _short_excerpt(matched_content, 350),
+            "highlight_text": _short_excerpt(matched_content, 220)
         })
 
     return sources
-
 # ------------------------
 # DOCUMENT ACCESS
 # ------------------------

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException, Depends
+from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException, Depends, Query
 from fastapi.responses import StreamingResponse
 import io
 from urllib.parse import quote
@@ -790,6 +790,26 @@ async def download_asset_api(
         headers={
             "Content-Disposition": f"attachment; filename*=UTF-8''{safe_download_name}"
         }
+    )
+
+@app.get("/assets/{asset_id}/preview")
+async def preview_asset_api(
+    asset_id: str,
+    request: Request,
+    highlight: Optional[str] = Query(None),
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    crew = services.get_crew(user["sub"])
+
+    if not crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.get_asset_preview(
+        asset_id=asset_id,
+        crew=crew,
+        highlight=highlight
     )
 
 @app.post("/assets/{asset_id}/authorize")
