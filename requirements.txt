@@ -7,7 +7,6 @@ requests
 PyJWT
 pydantic[email]
 python-multipart
-openai
 pypdf
 python-docx
 TXT
