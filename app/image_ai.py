@@ -1,11 +1,3 @@
-import base64
-from openai import OpenAI
-
-from app.config import OPENAI_API_KEY
-
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-
 def _file_to_data_url(file, filename: str) -> str:
     file.seek(0)
     data = file.read()
@@ -28,69 +20,22 @@ def _file_to_data_url(file, filename: str) -> str:
 
 
 def describe_image(file, filename: str) -> str:
-    data_url = _file_to_data_url(file, filename)
+    """
+    No-OpenAI image description placeholder.
 
-    response = client.responses.create(
-        model="gpt-4.1-mini",
-        input=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": """
-Describe this image for a private yacht memory/search system.
-
-Include:
-- visible objects
-- setting/location on the yacht if inferable
-- decorations
-- event clues
-- visible dates or text
-- season/holiday clues
-- colors and arrangement
-- anything useful for future search
-
-Do not invent exact dates unless visible or provided.
-"""
-                    },
-                    {
-                        "type": "input_image",
-                        "image_url": data_url
-                    }
-                ]
-            }
-        ]
-    )
-
-    return response.output_text or ""
+    This keeps uploads working without OpenAI.
+    If you later add image understanding to your own LLM/RunPod,
+    replace this function with a RunPod vision call.
+    """
+    return ""
 
 
 def extract_ocr_from_image(file, filename: str) -> str:
-    data_url = _file_to_data_url(file, filename)
+    """
+    No-OpenAI OCR placeholder.
 
-    response = client.responses.create(
-        model="gpt-4.1-mini",
-        input=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": """
-Extract any visible text from this image.
-
-Return only the visible text.
-If there is no visible text, return an empty string.
-"""
-                    },
-                    {
-                        "type": "input_image",
-                        "image_url": data_url
-                    }
-                ]
-            }
-        ]
-    )
-
-    return response.output_text or ""
+    This keeps image uploads working without OpenAI.
+    If you later add OCR to your own LLM/RunPod,
+    replace this function with a RunPod OCR call.
+    """
+    return ""
