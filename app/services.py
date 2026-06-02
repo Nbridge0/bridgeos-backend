@@ -1,6 +1,6 @@
 from fastapi import HTTPException
 import requests
-
+import json
 from app.database import supabase
 from app.embeddings import embed
 from app.config import BUCKET_NAME, RUNPOD_BASE_URL, BRIDGEOS_API_KEY
@@ -2512,6 +2512,32 @@ def upload_image(file, filename: str, yacht_id: str, uploaded_by: str):
         mime_type=None
     )
 
+def parse_llm_json_response(raw_text: str):
+    """
+    Safely parses a JSON object from the LLM response.
+    No hardcoded questions. No keyword matching.
+    """
+
+    if not raw_text:
+        return None
+
+    raw_text = str(raw_text).strip()
+
+    try:
+        return json.loads(raw_text)
+    except Exception:
+        pass
+
+    try:
+        start = raw_text.find("{")
+        end = raw_text.rfind("}") + 1
+
+        if start >= 0 and end > start:
+            return json.loads(raw_text[start:end])
+    except Exception:
+        pass
+
+    return None
 
 # ------------------------
 # CHAT SECURE
@@ -2524,13 +2550,16 @@ def chat(
     chat_id: str
 ):
     """
-    Hybrid chat flow.
+    Dynamic hybrid chat.
 
-    Correct behavior:
-    - Search uploaded yacht documents/assets first.
-    - If matching chunks are found, answer using those chunks.
-    - If no document chunks are found, answer normally.
-    - When documents are used, return sources and add document reference.
+    Behavior:
+    - Always returns {"answer": "...", "sources": [...]}
+    - Searches uploaded yacht documents/assets.
+    - Gives retrieved document context to the LLM.
+    - The LLM dynamically decides whether the document was actually used.
+    - Sources are returned ONLY when document_used is true.
+    - No hardcoded questions.
+    - No keyword matching.
     """
 
     chat_row = verify_chat_access(
@@ -2553,123 +2582,166 @@ def chat(
             "updated_at": "now()"
         }).eq("id", chat_id).eq("crew_id", crew_id).eq("yacht_id", yacht_id).execute()
 
-    accessible_asset_ids = get_accessible_asset_ids(
-        crew_id=crew_id,
-        yacht_id=yacht_id,
-        security_level=security_level
-    )
-
-    print("LOCAL CHAT DEBUG: yacht_id:", yacht_id)
-    print("LOCAL CHAT DEBUG: crew_id:", crew_id)
-    print("LOCAL CHAT DEBUG: security_level:", security_level)
-    print("LOCAL CHAT DEBUG: accessible_asset_ids:", accessible_asset_ids)
-
-    context = ""
+    answer = ""
     sources = []
+    matched_rows = []
+    context = ""
 
-    if accessible_asset_ids:
-        assets_res = supabase.table("assets") \
-            .select("id") \
-            .eq("yacht_id", yacht_id) \
-            .in_("id", accessible_asset_ids) \
-            .execute()
+    try:
+        accessible_asset_ids = get_accessible_asset_ids(
+            crew_id=crew_id,
+            yacht_id=yacht_id,
+            security_level=security_level
+        )
 
-        allowed_asset_ids = [asset["id"] for asset in (assets_res.data or [])]
+        print("LOCAL CHAT DEBUG: yacht_id:", yacht_id)
+        print("LOCAL CHAT DEBUG: crew_id:", crew_id)
+        print("LOCAL CHAT DEBUG: security_level:", security_level)
+        print("LOCAL CHAT DEBUG: accessible_asset_ids:", accessible_asset_ids)
 
-        if allowed_asset_ids:
-            filters = extract_query_filters(query)
-            year_filter = filters.get("year")
+        if accessible_asset_ids:
+            assets_res = supabase.table("assets") \
+                .select("id") \
+                .eq("yacht_id", yacht_id) \
+                .in_("id", accessible_asset_ids) \
+                .execute()
 
-            results = supabase.rpc("match_asset_chunks_secure", {
-                "query_embedding": embed(query),
-                "match_count": 12,
-                "allowed_asset_ids": allowed_asset_ids,
-                "yacht_filter": yacht_id,
-                "year_filter": year_filter
-            }).execute()
+            allowed_asset_ids = [
+                asset["id"]
+                for asset in (assets_res.data or [])
+                if asset.get("id")
+            ]
 
-            matched_rows = results.data or []
+            print("LOCAL CHAT DEBUG: allowed_asset_ids:", allowed_asset_ids)
 
-            context = ""
+            if allowed_asset_ids:
+                filters = extract_query_filters(query)
+                year_filter = filters.get("year")
+
+                results = supabase.rpc("match_asset_chunks_secure", {
+                    "query_embedding": embed(query),
+                    "match_count": 12,
+                    "allowed_asset_ids": allowed_asset_ids,
+                    "yacht_filter": yacht_id,
+                    "year_filter": year_filter
+                }).execute()
+
+                matched_rows = results.data or []
+
+                print("LOCAL CHAT DEBUG: matched chunks:", len(matched_rows))
+
+                if matched_rows:
+                    context = build_context_from_asset_results(matched_rows)
+
+    except Exception as e:
+        print("LOCAL CHAT DOCUMENT SEARCH ERROR:", type(e).__name__, str(e))
+        matched_rows = []
+        context = ""
+
+    if context.strip():
+        raw_answer = ask_llm(
+            query=query,
+            context=f"""
+You are BridgeOS.
+
+You must decide dynamically whether the uploaded document context is actually useful for answering the user's question.
+
+Return ONLY valid JSON in this exact shape:
+
+{{
+  "answer": "final user-facing answer here",
+  "document_used": true,
+  "document_reference_needed": true
+}}
+
+or:
+
+{{
+  "answer": "final user-facing answer here",
+  "document_used": false,
+  "document_reference_needed": false
+}}
+
+Rules:
+- Do not use keyword matching.
+- Do not assume the document is relevant just because it was retrieved.
+- Set "document_used": true only if the final answer is actually based on the uploaded document context.
+- Set "document_used": false if the answer is normal/general or if the uploaded document context does not directly support the answer.
+- Do not include document references inside the answer. The backend will add references only when document_used is true.
+- The answer must be natural and helpful.
+- Return JSON only. Do not wrap it in markdown.
+
+User question:
+{query}
+
+Uploaded document context:
+{context}
+""".strip()
+        )
+
+        parsed = parse_llm_json_response(raw_answer)
+
+        if parsed and isinstance(parsed, dict):
+            answer = str(parsed.get("answer") or "").strip()
+            document_used = bool(parsed.get("document_used"))
+        else:
+            print("LOCAL CHAT JSON ROUTING PARSE FAILED:", str(raw_answer)[:500])
+            answer = str(raw_answer or "").strip()
+            document_used = False
+
+        if not answer:
+            answer = "I could not generate a response. Please try again."
+
+        if document_used:
+            sources = build_sources_from_asset_results(matched_rows)
+
+            file_names = []
+
+            for source in sources:
+                name = source.get("file_name")
+                if name and name not in file_names:
+                    file_names.append(name)
+
+            if file_names and "Document reference:" not in answer:
+                answer = f"{answer}\n\nDocument reference: {', '.join(file_names)}"
+        else:
             sources = []
 
-            if matched_rows:
-                context = build_context_from_asset_results(matched_rows)
+    else:
+        answer = ask_llm(
+            query=query,
+            context="""
+You are BridgeOS.
 
-            if context.strip():
-                raw_answer = ask_llm(
-                    query=query,
-                    context=f"""
-            You are BridgeOS.
+Answer the user normally and helpfully.
+No uploaded document context is available for this answer.
+Do not include document references.
+""".strip()
+        )
 
-            The user asked:
-            {query}
+        answer = str(answer or "").strip()
 
-            Below is retrieved uploaded document context. It may or may not be relevant.
+        if not answer:
+            answer = "I could not generate a response. Please try again."
 
-            Your job:
-            1. Decide whether the uploaded document context directly answers the user's question.
-            2. If it directly answers the question, answer using the document context.
-            3. If it does not directly answer the question, answer normally from general knowledge.
+        sources = []
 
-            At the very end of your response, add exactly one hidden routing line:
+    supabase.table("messages").insert({
+        "chat_id": chat_id,
+        "yacht_id": yacht_id,
+        "crew_id": crew_id,
+        "role": "assistant",
+        "content": answer
+    }).execute()
 
-            DOCUMENT_USED: YES
+    supabase.table("chats").update({
+        "updated_at": "now()"
+    }).eq("id", chat_id).eq("crew_id", crew_id).eq("yacht_id", yacht_id).execute()
 
-            or
-
-            DOCUMENT_USED: NO
-
-            Rules:
-            - Use DOCUMENT_USED: YES only if the final answer is actually based on the uploaded document context.
-            - Use DOCUMENT_USED: NO for greetings, small talk, general questions, or when the document context is unrelated.
-            - Do not invent document references.
-            - Do not mention document sources unless DOCUMENT_USED is YES.
-
-            Uploaded document context:
-            {context}
-            """.strip()
-                )
-
-                document_used = "DOCUMENT_USED: YES" in raw_answer
-
-                answer = (
-                    raw_answer
-                    .replace("DOCUMENT_USED: YES", "")
-                    .replace("DOCUMENT_USED: NO", "")
-                    .strip()
-                )
-
-                if document_used:
-                    sources = build_sources_from_asset_results(matched_rows)
-
-                    if sources:
-                        file_names = []
-                        for source in sources:
-                            name = source.get("file_name")
-                            if name and name not in file_names:
-                                file_names.append(name)
-
-                        reference_text = ", ".join(file_names) if file_names else "Uploaded document"
-
-                        if "Document reference:" not in answer:
-                            answer = f"{answer}\n\nDocument reference: {reference_text}"
-                else:
-                    sources = []
-
-            else:
-                answer = ask_llm(
-                    query=query,
-                    context="""
-            You are BridgeOS.
-
-            Answer the user normally and helpfully.
-            There is no uploaded document context available for this question.
-            Do not mention documents.
-            Do not include document references.
-            """.strip()
-                )
-                sources = []
+    return {
+        "answer": answer,
+        "sources": sources
+    }
 # ------------------------
 # TEMP DEMO LOGIN FOR TESTING ONLY
 # Remove before production.
