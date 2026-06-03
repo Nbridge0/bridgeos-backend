@@ -2740,10 +2740,12 @@ Strict rules:
 - If the answer is not explicitly found in the uploaded document context, the answer must be exactly: "Sorry, I don't have this data yet. Please ask your admin to upload it."
 - When using that fallback answer, set "document_used": false, "used_source_numbers": [], and "used_source_titles": [].
 - Set "document_used": true only when the final answer is directly supported by the uploaded document context.
-- Include in "used_source_numbers" ONLY the SOURCE numbers whose content directly supports the answer.
-- Include in "used_source_titles" ONLY the exact file names whose content directly supports the answer.
+- Include in "used_source_numbers" ONLY the SOURCE numbers whose content directly supports the final answer.
+- Include in "used_source_titles" ONLY the exact file names whose content directly supports the final answer.
+- If the final answer uses one document, include only that one document.
+- If the final answer combines information from two or more documents, include all and only those documents.
 - Do not include retrieved files that were not used in the final answer.
-- If the answer is based on one SOP, include only that SOP source number and file name.
+- Do not include a source just because it was retrieved. Include it only if its content appears in or directly supports the answer.
 - Do not include document references inside the answer. The frontend will show sources separately.
 - Return JSON only. Do not wrap it in markdown.
 
