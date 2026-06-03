@@ -746,6 +746,24 @@ async def get_asset_signed_url_api(
         crew=crew
     )
 
+@app.get("/assets/{asset_id}/preview")
+async def get_asset_preview_api(
+    asset_id: str,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    crew = services.get_crew(user["sub"])
+
+    if not crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.create_asset_preview(
+        asset_id=asset_id,
+        crew=crew
+    )
+
 @app.get("/assets/{asset_id}/download")
 async def download_asset_api(
     asset_id: str,

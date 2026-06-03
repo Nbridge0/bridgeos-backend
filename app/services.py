@@ -1481,6 +1481,78 @@ def create_asset_signed_url(asset_id: str, crew: dict):
         "signed_url": signed_url
     }
 
+def create_asset_preview(asset_id: str, crew: dict):
+    accessible_asset_ids = get_accessible_asset_ids(
+        crew_id=crew["id"],
+        yacht_id=crew["yacht_id"],
+        security_level=crew["security_level"]
+    )
+
+    if asset_id not in accessible_asset_ids:
+        raise HTTPException(status_code=403, detail="No access to this asset")
+
+    res = supabase.table("assets") \
+        .select("*") \
+        .eq("id", asset_id) \
+        .eq("yacht_id", crew["yacht_id"]) \
+        .execute()
+
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Asset not found")
+
+    asset = res.data[0]
+
+    title = (
+        asset.get("original_file_name")
+        or asset.get("file_name")
+        or "Document preview"
+    )
+
+    extracted_text = (
+        asset.get("extracted_text")
+        or asset.get("ocr_text")
+        or asset.get("visual_description")
+        or ""
+    )
+
+    storage_path = asset.get("storage_path")
+    mime_type = asset.get("mime_type") or "application/octet-stream"
+
+    if storage_path:
+        try:
+            signed = storage_admin.storage.from_(BUCKET_NAME).create_signed_url(
+                storage_path,
+                60 * 10
+            )
+
+            signed_url = signed.get("signedURL") or signed.get("signed_url")
+
+            if signed_url:
+                return {
+                    "asset_id": asset_id,
+                    "title": title,
+                    "preview_type": "url",
+                    "url": signed_url,
+                    "mime_type": mime_type
+                }
+
+        except Exception as e:
+            print("PREVIEW SIGNED URL ERROR:", type(e).__name__, str(e))
+
+    if extracted_text.strip():
+        return {
+            "asset_id": asset_id,
+            "title": title,
+            "preview_type": "text",
+            "text": extracted_text,
+            "mime_type": "text/plain"
+        }
+
+    raise HTTPException(
+        status_code=404,
+        detail="No preview available for this asset"
+    )
+
 def get_asset_for_download(asset_id: str, crew: dict):
     """
     Gets an asset only if this crew member has access to it.
@@ -2257,13 +2329,6 @@ Content:
     return "\n\n---\n\n".join(parts)
 
 def build_sources_from_asset_results(results: list[dict]) -> list[dict]:
-    """
-    Builds the sources returned to the frontend.
-
-    Frontend should only receive the document title.
-    Do not return matched chunks, tags, file type, year, storage paths, or URLs.
-    """
-
     seen = set()
     sources = []
 
@@ -2699,10 +2764,10 @@ Uploaded document context:
             for source in sources:
                 name = source.get("title") or source.get("file_name")
                 if name and name not in file_names:
-                    file_names.append(name)
+            file_names.append(name)
 
-            if file_names and "Document reference:" not in answer:
-                answer = f"{answer}\n\nDocument reference: {', '.join(file_names)}"
+    if file_names and "Document reference:" not in answer:
+        answer = f"{answer}\n\nDocument reference: {', '.join(file_names)}"
         else:
             sources = []
 
