@@ -3257,8 +3257,10 @@ Strict rules:
 - Do not invent steps, warnings, locations, equipment, names, dates, or procedures.
 - If the document context contains the answer, answer only from that context.
 - If the user asks "what should I do in case of..." and the answer is in the SOP/context, extract the relevant procedure from the context and present it clearly.
-- If the context only partially answers the question, say only what the document says and clearly say the document does not provide more detail.
-- If none of the requested information is explicitly found in the uploaded document context, the answer must be exactly: "Sorry, I don't have this data yet. Please ask your admin to upload it."
+- If the user asks whether a document/procedure/report says something about a specific topic, object, operation, action, person, place, or requirement, only answer if that exact requested thing is explicitly present in the uploaded document context.
+- If the exact requested thing is not explicitly present in the uploaded document context, the answer must be exactly: "Sorry, I don't have this data yet. Please ask your admin to upload it."
+- Do not answer by using a broader related section. Do not infer that a missing topic is covered by another topic.
+- If none of the requested information is explicitly found in the uploaded document context, or if the user asks about a specific topic that is not explicitly named or clearly described in the context, the answer must be exactly: "Sorry, I don't have this data yet. Please ask your admin to upload it."
 - When using that fallback answer, set "document_used": false, "used_source_numbers": [], and "used_source_titles": [].
 - Set "document_used": true only when the final answer is directly supported by the uploaded document context.
 - If the user asks multiple things in one message, answer each requested part separately.
@@ -3275,6 +3277,7 @@ Strict rules:
 - Do not include document references inside the answer. The frontend will show sources separately.
 - Return JSON only. Do not wrap it in markdown.
 - Use the memory-aware retrieval query only to understand follow-up context. The factual answer must still come only from the uploaded document context.
+- Never say "the document does not provide additional details" for a topic that is not explicitly in the document. Use the fallback answer instead.
 
 Memory-aware retrieval query:
 {retrieval_query_input}
