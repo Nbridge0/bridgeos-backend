@@ -2844,7 +2844,7 @@ def keyword_match_asset_chunks(
     except Exception as e:
         print("KEYWORD FILE SEARCH ERROR:", type(e).__name__, str(e))
 
-    return matched[:limit]chat code i want 
+    return matched[:limit]
 
 # ------------------------
 # CHAT SECURE
