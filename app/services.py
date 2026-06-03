@@ -2706,16 +2706,16 @@ def chat(
         raw_answer = ask_llm(
             query=query,
             context=f"""
-You are BridgeOS.
+You are BridgeOS, a document-grounded yacht assistant.
 
-You must decide dynamically whether the uploaded document context is actually useful for answering the user's question.
+You must answer using ONLY the uploaded document context when the question is about yacht procedures, SOPs, safety, audits, operations, maintenance, guest instructions, emergencies, equipment, crew actions, or document content.
 
 Return ONLY valid JSON in this exact shape:
 
 {{
   "answer": "final user-facing answer here",
   "document_used": true,
-  "document_reference_needed": true
+  "used_source_titles": ["exact file name used for the answer"]
 }}
 
 or:
@@ -2723,16 +2723,25 @@ or:
 {{
   "answer": "final user-facing answer here",
   "document_used": false,
-  "document_reference_needed": false
+  "used_source_titles": []
 }}
 
-Rules:
-- Do not use keyword matching.
-- Do not assume the document is relevant just because it was retrieved.
-- Set "document_used": true only if the final answer is actually based on the uploaded document context.
-- Set "document_used": false if the answer is normal/general or if the uploaded document context does not directly support the answer.
-- Do not include document references inside the answer. The backend will add references only when document_used is true.
-- The answer must be natural and helpful.
+Strict rules:
+- Do not hallucinate.
+- Do not add general maritime knowledge.
+- Do not add advice that is not explicitly supported by the uploaded document context.
+- Do not invent steps, warnings, locations, equipment, names, dates, or procedures.
+- If the document context contains the answer, answer only from that context.
+- If the user asks "what should I do in case of..." and the answer is in the SOP/context, extract the relevant procedure from the context and present it clearly.
+- If the context only partially answers the question, say what the document says and clearly say that the document does not provide more detail.
+- If the answer is not in the uploaded document context, say: "I could not find that in the uploaded documents."
+- Set "document_used": true only when the final answer is supported by the uploaded document context.
+- Set "document_used": false when the retrieved context does not support the answer.
+- Include in "used_source_titles" ONLY the exact file names whose context directly supports the answer.
+- Do not include retrieved files that were not used in the final answer.
+- If the answer is based on one SOP, include only that SOP file name.
+- The file name is shown in the uploaded document context as "File name:".
+- Do not include document references inside the answer. The frontend will show sources separately.
 - Return JSON only. Do not wrap it in markdown.
 
 User question:
@@ -2741,23 +2750,56 @@ User question:
 Uploaded document context:
 {context}
 """.strip()
-        )
+)
 
         parsed = parse_llm_json_response(raw_answer)
+
+        used_source_titles = []
 
         if parsed and isinstance(parsed, dict):
             answer = str(parsed.get("answer") or "").strip()
             document_used = bool(parsed.get("document_used"))
+
+            raw_used_titles = parsed.get("used_source_titles") or []
+
+            if isinstance(raw_used_titles, list):
+                used_source_titles = [
+                    str(title).strip()
+                    for title in raw_used_titles
+                    if str(title).strip()
+               ]
         else:
             print("LOCAL CHAT JSON ROUTING PARSE FAILED:", str(raw_answer)[:500])
             answer = str(raw_answer or "").strip()
             document_used = False
-
+            used_source_titles = []
         if not answer:
             answer = "I could not generate a response. Please try again."
 
         if document_used:
-            sources = build_sources_from_asset_results(matched_rows)
+            all_sources = build_sources_from_asset_results(matched_rows)
+
+            if used_source_titles:
+                normalized_used_titles = {
+                    title.lower().strip()
+                    for title in used_source_titles
+                }
+
+                sources = [
+                    source
+                    for source in all_sources
+                    if (
+                        str(source.get("title") or "").lower().strip()
+                        in normalized_used_titles
+                        or str(source.get("file_name") or "").lower().strip()
+                        in normalized_used_titles
+                    )
+                ]
+
+                if not sources:
+                    sources = all_sources[:1]
+            else:
+                sources = all_sources[:1]
         else:
             sources = []
 
