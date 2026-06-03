@@ -2614,16 +2614,14 @@ def chat(
     chat_id: str
 ):
     """
-    Dynamic hybrid chat.
+    Secure document-grounded chat.
 
     Behavior:
-    - Always returns {"answer": "...", "sources": [...]}
-    - Searches uploaded yacht documents/assets.
-    - Gives retrieved document context to the LLM.
-    - The LLM dynamically decides whether the document was actually used.
-    - Sources are returned ONLY when document_used is true.
-    - No hardcoded questions.
-    - No keyword matching.
+    - Searches accessible uploaded yacht assets.
+    - Answers ONLY from uploaded document context.
+    - If no supported answer exists, returns FALLBACK_NO_DATA_ANSWER.
+    - Sources are returned ONLY for the exact document chunks used.
+    - No hallucinations.
     """
 
     chat_row = verify_chat_access(
@@ -2684,7 +2682,7 @@ def chat(
 
                 results = supabase.rpc("match_asset_chunks_secure", {
                     "query_embedding": embed(query),
-                    "match_count": 12,
+                    "match_count": 6,
                     "allowed_asset_ids": allowed_asset_ids,
                     "yacht_filter": yacht_id,
                     "year_filter": year_filter
@@ -2710,19 +2708,24 @@ You are BridgeOS, a document-grounded yacht assistant.
 
 You must answer using ONLY the uploaded document context when the question is about yacht procedures, SOPs, safety, audits, operations, maintenance, guest instructions, emergencies, equipment, crew actions, or document content.
 
+The uploaded context is divided into numbered blocks like SOURCE 1, SOURCE 2, SOURCE 3.
+Each source block includes a file name and content.
+
 Return ONLY valid JSON in this exact shape:
 
 {{
   "answer": "final user-facing answer here",
   "document_used": true,
+  "used_source_numbers": [1],
   "used_source_titles": ["exact file name used for the answer"]
 }}
 
 or:
 
 {{
-  "answer": "final user-facing answer here",
+  "answer": "Sorry, I don't have this data yet. Please ask your admin to upload it.",
   "document_used": false,
+  "used_source_numbers": [],
   "used_source_titles": []
 }}
 
@@ -2733,14 +2736,14 @@ Strict rules:
 - Do not invent steps, warnings, locations, equipment, names, dates, or procedures.
 - If the document context contains the answer, answer only from that context.
 - If the user asks "what should I do in case of..." and the answer is in the SOP/context, extract the relevant procedure from the context and present it clearly.
-- If the context only partially answers the question, say what the document says and clearly say that the document does not provide more detail.
-- If the answer is not in the uploaded document context, say: "I could not find that in the uploaded documents."
-- Set "document_used": true only when the final answer is supported by the uploaded document context.
-- Set "document_used": false when the retrieved context does not support the answer.
-- Include in "used_source_titles" ONLY the exact file names whose context directly supports the answer.
+- If the context only partially answers the question, say only what the document says and clearly say the document does not provide more detail.
+- If the answer is not explicitly found in the uploaded document context, the answer must be exactly: "Sorry, I don't have this data yet. Please ask your admin to upload it."
+- When using that fallback answer, set "document_used": false, "used_source_numbers": [], and "used_source_titles": [].
+- Set "document_used": true only when the final answer is directly supported by the uploaded document context.
+- Include in "used_source_numbers" ONLY the SOURCE numbers whose content directly supports the answer.
+- Include in "used_source_titles" ONLY the exact file names whose content directly supports the answer.
 - Do not include retrieved files that were not used in the final answer.
-- If the answer is based on one SOP, include only that SOP file name.
-- The file name is shown in the uploaded document context as "File name:".
+- If the answer is based on one SOP, include only that SOP source number and file name.
 - Do not include document references inside the answer. The frontend will show sources separately.
 - Return JSON only. Do not wrap it in markdown.
 
@@ -2750,76 +2753,93 @@ User question:
 Uploaded document context:
 {context}
 """.strip()
-)
+        )
 
         parsed = parse_llm_json_response(raw_answer)
 
+        document_used = False
+        used_source_numbers = []
         used_source_titles = []
 
         if parsed and isinstance(parsed, dict):
             answer = str(parsed.get("answer") or "").strip()
             document_used = bool(parsed.get("document_used"))
 
+            raw_used_numbers = parsed.get("used_source_numbers") or []
             raw_used_titles = parsed.get("used_source_titles") or []
+
+            if isinstance(raw_used_numbers, list):
+                for number in raw_used_numbers:
+                    try:
+                        number = int(number)
+                        if number > 0:
+                            used_source_numbers.append(number)
+                    except Exception:
+                        pass
 
             if isinstance(raw_used_titles, list):
                 used_source_titles = [
                     str(title).strip()
                     for title in raw_used_titles
                     if str(title).strip()
-               ]
+                ]
+
         else:
             print("LOCAL CHAT JSON ROUTING PARSE FAILED:", str(raw_answer)[:500])
-            answer = str(raw_answer or "").strip()
+            answer = FALLBACK_NO_DATA_ANSWER
             document_used = False
+            used_source_numbers = []
             used_source_titles = []
+
         if not answer:
-            answer = "I could not generate a response. Please try again."
+            answer = FALLBACK_NO_DATA_ANSWER
+            document_used = False
+            used_source_numbers = []
+            used_source_titles = []
 
-        if document_used:
-            all_sources = build_sources_from_asset_results(matched_rows)
+        if answer.strip() == FALLBACK_NO_DATA_ANSWER:
+            document_used = False
+            used_source_numbers = []
+            used_source_titles = []
 
-            if used_source_titles:
+        if document_used and answer.strip() != FALLBACK_NO_DATA_ANSWER:
+            source_rows = []
+
+            if used_source_numbers:
+                for source_number in used_source_numbers:
+                    index = source_number - 1
+
+                    if 0 <= index < len(matched_rows):
+                        source_rows.append(matched_rows[index])
+
+            if not source_rows and used_source_titles:
                 normalized_used_titles = {
                     title.lower().strip()
                     for title in used_source_titles
                 }
 
-                sources = [
-                    source
-                    for source in all_sources
-                    if (
-                        str(source.get("title") or "").lower().strip()
-                        in normalized_used_titles
-                        or str(source.get("file_name") or "").lower().strip()
-                        in normalized_used_titles
-                    )
-                ]
+                for row in matched_rows:
+                    row_file_name = str(row.get("file_name") or "").lower().strip()
+                    row_original_name = str(row.get("original_file_name") or "").lower().strip()
 
-                if not sources:
-                    sources = all_sources[:1]
-            else:
-                sources = all_sources[:1]
+                    if (
+                        row_file_name in normalized_used_titles
+                        or row_original_name in normalized_used_titles
+                    ):
+                        source_rows.append(row)
+
+            if not source_rows:
+                # Last-resort fallback:
+                # show only the top matched source, never all yacht documents.
+                source_rows = matched_rows[:1]
+
+            sources = build_sources_from_asset_results(source_rows)
+
         else:
             sources = []
 
     else:
-        answer = ask_llm(
-            query=query,
-            context="""
-You are BridgeOS.
-
-Answer the user normally and helpfully.
-No uploaded document context is available for this answer.
-Do not include document references.
-""".strip()
-        )
-
-        answer = str(answer or "").strip()
-
-        if not answer:
-            answer = "I could not generate a response. Please try again."
-
+        answer = FALLBACK_NO_DATA_ANSWER
         sources = []
 
     supabase.table("messages").insert({
