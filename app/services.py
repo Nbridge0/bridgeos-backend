@@ -2719,7 +2719,9 @@ def keyword_match_asset_chunks(
         "a", "an", "is", "are", "be", "for", "with",
         "give", "tell", "me", "about", "summary",
         "summarize", "please", "can", "you", "from",
-        "report", "document", "file", "form"
+        "report", "document", "file", "form","previous", 
+        "current", "user", "request", "chat","conversation", 
+        "message", "question"
     }
 
     raw_tokens = (
@@ -3013,6 +3015,69 @@ Current question:
         print("STANDALONE QUERY REWRITE ERROR:", type(e).__name__, str(e))
 
     return query
+
+def get_previous_user_query(chat_id: str, current_query: str) -> str:
+    """
+    Gets the previous user message in this same chat.
+
+    This is generic memory for follow-up questions.
+    It does not hardcode document names, topics, SOPs, reports, years, or examples.
+    """
+
+    try:
+        res = supabase.table("messages") \
+            .select("role, content, created_at") \
+            .eq("chat_id", chat_id) \
+            .eq("role", "user") \
+            .order("created_at", desc=True) \
+            .limit(6) \
+            .execute()
+
+        rows = res.data or []
+        current_clean = (current_query or "").strip()
+
+        for index, row in enumerate(rows):
+            content = (row.get("content") or "").strip()
+
+            if not content:
+                continue
+
+            # The newest row is usually the current message because chat()
+            # inserts it before retrieval. Skip it.
+            if index == 0 and content == current_clean:
+                continue
+
+            return content
+
+    except Exception as e:
+        print("PREVIOUS USER QUERY ERROR:", type(e).__name__, str(e))
+
+    return ""
+
+
+def build_memory_aware_retrieval_input(query: str, chat_id: str) -> str:
+    """
+    Builds a retrieval query using the previous user message as chat memory.
+
+    The previous message is used only to resolve context.
+    The answer must still come from uploaded document chunks.
+    """
+
+    previous_query = get_previous_user_query(
+        chat_id=chat_id,
+        current_query=query
+    )
+
+    if not previous_query:
+        return query
+
+    return f"""
+Previous user request in this chat:
+{previous_query}
+
+Current user request:
+{query}
+""".strip()
     
 # ------------------------
 # CHAT SECURE
@@ -3091,7 +3156,7 @@ def chat(
             print("LOCAL CHAT DEBUG: allowed_asset_ids:", allowed_asset_ids)
 
             if allowed_asset_ids:
-                retrieval_query_input = build_standalone_retrieval_query(
+                retrieval_query_input = build_memory_aware_retrieval_input(
                     query=query,
                     chat_id=chat_id
                 )
@@ -3104,6 +3169,23 @@ def chat(
                 for retrieval_query in retrieval_queries:
                     filters = extract_query_filters(retrieval_query)
                     year_filter = filters.get("year")
+
+                    keyword_rows = keyword_match_asset_chunks(
+                        retrieval_query=retrieval_query,
+                        allowed_asset_ids=allowed_asset_ids,
+                        yacht_id=yacht_id,
+                        limit=8
+                    )
+
+                    for row in keyword_rows:
+                        key = (
+                            row.get("asset_id"),
+                            row.get("chunk_index"),
+                            row.get("content_type")
+                        )
+
+                        if key not in matched_rows_by_key:
+                            matched_rows_by_key[key] = row
 
                     try:
                         semantic_results = supabase.rpc("match_asset_chunks_secure", {
@@ -3126,22 +3208,6 @@ def chat(
 
                     except Exception as e:
                         print("SEMANTIC SEARCH ERROR:", type(e).__name__, str(e))
-
-                    keyword_rows = keyword_match_asset_chunks(
-                        retrieval_query=retrieval_query,
-                        allowed_asset_ids=allowed_asset_ids,
-                        yacht_id=yacht_id,
-                        limit=8
-                    )
-
-                    for row in keyword_rows:
-                        key = (
-                            row.get("asset_id"),
-                            row.get("chunk_index"),
-                            row.get("content_type")
-                        )
-
-                        matched_rows_by_key[key] = row
 
                 matched_rows = list(matched_rows_by_key.values())[:30]
 
@@ -3208,8 +3274,12 @@ Strict rules:
 - If the user identifies a specific document, form, report, procedure, code, reference, or title using words from the query, prefer source blocks whose file name or content matches those words, unless another source is explicitly needed.
 - Do not include document references inside the answer. The frontend will show sources separately.
 - Return JSON only. Do not wrap it in markdown.
+- Use the memory-aware retrieval query only to understand follow-up context. The factual answer must still come only from the uploaded document context.
 
-User question:
+Memory-aware retrieval query:
+{retrieval_query_input}
+
+Original user question:
 {query}
 
 Uploaded document context:
