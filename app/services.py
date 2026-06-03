@@ -2603,6 +2603,92 @@ def parse_llm_json_response(raw_text: str):
 
     return None
 
+def build_retrieval_queries(query: str) -> list[str]:
+    """
+    Builds multiple retrieval queries from one user question without hardcoding
+    document names, years, SOP IDs, or topics.
+
+    This helps combined questions by searching:
+    - the full question
+    - each meaningful sub-question
+    """
+
+    clean_query = (query or "").strip()
+
+    if not clean_query:
+        return []
+
+    queries = [clean_query]
+
+    normalized = clean_query
+    separators = [
+        "?",
+        ";",
+        "\n",
+        " and ",
+        " also ",
+        " plus ",
+        " as well as ",
+        " together with ",
+        " along with ",
+        " then ",
+        " compare ",
+        " versus ",
+        " vs "
+    ]
+
+    candidate_parts = [normalized]
+
+    for separator in separators:
+        next_parts = []
+
+        for part in candidate_parts:
+            split_parts = part.split(separator)
+            next_parts.extend(split_parts)
+
+        candidate_parts = next_parts
+
+    for part in candidate_parts:
+        part = part.strip(" .,-;:\n\t")
+
+        if len(part) >= 8:
+            queries.append(part)
+
+    # Add generic identifier-like tokens such as SOP-SAF-008, ISM-123,
+    # SAF-001, SMS/abc/003, etc. This is pattern-based, not document-specific.
+    tokens = (
+        clean_query
+        .replace(",", " ")
+        .replace("?", " ")
+        .replace(";", " ")
+        .replace(":", " ")
+        .replace("(", " ")
+        .replace(")", " ")
+        .split()
+    )
+
+    for token in tokens:
+        token = token.strip(" .,-;:\n\t")
+
+        has_digit = any(char.isdigit() for char in token)
+        has_separator = "-" in token or "/" in token or "_" in token
+
+        if len(token) >= 4 and has_digit and has_separator:
+            queries.append(token)
+
+    unique_queries = []
+    seen = set()
+
+    for item in queries:
+        item = item.strip()
+        key = item.lower()
+
+        if item and key not in seen:
+            seen.add(key)
+            unique_queries.append(item)
+
+    return unique_queries[:8]
+
 # ------------------------
 # CHAT SECURE
 # ------------------------
@@ -2618,9 +2704,11 @@ def chat(
 
     Behavior:
     - Searches accessible uploaded yacht assets.
+    - Supports multi-part questions by retrieving for each sub-question.
     - Answers ONLY from uploaded document context.
     - If no supported answer exists, returns FALLBACK_NO_DATA_ANSWER.
-    - Sources are returned ONLY for the exact document chunks used.
+    - Sources are returned ONLY for documents actually used.
+    - If multiple documents support the final answer, all used documents are returned.
     - No hallucinations.
     """
 
@@ -2677,18 +2765,35 @@ def chat(
             print("LOCAL CHAT DEBUG: allowed_asset_ids:", allowed_asset_ids)
 
             if allowed_asset_ids:
-                filters = extract_query_filters(query)
-                year_filter = filters.get("year")
+                retrieval_queries = build_retrieval_queries(query)
 
-                results = supabase.rpc("match_asset_chunks_secure", {
-                    "query_embedding": embed(query),
-                    "match_count": 6,
-                    "allowed_asset_ids": allowed_asset_ids,
-                    "yacht_filter": yacht_id,
-                    "year_filter": year_filter
-                }).execute()
+                print("LOCAL CHAT DEBUG: retrieval_queries:", retrieval_queries)
 
-                matched_rows = results.data or []
+                matched_rows_by_key = {}
+
+                for retrieval_query in retrieval_queries:
+                    filters = extract_query_filters(retrieval_query)
+                    year_filter = filters.get("year")
+
+                    results = supabase.rpc("match_asset_chunks_secure", {
+                        "query_embedding": embed(retrieval_query),
+                        "match_count": 6,
+                        "allowed_asset_ids": allowed_asset_ids,
+                        "yacht_filter": yacht_id,
+                        "year_filter": year_filter
+                    }).execute()
+
+                    for row in results.data or []:
+                        key = (
+                            row.get("asset_id"),
+                            row.get("chunk_index"),
+                            row.get("content_type")
+                        )
+
+                        if key not in matched_rows_by_key:
+                            matched_rows_by_key[key] = row
+
+                matched_rows = list(matched_rows_by_key.values())[:18]
 
                 print("LOCAL CHAT DEBUG: matched chunks:", len(matched_rows))
 
@@ -2737,13 +2842,16 @@ Strict rules:
 - If the document context contains the answer, answer only from that context.
 - If the user asks "what should I do in case of..." and the answer is in the SOP/context, extract the relevant procedure from the context and present it clearly.
 - If the context only partially answers the question, say only what the document says and clearly say the document does not provide more detail.
-- If the answer is not explicitly found in the uploaded document context, the answer must be exactly: "Sorry, I don't have this data yet. Please ask your admin to upload it."
+- If none of the requested information is explicitly found in the uploaded document context, the answer must be exactly: "Sorry, I don't have this data yet. Please ask your admin to upload it."
 - When using that fallback answer, set "document_used": false, "used_source_numbers": [], and "used_source_titles": [].
 - Set "document_used": true only when the final answer is directly supported by the uploaded document context.
+- If the user asks multiple things in one message, answer each requested part separately.
+- Use every uploaded source block that directly supports any part of the final answer.
 - Include in "used_source_numbers" ONLY the SOURCE numbers whose content directly supports the final answer.
 - Include in "used_source_titles" ONLY the exact file names whose content directly supports the final answer.
 - If the final answer uses one document, include only that one document.
 - If the final answer combines information from two or more documents, include all and only those documents.
+- If one requested part is found and another requested part is not found, answer the found part and state that the missing part is not available in the uploaded documents.
 - Do not include retrieved files that were not used in the final answer.
 - Do not include a source just because it was retrieved. Include it only if its content appears in or directly supports the answer.
 - Do not include document references inside the answer. The frontend will show sources separately.
@@ -2831,8 +2939,6 @@ Uploaded document context:
                         source_rows.append(row)
 
             if not source_rows:
-                # Last-resort fallback:
-                # show only the top matched source, never all yacht documents.
                 source_rows = matched_rows[:1]
 
             sources = build_sources_from_asset_results(source_rows)
