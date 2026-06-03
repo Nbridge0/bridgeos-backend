@@ -2690,18 +2690,18 @@ def keyword_match_asset_chunks(
     retrieval_query: str,
     allowed_asset_ids: list[str],
     yacht_id: str,
-    limit: int = 6
+    limit: int = 8
 ) -> list[dict]:
     """
-    Generic keyword fallback.
+    Generic keyword/file-name fallback.
 
-    Finds chunks by:
-    - file name
-    - original file name
-    - chunk content
+    No hardcoded document names, years, reports, SOPs, or topics.
 
-    This helps when a user asks for a specific document/reference and
-    vector search misses it.
+    It scores chunks by:
+    - useful query tokens found in file name
+    - useful query tokens found in original file name
+    - useful query tokens found in chunk content
+    - earlier chunks get a small boost because they often contain title/purpose
     """
 
     if not retrieval_query or not allowed_asset_ids:
@@ -2712,91 +2712,140 @@ def keyword_match_asset_chunks(
     if not clean_query:
         return []
 
-    tokens = [
-        token.strip(" .,-;:\n\t()[]{}").lower()
-        for token in clean_query.split()
-        if len(token.strip(" .,-;:\n\t()[]{}")) >= 3
-    ]
+    stop_words = {
+        "what", "when", "where", "who", "why", "how",
+        "must", "should", "does", "do", "did", "the",
+        "and", "or", "of", "at", "in", "on", "to",
+        "a", "an", "is", "are", "be", "for", "with",
+        "give", "tell", "me", "about", "summary",
+        "summarize", "please", "can", "you", "from",
+        "report", "document", "file", "form"
+    }
+
+    raw_tokens = (
+        clean_query
+        .replace(",", " ")
+        .replace("?", " ")
+        .replace(";", " ")
+        .replace(":", " ")
+        .replace("(", " ")
+        .replace(")", " ")
+        .replace('"', " ")
+        .replace("'", " ")
+        .split()
+    )
+
+    tokens = []
+
+    for token in raw_tokens:
+        clean_token = token.strip(" .,-;:\n\t()[]{}").lower()
+
+        if len(clean_token) < 3:
+            continue
+
+        if clean_token in stop_words:
+            continue
+
+        tokens.append(clean_token)
 
     if not tokens:
         return []
 
-    matched = []
+    scored_rows = {}
+
+    def normalize_row(row):
+        asset_data = row.get("assets") or {}
+
+        return {
+            "asset_id": row.get("asset_id"),
+            "yacht_id": row.get("yacht_id"),
+            "chat_id": row.get("chat_id"),
+            "security_level": row.get("security_level"),
+            "content": row.get("content"),
+            "content_type": row.get("content_type"),
+            "chunk_index": row.get("chunk_index"),
+            "detected_date": row.get("detected_date"),
+            "detected_year": row.get("detected_year"),
+            "tags": row.get("tags"),
+            "file_name": asset_data.get("file_name"),
+            "original_file_name": asset_data.get("original_file_name"),
+            "file_type": asset_data.get("file_type")
+        }
+
+    def score_row(row):
+        file_name = str(row.get("file_name") or "").lower()
+        original_file_name = str(row.get("original_file_name") or "").lower()
+        content = str(row.get("content") or "").lower()
+
+        file_text = f"{file_name} {original_file_name}"
+
+        file_hits = sum(1 for token in tokens if token in file_text)
+        content_hits = sum(1 for token in tokens if token in content)
+
+        score = 0
+
+        score += file_hits * 30
+        score += content_hits * 6
+
+        if len(tokens) >= 2 and file_hits >= 2:
+            score += 80
+
+        if len(tokens) >= 2 and content_hits >= 2:
+            score += 25
+
+        try:
+            chunk_index = int(row.get("chunk_index") or 0)
+            if chunk_index <= 2:
+                score += 8
+        except Exception:
+            pass
+
+        return score
+
+    def add_row(row):
+        normalized = normalize_row(row)
+
+        key = (
+            normalized.get("asset_id"),
+            normalized.get("chunk_index"),
+            normalized.get("content_type")
+        )
+
+        score = score_row(normalized)
+
+        if score <= 0:
+            return
+
+        existing = scored_rows.get(key)
+
+        if not existing or score > existing["score"]:
+            scored_rows[key] = {
+                "score": score,
+                "row": normalized
+            }
 
     try:
-        # Search chunks directly.
-        chunk_query = supabase.table("asset_chunks") \
-            .select("""
-                asset_id,
-                yacht_id,
-                chat_id,
-                security_level,
-                content,
-                content_type,
-                chunk_index,
-                detected_date,
-                detected_year,
-                tags,
-                assets!inner (
-                    id,
-                    file_name,
-                    original_file_name,
-                    file_type
-                )
-            """) \
-            .eq("yacht_id", yacht_id) \
-            .in_("asset_id", allowed_asset_ids)
+        # Search matching file names first.
+        matching_asset_ids = set()
 
-        # Use the strongest token first, usually a reference/document token.
-        strongest_token = max(tokens, key=len)
+        for token in tokens[:8]:
+            asset_res = supabase.table("assets") \
+                .select("id, file_name, original_file_name") \
+                .eq("yacht_id", yacht_id) \
+                .in_("id", allowed_asset_ids) \
+                .or_(
+                    f"file_name.ilike.%{token}%,original_file_name.ilike.%{token}%"
+                ) \
+                .limit(30) \
+                .execute()
 
-        chunk_res = chunk_query.ilike("content", f"%{strongest_token}%") \
-            .limit(limit) \
-            .execute()
+            for asset in asset_res.data or []:
+                asset_id = asset.get("id")
 
-        for row in chunk_res.data or []:
-            asset_data = row.get("assets") or {}
+                if asset_id:
+                    matching_asset_ids.add(asset_id)
 
-            matched.append({
-                "asset_id": row.get("asset_id"),
-                "yacht_id": row.get("yacht_id"),
-                "chat_id": row.get("chat_id"),
-                "security_level": row.get("security_level"),
-                "content": row.get("content"),
-                "content_type": row.get("content_type"),
-                "chunk_index": row.get("chunk_index"),
-                "detected_date": row.get("detected_date"),
-                "detected_year": row.get("detected_year"),
-                "tags": row.get("tags"),
-                "file_name": asset_data.get("file_name"),
-                "original_file_name": asset_data.get("original_file_name"),
-                "file_type": asset_data.get("file_type")
-            })
-
-    except Exception as e:
-        print("KEYWORD CHUNK SEARCH ERROR:", type(e).__name__, str(e))
-
-    try:
-        # Search file names too.
-        strongest_token = max(tokens, key=len)
-
-        asset_res = supabase.table("assets") \
-            .select("id, file_name, original_file_name") \
-            .eq("yacht_id", yacht_id) \
-            .in_("id", allowed_asset_ids) \
-            .or_(
-                f"file_name.ilike.%{strongest_token}%,original_file_name.ilike.%{strongest_token}%"
-            ) \
-            .limit(limit) \
-            .execute()
-
-        asset_ids_from_names = [
-            asset["id"]
-            for asset in asset_res.data or []
-            if asset.get("id")
-        ]
-
-        if asset_ids_from_names:
+        if matching_asset_ids:
             chunks_res = supabase.table("asset_chunks") \
                 .select("""
                     asset_id,
@@ -2817,35 +2866,58 @@ def keyword_match_asset_chunks(
                     )
                 """) \
                 .eq("yacht_id", yacht_id) \
-                .in_("asset_id", asset_ids_from_names) \
+                .in_("asset_id", list(matching_asset_ids)) \
                 .order("chunk_index") \
-                .limit(limit) \
+                .limit(limit * 4) \
                 .execute()
 
             for row in chunks_res.data or []:
-                asset_data = row.get("assets") or {}
-
-                matched.append({
-                    "asset_id": row.get("asset_id"),
-                    "yacht_id": row.get("yacht_id"),
-                    "chat_id": row.get("chat_id"),
-                    "security_level": row.get("security_level"),
-                    "content": row.get("content"),
-                    "content_type": row.get("content_type"),
-                    "chunk_index": row.get("chunk_index"),
-                    "detected_date": row.get("detected_date"),
-                    "detected_year": row.get("detected_year"),
-                    "tags": row.get("tags"),
-                    "file_name": asset_data.get("file_name"),
-                    "original_file_name": asset_data.get("original_file_name"),
-                    "file_type": asset_data.get("file_type")
-                })
+                add_row(row)
 
     except Exception as e:
         print("KEYWORD FILE SEARCH ERROR:", type(e).__name__, str(e))
 
-    return matched[:limit]
+    try:
+        # Search chunk content with useful query tokens.
+        for token in tokens[:8]:
+            chunk_res = supabase.table("asset_chunks") \
+                .select("""
+                    asset_id,
+                    yacht_id,
+                    chat_id,
+                    security_level,
+                    content,
+                    content_type,
+                    chunk_index,
+                    detected_date,
+                    detected_year,
+                    tags,
+                    assets!inner (
+                        id,
+                        file_name,
+                        original_file_name,
+                        file_type
+                    )
+                """) \
+                .eq("yacht_id", yacht_id) \
+                .in_("asset_id", allowed_asset_ids) \
+                .ilike("content", f"%{token}%") \
+                .limit(limit * 4) \
+                .execute()
 
+            for row in chunk_res.data or []:
+                add_row(row)
+
+    except Exception as e:
+        print("KEYWORD CHUNK SEARCH ERROR:", type(e).__name__, str(e))
+
+    ranked = sorted(
+        scored_rows.values(),
+        key=lambda item: item["score"],
+        reverse=True
+    )
+
+    return [item["row"] for item in ranked[:limit]]
 # ------------------------
 # CHAT SECURE
 # ------------------------
@@ -2959,7 +3031,7 @@ def chat(
                         retrieval_query=retrieval_query,
                         allowed_asset_ids=allowed_asset_ids,
                         yacht_id=yacht_id,
-                        limit=6
+                        limit=8
                     )
 
                     for row in keyword_rows:
@@ -2969,10 +3041,9 @@ def chat(
                             row.get("content_type")
                         )
 
-                        if key not in matched_rows_by_key:
-                            matched_rows_by_key[key] = row
+                        matched_rows_by_key[key] = row
 
-                matched_rows = list(matched_rows_by_key.values())[:24]
+                matched_rows = list(matched_rows_by_key.values())[:30]
 
                 print("LOCAL CHAT DEBUG: matched chunks:", len(matched_rows))
 
@@ -3034,6 +3105,7 @@ Strict rules:
 - Do not turn a partially supported multi-part question into the full fallback answer unless none of the requested parts are supported.
 - Do not include retrieved files that were not used in the final answer.
 - Do not include a source just because it was retrieved. Include it only if its content appears in or directly supports the answer.
+- If the user identifies a specific document, form, report, procedure, code, reference, or title using words from the query, prefer source blocks whose file name or content matches those words, unless another source is explicitly needed.
 - Do not include document references inside the answer. The frontend will show sources separately.
 - Return JSON only. Do not wrap it in markdown.
 
