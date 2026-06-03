@@ -2605,12 +2605,8 @@ def parse_llm_json_response(raw_text: str):
 
 def build_retrieval_queries(query: str) -> list[str]:
     """
-    Builds multiple retrieval queries from one user question without hardcoding
-    document names, years, SOP IDs, or topics.
-
-    This helps combined questions by searching:
-    - the full question
-    - each meaningful sub-question
+    Generic multi-part retrieval query builder.
+    No hardcoded document names or topics.
     """
 
     clean_query = (query or "").strip()
@@ -2620,7 +2616,6 @@ def build_retrieval_queries(query: str) -> list[str]:
 
     queries = [clean_query]
 
-    normalized = clean_query
     separators = [
         "?",
         ";",
@@ -2637,7 +2632,7 @@ def build_retrieval_queries(query: str) -> list[str]:
         " vs "
     ]
 
-    candidate_parts = [normalized]
+    candidate_parts = [clean_query]
 
     for separator in separators:
         next_parts = []
@@ -2651,11 +2646,9 @@ def build_retrieval_queries(query: str) -> list[str]:
     for part in candidate_parts:
         part = part.strip(" .,-;:\n\t")
 
-        if len(part) >= 8:
+        if len(part) >= 5:
             queries.append(part)
 
-    # Add generic identifier-like tokens such as SOP-SAF-008, ISM-123,
-    # SAF-001, SMS/abc/003, etc. This is pattern-based, not document-specific.
     tokens = (
         clean_query
         .replace(",", " ")
@@ -2664,6 +2657,8 @@ def build_retrieval_queries(query: str) -> list[str]:
         .replace(":", " ")
         .replace("(", " ")
         .replace(")", " ")
+        .replace('"', " ")
+        .replace("'", " ")
         .split()
     )
 
@@ -2673,7 +2668,9 @@ def build_retrieval_queries(query: str) -> list[str]:
         has_digit = any(char.isdigit() for char in token)
         has_separator = "-" in token or "/" in token or "_" in token
 
-        if len(token) >= 4 and has_digit and has_separator:
+        # Generic reference-like tokens:
+        # SOP-SAF-008, SMM/c/ac/003, SAF_001, 2023, etc.
+        if len(token) >= 4 and (has_separator or has_digit):
             queries.append(token)
 
     unique_queries = []
@@ -2687,7 +2684,167 @@ def build_retrieval_queries(query: str) -> list[str]:
             seen.add(key)
             unique_queries.append(item)
 
-    return unique_queries[:8]
+    return unique_queries[:10]
+
+def keyword_match_asset_chunks(
+    retrieval_query: str,
+    allowed_asset_ids: list[str],
+    yacht_id: str,
+    limit: int = 6
+) -> list[dict]:
+    """
+    Generic keyword fallback.
+
+    Finds chunks by:
+    - file name
+    - original file name
+    - chunk content
+
+    This helps when a user asks for a specific document/reference and
+    vector search misses it.
+    """
+
+    if not retrieval_query or not allowed_asset_ids:
+        return []
+
+    clean_query = retrieval_query.strip()
+
+    if not clean_query:
+        return []
+
+    tokens = [
+        token.strip(" .,-;:\n\t()[]{}").lower()
+        for token in clean_query.split()
+        if len(token.strip(" .,-;:\n\t()[]{}")) >= 3
+    ]
+
+    if not tokens:
+        return []
+
+    matched = []
+
+    try:
+        # Search chunks directly.
+        chunk_query = supabase.table("asset_chunks") \
+            .select("""
+                asset_id,
+                yacht_id,
+                chat_id,
+                security_level,
+                content,
+                content_type,
+                chunk_index,
+                detected_date,
+                detected_year,
+                tags,
+                assets!inner (
+                    id,
+                    file_name,
+                    original_file_name,
+                    file_type
+                )
+            """) \
+            .eq("yacht_id", yacht_id) \
+            .in_("asset_id", allowed_asset_ids)
+
+        # Use the strongest token first, usually a reference/document token.
+        strongest_token = max(tokens, key=len)
+
+        chunk_res = chunk_query.ilike("content", f"%{strongest_token}%") \
+            .limit(limit) \
+            .execute()
+
+        for row in chunk_res.data or []:
+            asset_data = row.get("assets") or {}
+
+            matched.append({
+                "asset_id": row.get("asset_id"),
+                "yacht_id": row.get("yacht_id"),
+                "chat_id": row.get("chat_id"),
+                "security_level": row.get("security_level"),
+                "content": row.get("content"),
+                "content_type": row.get("content_type"),
+                "chunk_index": row.get("chunk_index"),
+                "detected_date": row.get("detected_date"),
+                "detected_year": row.get("detected_year"),
+                "tags": row.get("tags"),
+                "file_name": asset_data.get("file_name"),
+                "original_file_name": asset_data.get("original_file_name"),
+                "file_type": asset_data.get("file_type")
+            })
+
+    except Exception as e:
+        print("KEYWORD CHUNK SEARCH ERROR:", type(e).__name__, str(e))
+
+    try:
+        # Search file names too.
+        strongest_token = max(tokens, key=len)
+
+        asset_res = supabase.table("assets") \
+            .select("id, file_name, original_file_name") \
+            .eq("yacht_id", yacht_id) \
+            .in_("id", allowed_asset_ids) \
+            .or_(
+                f"file_name.ilike.%{strongest_token}%,original_file_name.ilike.%{strongest_token}%"
+            ) \
+            .limit(limit) \
+            .execute()
+
+        asset_ids_from_names = [
+            asset["id"]
+            for asset in asset_res.data or []
+            if asset.get("id")
+        ]
+
+        if asset_ids_from_names:
+            chunks_res = supabase.table("asset_chunks") \
+                .select("""
+                    asset_id,
+                    yacht_id,
+                    chat_id,
+                    security_level,
+                    content,
+                    content_type,
+                    chunk_index,
+                    detected_date,
+                    detected_year,
+                    tags,
+                    assets!inner (
+                        id,
+                        file_name,
+                        original_file_name,
+                        file_type
+                    )
+                """) \
+                .eq("yacht_id", yacht_id) \
+                .in_("asset_id", asset_ids_from_names) \
+                .order("chunk_index") \
+                .limit(limit) \
+                .execute()
+
+            for row in chunks_res.data or []:
+                asset_data = row.get("assets") or {}
+
+                matched.append({
+                    "asset_id": row.get("asset_id"),
+                    "yacht_id": row.get("yacht_id"),
+                    "chat_id": row.get("chat_id"),
+                    "security_level": row.get("security_level"),
+                    "content": row.get("content"),
+                    "content_type": row.get("content_type"),
+                    "chunk_index": row.get("chunk_index"),
+                    "detected_date": row.get("detected_date"),
+                    "detected_year": row.get("detected_year"),
+                    "tags": row.get("tags"),
+                    "file_name": asset_data.get("file_name"),
+                    "original_file_name": asset_data.get("original_file_name"),
+                    "file_type": asset_data.get("file_type")
+                })
+
+    except Exception as e:
+        print("KEYWORD FILE SEARCH ERROR:", type(e).__name__, str(e))
+
+    return matched[:limit]chat code i want 
 
 # ------------------------
 # CHAT SECURE
@@ -2704,7 +2861,8 @@ def chat(
 
     Behavior:
     - Searches accessible uploaded yacht assets.
-    - Supports multi-part questions by retrieving for each sub-question.
+    - Supports multi-part questions.
+    - Uses semantic retrieval plus generic keyword/file-name fallback.
     - Answers ONLY from uploaded document context.
     - If no supported answer exists, returns FALLBACK_NO_DATA_ANSWER.
     - Sources are returned ONLY for documents actually used.
@@ -2775,15 +2933,36 @@ def chat(
                     filters = extract_query_filters(retrieval_query)
                     year_filter = filters.get("year")
 
-                    results = supabase.rpc("match_asset_chunks_secure", {
-                        "query_embedding": embed(retrieval_query),
-                        "match_count": 6,
-                        "allowed_asset_ids": allowed_asset_ids,
-                        "yacht_filter": yacht_id,
-                        "year_filter": year_filter
-                    }).execute()
+                    try:
+                        semantic_results = supabase.rpc("match_asset_chunks_secure", {
+                            "query_embedding": embed(retrieval_query),
+                            "match_count": 6,
+                            "allowed_asset_ids": allowed_asset_ids,
+                            "yacht_filter": yacht_id,
+                            "year_filter": year_filter
+                        }).execute()
 
-                    for row in results.data or []:
+                        for row in semantic_results.data or []:
+                            key = (
+                                row.get("asset_id"),
+                                row.get("chunk_index"),
+                                row.get("content_type")
+                            )
+
+                            if key not in matched_rows_by_key:
+                                matched_rows_by_key[key] = row
+
+                    except Exception as e:
+                        print("SEMANTIC SEARCH ERROR:", type(e).__name__, str(e))
+
+                    keyword_rows = keyword_match_asset_chunks(
+                        retrieval_query=retrieval_query,
+                        allowed_asset_ids=allowed_asset_ids,
+                        yacht_id=yacht_id,
+                        limit=6
+                    )
+
+                    for row in keyword_rows:
                         key = (
                             row.get("asset_id"),
                             row.get("chunk_index"),
@@ -2793,7 +2972,7 @@ def chat(
                         if key not in matched_rows_by_key:
                             matched_rows_by_key[key] = row
 
-                matched_rows = list(matched_rows_by_key.values())[:18]
+                matched_rows = list(matched_rows_by_key.values())[:24]
 
                 print("LOCAL CHAT DEBUG: matched chunks:", len(matched_rows))
 
@@ -2851,7 +3030,8 @@ Strict rules:
 - Include in "used_source_titles" ONLY the exact file names whose content directly supports the final answer.
 - If the final answer uses one document, include only that one document.
 - If the final answer combines information from two or more documents, include all and only those documents.
-- If one requested part is found and another requested part is not found, answer the found part and state that the missing part is not available in the uploaded documents.
+- If one requested part is found and another requested part is not found, answer the found part and clearly say only that the missing part is not available in the uploaded documents.
+- Do not turn a partially supported multi-part question into the full fallback answer unless none of the requested parts are supported.
 - Do not include retrieved files that were not used in the final answer.
 - Do not include a source just because it was retrieved. Include it only if its content appears in or directly supports the answer.
 - Do not include document references inside the answer. The frontend will show sources separately.
