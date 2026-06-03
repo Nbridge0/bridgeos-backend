@@ -2758,16 +2758,6 @@ Uploaded document context:
 
         if document_used:
             sources = build_sources_from_asset_results(matched_rows)
-
-            file_names = []
-
-            for source in sources:
-                name = source.get("title") or source.get("file_name")
-                if name and name not in file_names:
-                    file_names.append(name)
-
-            if file_names and "Document reference:" not in answer:
-                answer = f"{answer}\n\nDocument reference: {', '.join(file_names)}"
         else:
             sources = []
 
