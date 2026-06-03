@@ -2260,11 +2260,8 @@ def build_sources_from_asset_results(results: list[dict]) -> list[dict]:
     """
     Builds the sources returned to the frontend.
 
-    Important:
-    - Do not return file_url.
-    - Do not return storage_path.
-    - The frontend should only receive safe metadata.
-    - If the frontend needs to open the file, it must call the signed-url endpoint.
+    Frontend should only receive the document title.
+    Do not return matched chunks, tags, file type, year, storage paths, or URLs.
     """
 
     seen = set()
@@ -2273,22 +2270,24 @@ def build_sources_from_asset_results(results: list[dict]) -> list[dict]:
     for row in results:
         asset_id = row.get("asset_id")
 
-        if asset_id in seen:
+        if not asset_id or asset_id in seen:
             continue
 
         seen.add(asset_id)
 
+        file_name = (
+            row.get("original_file_name")
+            or row.get("file_name")
+            or "Untitled document"
+        )
+
         sources.append({
             "asset_id": asset_id,
-            "file_name": row.get("file_name"),
-            "file_type": row.get("file_type"),
-            "content_type": row.get("content_type"),
-            "detected_year": row.get("detected_year"),
-            "matched_content": row.get("content")
+            "title": file_name,
+            "file_name": file_name
         })
 
     return sources
-
 # ------------------------
 # DOCUMENT ACCESS
 # ------------------------
@@ -2698,7 +2697,7 @@ Uploaded document context:
             file_names = []
 
             for source in sources:
-                name = source.get("file_name")
+                name = source.get("title") or source.get("file_name")
                 if name and name not in file_names:
                     file_names.append(name)
 
