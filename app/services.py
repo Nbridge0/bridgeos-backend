@@ -2764,10 +2764,10 @@ Uploaded document context:
             for source in sources:
                 name = source.get("title") or source.get("file_name")
                 if name and name not in file_names:
-            file_names.append(name)
+                    file_names.append(name)
 
-    if file_names and "Document reference:" not in answer:
-        answer = f"{answer}\n\nDocument reference: {', '.join(file_names)}"
+            if file_names and "Document reference:" not in answer:
+                answer = f"{answer}\n\nDocument reference: {', '.join(file_names)}"
         else:
             sources = []
 
