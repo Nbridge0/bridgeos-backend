@@ -2918,6 +2918,102 @@ def keyword_match_asset_chunks(
     )
 
     return [item["row"] for item in ranked[:limit]]
+
+def get_recent_chat_context(chat_id: str, limit: int = 6) -> str:
+    """
+    Gets recent chat messages.
+
+    This is used only to resolve follow-up references like:
+    - it
+    - that
+    - this
+    - they
+    - the above
+    - the previous answer
+
+    It is not used as factual evidence.
+    """
+
+    try:
+        res = supabase.table("messages") \
+            .select("role, content, created_at") \
+            .eq("chat_id", chat_id) \
+            .order("created_at", desc=True) \
+            .limit(limit) \
+            .execute()
+
+        rows = list(reversed(res.data or []))
+
+        parts = []
+
+        for row in rows:
+            role = row.get("role") or "message"
+            content = (row.get("content") or "").strip()
+
+            if content:
+                parts.append(f"{role}: {content}")
+
+        return "\n".join(parts)
+
+    except Exception as e:
+        print("RECENT CHAT CONTEXT ERROR:", type(e).__name__, str(e))
+        return ""
+
+
+def build_standalone_retrieval_query(query: str, chat_id: str) -> str:
+    """
+    Turns a follow-up question into a standalone retrieval query using recent chat.
+
+    No hardcoded document names.
+    No hardcoded topics.
+    No hardcoded example questions.
+
+    The LLM uses recent chat only to resolve references.
+    """
+
+    recent_chat_context = get_recent_chat_context(
+        chat_id=chat_id,
+        limit=6
+    )
+
+    if not recent_chat_context.strip():
+        return query
+
+    try:
+        rewritten = ask_llm(
+            query=query,
+            context=f"""
+You rewrite user questions for document retrieval.
+
+Your task:
+- Use the recent conversation only to resolve references in the current question.
+- If the current question depends on previous context, rewrite it as a complete standalone search query.
+- If it is already standalone, return it unchanged.
+- Do not answer the question.
+- Do not add facts.
+- Do not invent document names.
+- Do not invent topics.
+- Do not hardcode anything.
+- Return only the rewritten search query as plain text.
+
+Recent conversation:
+{recent_chat_context}
+
+Current question:
+{query}
+""".strip()
+        )
+
+        rewritten = str(rewritten or "").strip()
+
+        if rewritten:
+            return rewritten
+
+    except Exception as e:
+        print("STANDALONE QUERY REWRITE ERROR:", type(e).__name__, str(e))
+
+    return query
+    
 # ------------------------
 # CHAT SECURE
 # ------------------------
@@ -2995,10 +3091,14 @@ def chat(
             print("LOCAL CHAT DEBUG: allowed_asset_ids:", allowed_asset_ids)
 
             if allowed_asset_ids:
-                retrieval_queries = build_retrieval_queries(query)
+                retrieval_query_input = build_standalone_retrieval_query(
+                    query=query,
+                    chat_id=chat_id
+                )
 
-                print("LOCAL CHAT DEBUG: retrieval_queries:", retrieval_queries)
+                print("LOCAL CHAT DEBUG: retrieval_query_input:", retrieval_query_input)
 
+                retrieval_queries = build_retrieval_queries(retrieval_query_input)
                 matched_rows_by_key = {}
 
                 for retrieval_query in retrieval_queries:
@@ -3191,9 +3291,9 @@ Uploaded document context:
                         source_rows.append(row)
 
             if not source_rows:
-                source_rows = matched_rows[:1]
-
-            sources = build_sources_from_asset_results(source_rows)
+                sources = []
+            else:
+                sources = build_sources_from_asset_results(source_rows)
 
         else:
             sources = []
