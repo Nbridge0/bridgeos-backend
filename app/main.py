@@ -859,6 +859,44 @@ async def download_asset(
             )
         }
     )
+
+@app.delete("/assets/{asset_id}")
+async def delete_asset_api(
+    asset_id: str,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.delete_asset(
+        asset_id=asset_id,
+        admin_crew=admin_crew
+    )
+
+@app.delete("/assets/folders/{folder_name}")
+async def delete_folder_assets_api(
+    folder_name: str,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.delete_folder_assets(
+        folder_name=folder_name,
+        admin_crew=admin_crew
+    )
+
+
 @app.post("/assets/{asset_id}/authorize")
 async def authorize_asset(
     asset_id: str,

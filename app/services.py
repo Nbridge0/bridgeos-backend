@@ -1579,6 +1579,131 @@ def get_asset_for_download(asset_id: str, crew: dict):
 
     return res.data[0]
 
+def delete_asset(asset_id: str, admin_crew: dict):
+    """
+    Deletes one asset from:
+    1. Supabase Storage
+    2. asset_chunks
+    3. asset_access
+    4. assets table
+
+    Only Tier 1 admins can delete yacht documentation.
+    """
+
+    if int(admin_crew["security_level"]) != 1:
+        raise HTTPException(
+            status_code=403,
+            detail="Only Tier 1 admins can delete assets"
+        )
+
+    asset_res = supabase.table("assets") \
+        .select("*") \
+        .eq("id", asset_id) \
+        .eq("yacht_id", admin_crew["yacht_id"]) \
+        .execute()
+
+    if not asset_res.data:
+        raise HTTPException(status_code=404, detail="Asset not found")
+
+    asset = asset_res.data[0]
+    storage_path = asset.get("storage_path")
+
+    try:
+        supabase.table("asset_chunks") \
+            .delete() \
+            .eq("asset_id", asset_id) \
+            .eq("yacht_id", admin_crew["yacht_id"]) \
+            .execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not delete asset chunks: {str(e)}"
+        )
+
+    try:
+        supabase.table("asset_access") \
+            .delete() \
+            .eq("asset_id", asset_id) \
+            .execute()
+    except Exception:
+        pass
+
+    if storage_path:
+        try:
+            storage_admin.storage.from_(BUCKET_NAME).remove([storage_path])
+        except Exception as e:
+            print("STORAGE DELETE WARNING:", type(e).__name__, str(e))
+
+    try:
+        delete_res = supabase.table("assets") \
+            .delete() \
+            .eq("id", asset_id) \
+            .eq("yacht_id", admin_crew["yacht_id"]) \
+            .execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not delete asset row: {str(e)}"
+        )
+
+    if not delete_res.data:
+        raise HTTPException(status_code=404, detail="Asset not found")
+
+    return {
+        "message": "Asset deleted successfully",
+        "deleted_asset_id": asset_id,
+        "deleted_file_name": asset.get("original_file_name") or asset.get("file_name")
+    }
+
+def delete_folder_assets(folder_name: str, admin_crew: dict):
+    """
+    Deletes every asset inside one folder_name for this yacht.
+
+    Folder is virtual:
+    - There is no folders table.
+    - Folder exists because assets have folder_name.
+    - Deleting the folder means deleting all assets with that folder_name.
+    """
+
+    if int(admin_crew["security_level"]) != 1:
+        raise HTTPException(
+            status_code=403,
+            detail="Only Tier 1 admins can delete folders"
+        )
+
+    clean_folder_name = (folder_name or "").strip()
+
+    if not clean_folder_name:
+        raise HTTPException(status_code=400, detail="Folder name is required")
+
+    folder_assets_res = supabase.table("assets") \
+        .select("id, file_name, original_file_name, folder_name") \
+        .eq("yacht_id", admin_crew["yacht_id"]) \
+        .eq("folder_name", clean_folder_name) \
+        .execute()
+
+    folder_assets = folder_assets_res.data or []
+
+    if not folder_assets:
+        raise HTTPException(status_code=404, detail="Folder not found or empty")
+
+    deleted = []
+
+    for asset in folder_assets:
+        result = delete_asset(
+            asset_id=asset["id"],
+            admin_crew=admin_crew
+        )
+
+        deleted.append(result)
+
+    return {
+        "message": "Folder deleted successfully",
+        "folder_name": clean_folder_name,
+        "deleted_count": len(deleted),
+        "deleted_assets": deleted
+    }
+
 def seed_text_asset(
     file_name: str,
     content: str,
