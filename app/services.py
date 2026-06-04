@@ -3470,6 +3470,50 @@ Previous user request in this chat:
 Current user request:
 {query}
 """.strip()
+
+def get_latest_chat_asset_id(
+    chat_id: str,
+    crew_id: str,
+    yacht_id: str,
+    security_level: int
+) -> str | None:
+    """
+    Returns the latest asset attached to this exact chat.
+
+    Generic memory rule:
+    - No hardcoded user phrases.
+    - No hardcoded topics.
+    - No hardcoded file names.
+    - Only uses the current chat_id as memory boundary.
+    """
+
+    try:
+        accessible_asset_ids = get_accessible_asset_ids(
+            crew_id=crew_id,
+            yacht_id=yacht_id,
+            security_level=security_level
+        )
+
+        if not accessible_asset_ids:
+            return None
+
+        res = supabase.table("assets") \
+            .select("id, chat_id, created_at") \
+            .eq("chat_id", chat_id) \
+            .eq("yacht_id", yacht_id) \
+            .in_("id", accessible_asset_ids) \
+            .order("created_at", desc=True) \
+            .limit(1) \
+            .execute()
+
+        if not res.data:
+            return None
+
+        return res.data[0].get("id")
+
+    except Exception as e:
+        print("LATEST CHAT ASSET ERROR:", type(e).__name__, str(e))
+        return None
     
 # ------------------------
 # CHAT SECURE
@@ -3522,12 +3566,21 @@ def chat(
     context = ""
     retrieval_query_input = query
 
-    try:
-        if uploaded_asset_id:
-            print("LOCAL CHAT DEBUG: using uploaded chat asset only:", uploaded_asset_id)
+    resolved_uploaded_asset_id = uploaded_asset_id or get_latest_chat_asset_id(
+        chat_id=chat_id,
+        crew_id=crew_id,
+        yacht_id=yacht_id,
+        security_level=security_level
+    )
 
+    try:
+        if resolved_uploaded_asset_id:
+            print(
+                "LOCAL CHAT DEBUG: using chat-memory asset:",
+                resolved_uploaded_asset_id
+            )
             matched_rows = get_uploaded_chat_asset_rows(
-                uploaded_asset_id=uploaded_asset_id,
+                uploaded_asset_id=resolved_uploaded_asset_id,
                 crew_id=crew_id,
                 yacht_id=yacht_id,
                 security_level=security_level,
@@ -3631,7 +3684,7 @@ def chat(
         matched_rows = []
         context = ""
 
-        if uploaded_asset_id:
+        if resolved_uploaded_asset_id:
             uploaded_result = answer_from_uploaded_chat_asset(
                 query=query,
                 context=context,
@@ -3656,7 +3709,7 @@ def chat(
             return {
                 "answer": answer,
                 "sources": sources,
-                "uploaded_asset_id": uploaded_asset_id,
+                "uploaded_asset_id": resolved_uploaded_asset_id,
                 "mode": "uploaded_chat_asset"
             }
 
