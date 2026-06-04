@@ -2458,6 +2458,102 @@ Content:
 
     return "\n\n---\n\n".join(parts)
 
+def get_uploaded_chat_asset_rows(
+    uploaded_asset_id: str,
+    crew_id: str,
+    yacht_id: str,
+    security_level: int,
+    chat_id: str
+):
+    """
+    Gets chunks for one specific asset uploaded inside the current chat.
+
+    This is only used when the frontend sends uploaded_asset_id.
+    Normal chatbot questions do not use this path.
+    """
+
+    if not uploaded_asset_id:
+        return []
+
+    accessible_asset_ids = get_accessible_asset_ids(
+        crew_id=crew_id,
+        yacht_id=yacht_id,
+        security_level=security_level
+    )
+
+    if uploaded_asset_id not in accessible_asset_ids:
+        raise HTTPException(status_code=403, detail="No access to this uploaded file")
+
+    asset_res = supabase.table("assets") \
+        .select("id, yacht_id, chat_id, file_name, original_file_name, file_type, processing_status") \
+        .eq("id", uploaded_asset_id) \
+        .eq("yacht_id", yacht_id) \
+        .eq("chat_id", chat_id) \
+        .execute()
+
+    if not asset_res.data:
+        raise HTTPException(
+            status_code=404,
+            detail="Uploaded chat file was not found for this chat"
+        )
+
+    asset = asset_res.data[0]
+
+    if asset.get("processing_status") != "processed":
+        raise HTTPException(
+            status_code=400,
+            detail="The uploaded file is still processing. Please try again in a moment."
+        )
+
+    chunks_res = supabase.table("asset_chunks") \
+        .select("""
+            asset_id,
+            yacht_id,
+            chat_id,
+            security_level,
+            content,
+            content_type,
+            chunk_index,
+            detected_date,
+            detected_year,
+            tags,
+            assets!inner (
+                id,
+                file_name,
+                original_file_name,
+                file_type
+            )
+        """) \
+        .eq("asset_id", uploaded_asset_id) \
+        .eq("yacht_id", yacht_id) \
+        .eq("chat_id", chat_id) \
+        .order("chunk_index") \
+        .limit(40) \
+        .execute()
+
+    rows = []
+
+    for row in chunks_res.data or []:
+        asset_data = row.get("assets") or {}
+
+        rows.append({
+            "asset_id": row.get("asset_id"),
+            "yacht_id": row.get("yacht_id"),
+            "chat_id": row.get("chat_id"),
+            "security_level": row.get("security_level"),
+            "content": row.get("content"),
+            "content_type": row.get("content_type"),
+            "chunk_index": row.get("chunk_index"),
+            "detected_date": row.get("detected_date"),
+            "detected_year": row.get("detected_year"),
+            "tags": row.get("tags"),
+            "file_name": asset_data.get("file_name"),
+            "original_file_name": asset_data.get("original_file_name"),
+            "file_type": asset_data.get("file_type")
+        })
+
+    return rows
+
 def build_sources_from_asset_results(results: list[dict]) -> list[dict]:
     seen = set()
     sources = []
@@ -3217,7 +3313,8 @@ def chat(
     crew_id: str,
     yacht_id: str,
     security_level: int,
-    chat_id: str
+    chat_id: str,
+    uploaded_asset_id: str | None = None
 ):
     """
     Secure document-grounded chat.
@@ -3259,74 +3356,71 @@ def chat(
     context = ""
 
     try:
-        accessible_asset_ids = get_accessible_asset_ids(
-            crew_id=crew_id,
-            yacht_id=yacht_id,
-            security_level=security_level
-        )
+        if uploaded_asset_id:
+            print("LOCAL CHAT DEBUG: using uploaded chat asset only:", uploaded_asset_id)
 
-        print("LOCAL CHAT DEBUG: yacht_id:", yacht_id)
-        print("LOCAL CHAT DEBUG: crew_id:", crew_id)
-        print("LOCAL CHAT DEBUG: security_level:", security_level)
-        print("LOCAL CHAT DEBUG: accessible_asset_ids:", accessible_asset_ids)
+            matched_rows = get_uploaded_chat_asset_rows(
+                uploaded_asset_id=uploaded_asset_id,
+                crew_id=crew_id,
+                yacht_id=yacht_id,
+                security_level=security_level,
+                chat_id=chat_id
+            )
 
-        if accessible_asset_ids:
-            assets_res = supabase.table("assets") \
-                .select("id") \
-                .eq("yacht_id", yacht_id) \
-                .in_("id", accessible_asset_ids) \
-                .execute()
+            if matched_rows:
+                context = build_context_from_asset_results(matched_rows)
 
-            allowed_asset_ids = [
-                asset["id"]
-                for asset in (assets_res.data or [])
-                if asset.get("id")
-            ]
+        else:
+            accessible_asset_ids = get_accessible_asset_ids(
+                crew_id=crew_id,
+                yacht_id=yacht_id,
+                security_level=security_level
+            )
 
-            print("LOCAL CHAT DEBUG: allowed_asset_ids:", allowed_asset_ids)
+            print("LOCAL CHAT DEBUG: yacht_id:", yacht_id)
+            print("LOCAL CHAT DEBUG: crew_id:", crew_id)
+            print("LOCAL CHAT DEBUG: security_level:", security_level)
+            print("LOCAL CHAT DEBUG: accessible_asset_ids:", accessible_asset_ids)
 
-            if allowed_asset_ids:
-                retrieval_query_input = build_memory_aware_retrieval_input(
-                    query=query,
-                    chat_id=chat_id
-                )
+            if accessible_asset_ids:
+                assets_res = supabase.table("assets") \
+                    .select("id") \
+                    .eq("yacht_id", yacht_id) \
+                    .in_("id", accessible_asset_ids) \
+                    .execute()
 
-                print("LOCAL CHAT DEBUG: retrieval_query_input:", retrieval_query_input)
+                allowed_asset_ids = [
+                    asset["id"]
+                    for asset in (assets_res.data or [])
+                    if asset.get("id")
+                ]
 
-                retrieval_queries = build_retrieval_queries(retrieval_query_input)
-                matched_rows_by_key = {}
+                print("LOCAL CHAT DEBUG: allowed_asset_ids:", allowed_asset_ids)
 
-                for retrieval_query in retrieval_queries:
-                    filters = extract_query_filters(retrieval_query)
-                    year_filter = filters.get("year")
-
-                    keyword_rows = keyword_match_asset_chunks(
-                        retrieval_query=retrieval_query,
-                        allowed_asset_ids=allowed_asset_ids,
-                        yacht_id=yacht_id,
-                        limit=8
+                if allowed_asset_ids:
+                    retrieval_query_input = build_memory_aware_retrieval_input(
+                        query=query,
+                        chat_id=chat_id
                     )
 
-                    for row in keyword_rows:
-                        key = (
-                            row.get("asset_id"),
-                            row.get("chunk_index"),
-                            row.get("content_type")
+                    print("LOCAL CHAT DEBUG: retrieval_query_input:", retrieval_query_input)
+
+                    retrieval_queries = build_retrieval_queries(retrieval_query_input)
+                    matched_rows_by_key = {}
+
+                    for retrieval_query in retrieval_queries:
+                        filters = extract_query_filters(retrieval_query)
+                        year_filter = filters.get("year")
+
+                        keyword_rows = keyword_search_asset_chunks(
+                            query=retrieval_query,
+                            yacht_id=yacht_id,
+                            allowed_asset_ids=allowed_asset_ids,
+                            year_filter=year_filter,
+                            limit=10
                         )
 
-                        if key not in matched_rows_by_key:
-                            matched_rows_by_key[key] = row
-
-                    try:
-                        semantic_results = supabase.rpc("match_asset_chunks_secure", {
-                            "query_embedding": embed(retrieval_query),
-                            "match_count": 6,
-                            "allowed_asset_ids": allowed_asset_ids,
-                            "yacht_filter": yacht_id,
-                            "year_filter": year_filter
-                        }).execute()
-
-                        for row in semantic_results.data or []:
+                        for row in keyword_rows:
                             key = (
                                 row.get("asset_id"),
                                 row.get("chunk_index"),
@@ -3336,15 +3430,34 @@ def chat(
                             if key not in matched_rows_by_key:
                                 matched_rows_by_key[key] = row
 
-                    except Exception as e:
-                        print("SEMANTIC SEARCH ERROR:", type(e).__name__, str(e))
+                        try:
+                            semantic_results = supabase.rpc("match_asset_chunks_secure", {
+                                "query_embedding": embed(retrieval_query),
+                                "match_count": 6,
+                                "allowed_asset_ids": allowed_asset_ids,
+                                "yacht_filter": yacht_id,
+                                "year_filter": year_filter
+                            }).execute()
 
-                matched_rows = list(matched_rows_by_key.values())[:30]
+                            for row in semantic_results.data or []:
+                                key = (
+                                    row.get("asset_id"),
+                                    row.get("chunk_index"),
+                                    row.get("content_type")
+                                )
 
-                print("LOCAL CHAT DEBUG: matched chunks:", len(matched_rows))
+                                if key not in matched_rows_by_key:
+                                    matched_rows_by_key[key] = row
 
-                if matched_rows:
-                    context = build_context_from_asset_results(matched_rows)
+                        except Exception as e:
+                            print("SEMANTIC SEARCH ERROR:", type(e).__name__, str(e))
+
+                    matched_rows = list(matched_rows_by_key.values())[:30]
+
+                    print("LOCAL CHAT DEBUG: matched chunks:", len(matched_rows))
+
+                    if matched_rows:
+                        context = build_context_from_asset_results(matched_rows)
 
     except Exception as e:
         print("LOCAL CHAT DOCUMENT SEARCH ERROR:", type(e).__name__, str(e))
@@ -3358,6 +3471,8 @@ def chat(
 You are BridgeOS, a document-grounded yacht assistant.
 
 You must answer using ONLY the uploaded document context when the question is about yacht procedures, SOPs, safety, audits, operations, maintenance, guest instructions, emergencies, equipment, crew actions, or document content.
+
+If uploaded_asset_id was provided, the uploaded document context is the file/photo/document the user just uploaded in this chat. In that case, answer directly from that uploaded file context, including image visual description and OCR text when available.
 
 The uploaded context is divided into numbered blocks like SOURCE 1, SOURCE 2, SOURCE 3.
 Each source block includes a file name and content.

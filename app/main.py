@@ -83,6 +83,7 @@ class ChatRequest(BaseModel):
     chat_id: Optional[str] = None
     query: Optional[str] = None
     message: Optional[str] = None
+    uploaded_asset_id: Optional[str] = None
 
 class CreateChatRequest(BaseModel):
     title: Optional[str] = "New Chat"
@@ -1093,5 +1094,6 @@ async def chat_api(
         crew_id=crew["id"],
         yacht_id=crew["yacht_id"],
         security_level=crew["security_level"],
-        chat_id=body.chat_id
+        chat_id=body.chat_id,
+        uploaded_asset_id=body.uploaded_asset_id
     )
