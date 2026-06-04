@@ -1928,8 +1928,11 @@ def upload_asset(
     mime_type: str | None = None,
     original_relative_path: str | None = None,
     chat_id: str | None = None,
-    security_level: int = 1
+    security_level: int = 1,
+    folder_name: str | None = None,
+    folder_security_level: int | None = None
 ):
+    
     """
     Uploads any file, stores it in Supabase Storage, creates an asset row,
     extracts/processes it, creates chunks and embeddings.
@@ -2030,6 +2033,8 @@ def upload_asset(
             "chat_id": chat_id,
             "uploaded_by": uploaded_by,
             "security_level": security_level,
+            "folder_name": folder_name,
+            "folder_security_level": folder_security_level or security_level,
             "file_name": clean_filename,
             "original_file_name": filename,
             "original_relative_path": original_relative_path,
