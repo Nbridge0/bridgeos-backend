@@ -6,7 +6,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
-from app.config import FRONTEND_ORIGINS
+from app.config import FRONTEND_ORIGINS, BUCKET_NAME
 
 from app.auth import get_user
 from app import services
@@ -808,7 +808,6 @@ def download_asset(asset_id: str, user=Depends(get_user)):
     )
 
     mime_type = asset.get("mime_type") or "application/octet-stream"
-
     safe_download_name = filename.replace('"', "")
 
     return StreamingResponse(
