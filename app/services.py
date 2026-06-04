@@ -3478,13 +3478,12 @@ def get_latest_chat_asset_id(
     security_level: int
 ) -> str | None:
     """
-    Returns the latest asset attached to this exact chat.
+    Gets the latest uploaded asset attached to this exact chat.
 
-    Generic memory rule:
-    - No hardcoded user phrases.
-    - No hardcoded topics.
-    - No hardcoded file names.
-    - Only uses the current chat_id as memory boundary.
+    This is generic chat memory:
+    - no hardcoded phrases
+    - no hardcoded document names
+    - no hardcoded examples
     """
 
     try:
@@ -3514,7 +3513,6 @@ def get_latest_chat_asset_id(
     except Exception as e:
         print("LATEST CHAT ASSET ERROR:", type(e).__name__, str(e))
         return None
-    
 # ------------------------
 # CHAT SECURE
 # ------------------------
@@ -3533,10 +3531,10 @@ def chat(
     - Searches accessible uploaded yacht assets.
     - Supports multi-part questions.
     - Uses semantic retrieval plus generic keyword/file-name fallback.
+    - Uses current chat memory for recently uploaded chat files.
     - Answers ONLY from uploaded document context.
     - If no supported answer exists, returns FALLBACK_NO_DATA_ANSWER.
-    - Sources are returned ONLY for documents actually used.
-    - If multiple documents support the final answer, all used documents are returned.
+    - Sources are returned and saved with the assistant message.
     - No hallucinations.
     """
 
@@ -3551,7 +3549,8 @@ def chat(
         "yacht_id": yacht_id,
         "crew_id": crew_id,
         "role": "user",
-        "content": query
+        "content": query,
+        "sources": []
     }).execute()
 
     if chat_row.get("title") == "New Chat":
@@ -3566,6 +3565,9 @@ def chat(
     context = ""
     retrieval_query_input = query
 
+    # Generic chat memory:
+    # If frontend does not send uploaded_asset_id, recover the latest file
+    # attached to this exact chat_id.
     resolved_uploaded_asset_id = uploaded_asset_id or get_latest_chat_asset_id(
         chat_id=chat_id,
         crew_id=crew_id,
@@ -3579,6 +3581,7 @@ def chat(
                 "LOCAL CHAT DEBUG: using chat-memory asset:",
                 resolved_uploaded_asset_id
             )
+
             matched_rows = get_uploaded_chat_asset_rows(
                 uploaded_asset_id=resolved_uploaded_asset_id,
                 crew_id=crew_id,
@@ -3597,16 +3600,12 @@ def chat(
                 security_level=security_level
             )
 
-            print("LOCAL CHAT DEBUG: yacht_id:", yacht_id)
-            print("LOCAL CHAT DEBUG: crew_id:", crew_id)
-            print("LOCAL CHAT DEBUG: security_level:", security_level)
-            print("LOCAL CHAT DEBUG: accessible_asset_ids:", accessible_asset_ids)
-
             if accessible_asset_ids:
                 assets_res = supabase.table("assets") \
                     .select("id") \
                     .eq("yacht_id", yacht_id) \
                     .in_("id", accessible_asset_ids) \
+                    .eq("processing_status", "processed") \
                     .execute()
 
                 allowed_asset_ids = [
@@ -3699,7 +3698,8 @@ def chat(
                 "yacht_id": yacht_id,
                 "crew_id": crew_id,
                 "role": "assistant",
-                "content": answer
+                "content": answer,
+                "sources": sources
             }).execute()
 
             supabase.table("chats").update({
@@ -3713,15 +3713,25 @@ def chat(
                 "mode": "uploaded_chat_asset"
             }
 
-    if context.strip():
+    if resolved_uploaded_asset_id:
+        uploaded_result = answer_from_uploaded_chat_asset(
+            query=query,
+            context=context,
+            matched_rows=matched_rows
+        )
+
+        answer = uploaded_result["answer"]
+        sources = uploaded_result["sources"]
+
+    elif context:
         raw_answer = ask_llm(
             query=query,
             context=f"""
-You are BridgeOS, a document-grounded yacht assistant.
+You are BridgeOS, a secure yacht documentation assistant.
 
-You must answer using ONLY the uploaded document context when the question is about yacht procedures, SOPs, safety, audits, operations, maintenance, guest instructions, emergencies, equipment, crew actions, or document content.
+You must answer using ONLY the uploaded document context below.
 
-If uploaded_asset_id was provided, the uploaded document context is the file/photo/document the user just uploaded in this chat. In that case, answer directly from that uploaded file context, including image visual description and OCR text when available.
+If uploaded_asset_id was provided or resolved from this chat's uploaded file memory, the uploaded document context is the file/photo/document the user uploaded in this chat. In that case, answer directly from that uploaded file context, including image visual description and OCR text when available.
 
 The uploaded context is divided into numbered blocks like SOURCE 1, SOURCE 2, SOURCE 3.
 Each source block includes a file name and content.
@@ -3745,10 +3755,10 @@ or:
 }}
 
 Special rule for chatbot-uploaded files:
-- If uploaded_asset_id was provided, the user is asking about the file/photo/document they just uploaded in this chat.
-- In that case, answer from the uploaded file context even if the question is informal, such as "analyze this photo", "what is this", "tell me about this file", or "summarize it".
+- If uploaded_asset_id was provided or resolved from this chat's uploaded file memory, the user is asking about the file/photo/document uploaded in this chat.
+- In that case, answer from the uploaded file context.
 - For photos, use the Image visual description and OCR text.
-- Do not require the user to name a yacht document or procedure when uploaded_asset_id is provided.
+- Do not require the user to name a yacht document or procedure when uploaded_asset_id was provided or resolved.
 
 Strict rules:
 - Do not hallucinate.
@@ -3880,7 +3890,8 @@ Uploaded document context:
         "yacht_id": yacht_id,
         "crew_id": crew_id,
         "role": "assistant",
-        "content": answer
+        "content": answer,
+        "sources": sources
     }).execute()
 
     supabase.table("chats").update({
@@ -3889,7 +3900,8 @@ Uploaded document context:
 
     return {
         "answer": answer,
-        "sources": sources
+        "sources": sources,
+        "uploaded_asset_id": resolved_uploaded_asset_id
     }
 # ------------------------
 # TEMP DEMO LOGIN FOR TESTING ONLY
