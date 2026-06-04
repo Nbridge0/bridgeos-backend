@@ -26,6 +26,7 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
 )
 security = HTTPBearer()
 # ------------------------
@@ -842,15 +843,18 @@ async def download_asset(
         or "download"
     )
 
+    filename = str(filename).replace("\r", "").replace("\n", "").strip()
+
     mime_type = asset.get("mime_type") or "application/octet-stream"
-    safe_download_name = filename.replace('"', "")
+
+    ascii_filename = filename.replace('"', "").replace("\\", "")
 
     return StreamingResponse(
         io.BytesIO(file_bytes),
         media_type=mime_type,
         headers={
             "Content-Disposition": (
-                f'attachment; filename="{safe_download_name}"; '
+                f'attachment; filename="{ascii_filename}"; '
                 f"filename*=UTF-8''{quote(filename)}"
             )
         }

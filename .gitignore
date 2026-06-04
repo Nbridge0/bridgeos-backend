@@ -6,3 +6,13 @@ __pycache__/
 venv/
 .ipynb_checkpoints/
 app/.ipynb_checkpoints/
+
+# Local seeded/demo yacht documents - do not commit
+Audit Report 3rd Feb 2023.docx.pdf
+SOP-SAF-008 Guest Safety Induction DEMO.docx.pdf
+ISM Monthly Report DEMO.docx.pdf
+*.docx.pdf
+
+# Local seeded/demo yacht documents - do not commit
+Watchkeeping At Anchor DEMO.docx.pdf
+*.docx.pdf

@@ -2,34 +2,15 @@ import json
 import sys
 import urllib.request
 import urllib.error
+import mimetypes
+import uuid
 from pathlib import Path
-
-from pypdf import PdfReader
 
 
 API_BASE = "https://bridgeos-backend.onrender.com"
 
-YACHT_ID = "1c7a2b09-2bca-465b-a77b-c6b5c7995fff"
+# Always upload seeded/demo documents as Tier 1 only.
 SECURITY_LEVEL = 1
-
-
-def extract_text(file_path: Path) -> str:
-    """
-    Extract readable text from a supported file.
-    Supports PDF and plain text-style files.
-    """
-
-    if file_path.suffix.lower() == ".pdf":
-        reader = PdfReader(str(file_path))
-        pages = []
-
-        for index, page in enumerate(reader.pages, start=1):
-            text = page.extract_text() or ""
-            pages.append(f"\n\n--- Page {index} ---\n{text}")
-
-        return "\n".join(pages)
-
-    return file_path.read_text(encoding="utf-8", errors="ignore")
 
 
 def post_json(path, payload, token=None):
@@ -51,7 +32,7 @@ def post_json(path, payload, token=None):
     )
 
     try:
-        with urllib.request.urlopen(req) as res:
+        with urllib.request.urlopen(req, timeout=120) as res:
             body = res.read().decode("utf-8")
 
             if not body.strip():
@@ -81,15 +62,98 @@ def post_json(path, payload, token=None):
         raise SystemExit(1)
 
 
+def post_multipart_file(path, file_path: Path, token: str):
+    """
+    Uploads the real file to /assets as multipart/form-data.
+
+    Important:
+    - Uploads the actual PDF/file, not just extracted text.
+    - Security level is always 1.
+    - The backend /assets route will extract text, chunk it, embed it,
+      store the original file, and make it searchable/previewable.
+    """
+
+    url = API_BASE + path
+    boundary = "----BridgeOSBoundary" + uuid.uuid4().hex
+
+    mime_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+    file_bytes = file_path.read_bytes()
+
+    body = bytearray()
+
+    # security_level field
+    body.extend(f"--{boundary}\r\n".encode("utf-8"))
+    body.extend(b'Content-Disposition: form-data; name="security_level"\r\n')
+    body.extend(b"Content-Type: text/plain\r\n\r\n")
+    body.extend(str(SECURITY_LEVEL).encode("utf-8"))
+    body.extend(b"\r\n")
+
+    # file field
+    body.extend(f"--{boundary}\r\n".encode("utf-8"))
+    body.extend(
+        (
+            f'Content-Disposition: form-data; name="file"; '
+            f'filename="{file_path.name}"\r\n'
+        ).encode("utf-8")
+    )
+    body.extend(f"Content-Type: {mime_type}\r\n\r\n".encode("utf-8"))
+    body.extend(file_bytes)
+    body.extend(b"\r\n")
+
+    body.extend(f"--{boundary}--\r\n".encode("utf-8"))
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
+        "Content-Length": str(len(body))
+    }
+
+    req = urllib.request.Request(
+        url,
+        data=bytes(body),
+        headers=headers,
+        method="POST"
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=300) as res:
+            response_body = res.read().decode("utf-8")
+
+            if not response_body.strip():
+                return {}
+
+            return json.loads(response_body)
+
+    except urllib.error.HTTPError as e:
+        response_body = e.read().decode("utf-8", errors="ignore")
+
+        print("")
+        print("UPLOAD FAILED")
+        print("URL:", url)
+        print("STATUS:", e.code)
+        print("BODY:", response_body)
+        print("")
+
+        raise SystemExit(1)
+
+    except urllib.error.URLError as e:
+        print("")
+        print("NETWORK ERROR")
+        print("URL:", url)
+        print("ERROR:", e)
+        print("")
+
+        raise SystemExit(1)
+
+
 def main():
     if len(sys.argv) != 4:
         print("Usage:")
         print("python3 seed_file_to_yacht.py EMAIL PASSWORD FILE_PATH")
         print("")
         print("Example:")
-        print('python3 seed_file_to_yacht.py admin@example.com password123 "Audit Report 3rd Feb 2023.docx.pdf"')
+        print('python3 seed_file_to_yacht.py arman@askthebridge.com "Bridge123!" "Watchkeeping At Anchor DEMO.docx.pdf"')
         print("")
-        print(f"Yacht ID: {YACHT_ID}")
         print(f"Security level: {SECURITY_LEVEL} = Tier 1 only")
         raise SystemExit(1)
 
@@ -101,14 +165,8 @@ def main():
         print(f"File not found: {file_path}")
         raise SystemExit(1)
 
-    print("Reading document...")
-    content = extract_text(file_path)
-
-    if not content.strip():
-        print("Could not extract readable text from the file.")
-        raise SystemExit(1)
-
     print("Logging in...")
+
     login = post_json("/auth/login", {
         "email": email,
         "password": password
@@ -122,23 +180,21 @@ def main():
         raise SystemExit(1)
 
     print("")
-    print("Uploading document to chatbot knowledge base...")
+    print("Uploading real file to BridgeOS assets...")
     print(f"File: {file_path.name}")
-    print(f"Yacht ID: {YACHT_ID}")
     print(f"Security level: {SECURITY_LEVEL} = Tier 1 only")
     print("")
 
-    result = post_json("/dev/seed-asset", {
-        "yacht_id": YACHT_ID,
-        "file_name": file_path.name,
-        "content": content,
-        "security_level": SECURITY_LEVEL
-    }, token=token)
+    result = post_multipart_file(
+        path="/assets",
+        file_path=file_path,
+        token=token
+    )
 
     print("Upload result:")
     print(json.dumps(result, indent=2))
     print("")
-    print("Done. This document should now be searchable by Tier 1 users only.")
+    print("Done. The file is uploaded, processed, searchable, previewable, and Tier 1 only.")
 
 
 if __name__ == "__main__":
