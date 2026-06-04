@@ -2159,7 +2159,7 @@ def upload_asset(
             "uploaded_by": uploaded_by,
             "security_level": security_level,
             "folder_name": folder_name,
-            "folder_security_level": folder_security_level or security_level,
+            "folder_security_level": None,
             "file_name": clean_filename,
             "original_file_name": filename,
             "original_relative_path": original_relative_path,
@@ -2466,10 +2466,16 @@ def get_uploaded_chat_asset_rows(
     chat_id: str
 ):
     """
-    Gets chunks for one specific asset uploaded inside the current chat.
+    Gets context for one specific file/photo/doc uploaded inside the current chat.
 
-    This is only used when the frontend sends uploaded_asset_id.
-    Normal chatbot questions do not use this path.
+    Important:
+    - Used ONLY when frontend sends uploaded_asset_id.
+    - Does not search unrelated yacht documentation.
+    - Reads both:
+      1. asset_chunks
+      2. asset row fields like visual_description, ocr_text, extracted_text, summary
+
+    This makes chatbot-uploaded images/files answerable even if chunk lookup is weak.
     """
 
     if not uploaded_asset_id:
@@ -2485,7 +2491,21 @@ def get_uploaded_chat_asset_rows(
         raise HTTPException(status_code=403, detail="No access to this uploaded file")
 
     asset_res = supabase.table("assets") \
-        .select("id, yacht_id, chat_id, file_name, original_file_name, file_type, processing_status") \
+        .select("""
+            id,
+            yacht_id,
+            chat_id,
+            file_name,
+            original_file_name,
+            file_type,
+            mime_type,
+            processing_status,
+            processing_error,
+            extracted_text,
+            visual_description,
+            ocr_text,
+            summary
+        """) \
         .eq("id", uploaded_asset_id) \
         .eq("yacht_id", yacht_id) \
         .eq("chat_id", chat_id) \
@@ -2499,61 +2519,124 @@ def get_uploaded_chat_asset_rows(
 
     asset = asset_res.data[0]
 
-    if asset.get("processing_status") != "processed":
+    if asset.get("processing_status") == "failed":
         raise HTTPException(
             status_code=400,
-            detail="The uploaded file is still processing. Please try again in a moment."
+            detail="The uploaded file could not be processed: " + str(asset.get("processing_error") or "")
         )
 
-    chunks_res = supabase.table("asset_chunks") \
-        .select("""
-            asset_id,
-            yacht_id,
-            chat_id,
-            security_level,
-            content,
-            content_type,
-            chunk_index,
-            detected_date,
-            detected_year,
-            tags,
-            assets!inner (
-                id,
-                file_name,
-                original_file_name,
-                file_type
-            )
-        """) \
-        .eq("asset_id", uploaded_asset_id) \
-        .eq("yacht_id", yacht_id) \
-        .eq("chat_id", chat_id) \
-        .order("chunk_index") \
-        .limit(40) \
-        .execute()
+    if asset.get("processing_status") not in ["processed", "processing", "pending"]:
+        raise HTTPException(
+            status_code=400,
+            detail="The uploaded file is not ready yet. Please try again."
+        )
 
     rows = []
 
-    for row in chunks_res.data or []:
-        asset_data = row.get("assets") or {}
+    file_name = (
+        asset.get("original_file_name")
+        or asset.get("file_name")
+        or "Uploaded file"
+    )
 
+    file_type = asset.get("file_type") or "file"
+
+    direct_parts = []
+
+    direct_parts.append(f"File name: {file_name}")
+    direct_parts.append(f"File type: {file_type}")
+
+    if asset.get("visual_description"):
+        direct_parts.append(
+            "Image visual description:\n" + str(asset.get("visual_description"))
+        )
+
+    if asset.get("ocr_text"):
+        direct_parts.append(
+            "OCR text from image/file:\n" + str(asset.get("ocr_text"))
+        )
+
+    if asset.get("extracted_text"):
+        direct_parts.append(
+            "Extracted document text:\n" + str(asset.get("extracted_text"))
+        )
+
+    if asset.get("summary"):
+        direct_parts.append(
+            "Summary:\n" + str(asset.get("summary"))
+        )
+
+    direct_context = "\n\n".join(
+        part for part in direct_parts if str(part or "").strip()
+    ).strip()
+
+    if direct_context:
         rows.append({
-            "asset_id": row.get("asset_id"),
-            "yacht_id": row.get("yacht_id"),
-            "chat_id": row.get("chat_id"),
-            "security_level": row.get("security_level"),
-            "content": row.get("content"),
-            "content_type": row.get("content_type"),
-            "chunk_index": row.get("chunk_index"),
-            "detected_date": row.get("detected_date"),
-            "detected_year": row.get("detected_year"),
-            "tags": row.get("tags"),
-            "file_name": asset_data.get("file_name"),
-            "original_file_name": asset_data.get("original_file_name"),
-            "file_type": asset_data.get("file_type")
+            "asset_id": asset.get("id"),
+            "yacht_id": asset.get("yacht_id"),
+            "chat_id": asset.get("chat_id"),
+            "security_level": security_level,
+            "content": direct_context,
+            "content_type": "uploaded_chat_asset",
+            "chunk_index": 0,
+            "detected_date": None,
+            "detected_year": None,
+            "tags": [],
+            "file_name": asset.get("file_name"),
+            "original_file_name": asset.get("original_file_name"),
+            "file_type": asset.get("file_type")
         })
 
-    return rows
+    try:
+        chunks_res = supabase.table("asset_chunks") \
+            .select("""
+                asset_id,
+                yacht_id,
+                chat_id,
+                security_level,
+                content,
+                content_type,
+                chunk_index,
+                detected_date,
+                detected_year,
+                tags,
+                assets!inner (
+                    id,
+                    file_name,
+                    original_file_name,
+                    file_type
+                )
+            """) \
+            .eq("asset_id", uploaded_asset_id) \
+            .eq("yacht_id", yacht_id) \
+            .eq("chat_id", chat_id) \
+            .order("chunk_index") \
+            .limit(40) \
+            .execute()
 
+        for row in chunks_res.data or []:
+            asset_data = row.get("assets") or {}
+
+            rows.append({
+                "asset_id": row.get("asset_id"),
+                "yacht_id": row.get("yacht_id"),
+                "chat_id": row.get("chat_id"),
+                "security_level": row.get("security_level"),
+                "content": row.get("content"),
+                "content_type": row.get("content_type"),
+                "chunk_index": row.get("chunk_index"),
+                "detected_date": row.get("detected_date"),
+                "detected_year": row.get("detected_year"),
+                "tags": row.get("tags"),
+                "file_name": asset_data.get("file_name"),
+                "original_file_name": asset_data.get("original_file_name"),
+                "file_type": asset_data.get("file_type")
+            })
+
+    except Exception as e:
+        print("UPLOADED CHAT CHUNKS LOOKUP ERROR:", type(e).__name__, str(e))
+
+    return rows
 def build_sources_from_asset_results(results: list[dict]) -> list[dict]:
     seen = set()
     sources = []
@@ -3147,6 +3230,28 @@ def keyword_match_asset_chunks(
 
     return [item["row"] for item in ranked[:limit]]
 
+def keyword_search_asset_chunks(
+    query: str,
+    yacht_id: str,
+    allowed_asset_ids: list[str],
+    year_filter: int | None = None,
+    limit: int = 8
+) -> list[dict]:
+    """
+    Compatibility wrapper.
+
+    chat() calls keyword_search_asset_chunks(...), but the real implementation
+    is keyword_match_asset_chunks(...). Without this wrapper, normal chat search
+    crashes and returns the fallback answer.
+    """
+
+    return keyword_match_asset_chunks(
+        retrieval_query=query,
+        allowed_asset_ids=allowed_asset_ids,
+        yacht_id=yacht_id,
+        limit=limit
+    )
+
 def get_recent_chat_context(chat_id: str, limit: int = 6) -> str:
     """
     Gets recent chat messages.
@@ -3354,6 +3459,7 @@ def chat(
     sources = []
     matched_rows = []
     context = ""
+    retrieval_query_input = query
 
     try:
         if uploaded_asset_id:
@@ -3494,6 +3600,12 @@ or:
   "used_source_numbers": [],
   "used_source_titles": []
 }}
+
+Special rule for chatbot-uploaded files:
+- If uploaded_asset_id was provided, the user is asking about the file/photo/document they just uploaded in this chat.
+- In that case, answer from the uploaded file context even if the question is informal, such as "analyze this photo", "what is this", "tell me about this file", or "summarize it".
+- For photos, use the Image visual description and OCR text.
+- Do not require the user to name a yacht document or procedure when uploaded_asset_id is provided.
 
 Strict rules:
 - Do not hallucinate.

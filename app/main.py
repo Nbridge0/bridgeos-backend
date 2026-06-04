@@ -614,7 +614,6 @@ async def upload_asset_api(
     chat_id: Optional[str] = Form(None),
     security_level: int = Form(1),
     folder_name: Optional[str] = Form(None),
-    folder_security_level: Optional[int] = Form(None),
     token: HTTPAuthorizationCredentials = Depends(security)
 ):
     user = get_user(request)
@@ -631,7 +630,7 @@ async def upload_asset_api(
         )
 
     try:
-        final_security_level = int(folder_security_level or security_level)
+        final_security_level = int(security_level)
 
         if final_security_level not in [1, 2, 3]:
             raise HTTPException(
@@ -648,7 +647,7 @@ async def upload_asset_api(
             chat_id=chat_id,
             security_level=final_security_level,
             folder_name=folder_name,
-            folder_security_level=final_security_level
+            folder_security_level=None
         )
 
     except HTTPException:
@@ -659,6 +658,7 @@ async def upload_asset_api(
             status_code=500,
             detail=f"Asset upload failed: {type(e).__name__}: {str(e)}"
         )
+        
 @app.post("/assets/batch")
 async def upload_assets_batch_api(
     request: Request,
@@ -666,7 +666,6 @@ async def upload_assets_batch_api(
     chat_id: Optional[str] = Form(None),
     security_level: int = Form(1),
     folder_name: Optional[str] = Form(None),
-    folder_security_level: Optional[int] = Form(None),
     token: HTTPAuthorizationCredentials = Depends(security)
 ):
     user = get_user(request)
@@ -682,7 +681,7 @@ async def upload_assets_batch_api(
             detail="Only security level 1 can upload assets"
         )
 
-    final_security_level = int(folder_security_level or security_level)
+    final_security_level = int(security_level)
 
     if final_security_level not in [1, 2, 3]:
         raise HTTPException(
@@ -702,7 +701,7 @@ async def upload_assets_batch_api(
             chat_id=chat_id,
             security_level=final_security_level,
             folder_name=folder_name,
-            folder_security_level=final_security_level
+            folder_security_level=None
         )
         results.append(result)
 
