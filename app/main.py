@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException, Depends
+from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException, Depends 
 from fastapi.responses import StreamingResponse
 import io
 from urllib.parse import quote
@@ -611,6 +611,8 @@ async def upload_asset_api(
     file: UploadFile = File(...),
     chat_id: Optional[str] = Form(None),
     security_level: int = Form(1),
+    folder_name: Optional[str] = Form(None),
+    folder_security_level: Optional[int] = Form(None),
     token: HTTPAuthorizationCredentials = Depends(security)
 ):
     user = get_user(request)
@@ -627,6 +629,14 @@ async def upload_asset_api(
         )
 
     try:
+        final_security_level = int(folder_security_level or security_level)
+
+        if final_security_level not in [1, 2, 3]:
+            raise HTTPException(
+                status_code=400,
+                detail="security_level must be 1, 2, or 3"
+            )
+
         return services.upload_asset(
             file=file.file,
             filename=file.filename,
@@ -634,8 +644,14 @@ async def upload_asset_api(
             yacht_id=crew["yacht_id"],
             uploaded_by=crew["id"],
             chat_id=chat_id,
-            security_level=security_level
+            security_level=final_security_level,
+            folder_name=folder_name,
+            folder_security_level=final_security_level
         )
+
+    except HTTPException:
+        raise
+
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -647,6 +663,8 @@ async def upload_assets_batch_api(
     files: list[UploadFile] = File(...),
     chat_id: Optional[str] = Form(None),
     security_level: int = Form(1),
+    folder_name: Optional[str] = Form(None),
+    folder_security_level: Optional[int] = Form(None),
     token: HTTPAuthorizationCredentials = Depends(security)
 ):
     user = get_user(request)
@@ -656,10 +674,18 @@ async def upload_assets_batch_api(
     if not crew:
         raise HTTPException(status_code=403, detail="No access")
 
-    if crew["security_level"] != 1:
+    if int(crew["security_level"]) != 1:
         raise HTTPException(
             status_code=403,
             detail="Only security level 1 can upload assets"
+        )
+
+    final_security_level = int(folder_security_level or security_level)
+
+    if final_security_level not in [1, 2, 3]:
+        raise HTTPException(
+            status_code=400,
+            detail="security_level must be 1, 2, or 3"
         )
 
     results = []
@@ -672,16 +698,19 @@ async def upload_assets_batch_api(
             yacht_id=crew["yacht_id"],
             uploaded_by=crew["id"],
             chat_id=chat_id,
-            security_level=security_level
+            security_level=final_security_level,
+            folder_name=folder_name,
+            folder_security_level=final_security_level
         )
         results.append(result)
 
     return {
         "message": "Batch upload completed",
         "count": len(results),
+        "folder_name": folder_name,
+        "security_level": final_security_level,
         "results": results
     }
-
 
 @app.get("/assets/admin")
 async def list_assets_admin(
@@ -766,8 +795,14 @@ async def get_asset_preview_api(
     )
 
 @app.get("/assets/{asset_id}/download")
-def download_asset(asset_id: str, user=Depends(get_user)):
-    crew = services.get_crew(user["id"])
+async def download_asset(
+    asset_id: str,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    crew = services.get_crew(user["sub"])
 
     if not crew:
         raise HTTPException(status_code=404, detail="Crew profile not found")
@@ -786,7 +821,7 @@ def download_asset(asset_id: str, user=Depends(get_user)):
         )
 
     try:
-        file_bytes = services.storage_admin.storage.from_(BUCKET_NAME).download(
+        file_bytes = services.storage_admin.storage.from_(services.BUCKET_NAME).download(
             storage_path
         )
     except Exception as e:
