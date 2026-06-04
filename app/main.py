@@ -10,6 +10,7 @@ from app.config import FRONTEND_ORIGINS
 
 from app.auth import get_user
 from app import services
+from app.services import get_asset_for_download
 
 app = FastAPI(title="Yacht Secure Chatbot API")
 
@@ -765,51 +766,61 @@ async def get_asset_preview_api(
     )
 
 @app.get("/assets/{asset_id}/download")
-async def download_asset_api(
-    asset_id: str,
-    request: Request,
-    token: HTTPAuthorizationCredentials = Depends(security)
-):
-    user = get_user(request)
-
-    crew = services.get_crew(user["sub"])
+def download_asset(asset_id: str, user=Depends(get_user)):
+    crew = services.get_crew(user["id"])
 
     if not crew:
-        raise HTTPException(status_code=403, detail="No access")
+        raise HTTPException(status_code=404, detail="Crew profile not found")
 
     asset = services.get_asset_for_download(
         asset_id=asset_id,
         crew=crew
     )
 
+    storage_path = asset.get("storage_path")
+
+    if not storage_path:
+        raise HTTPException(
+            status_code=404,
+            detail="This asset has no stored file to download"
+        )
+
     try:
-        file_bytes = services.storage_admin.storage.from_(services.BUCKET_NAME).download(
-            asset["storage_path"]
+        file_bytes = services.storage_admin.storage.from_(BUCKET_NAME).download(
+            storage_path
         )
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Could not download asset from storage: {str(e)}"
+            detail=f"Could not download file from storage: {str(e)}"
+        )
+
+    if not file_bytes:
+        raise HTTPException(
+            status_code=404,
+            detail="File not found in storage"
         )
 
     filename = (
         asset.get("original_file_name")
         or asset.get("file_name")
-        or "asset-download"
+        or "download"
     )
 
     mime_type = asset.get("mime_type") or "application/octet-stream"
 
-    safe_download_name = quote(filename)
+    safe_download_name = filename.replace('"', "")
 
     return StreamingResponse(
         io.BytesIO(file_bytes),
         media_type=mime_type,
         headers={
-            "Content-Disposition": f"attachment; filename*=UTF-8''{safe_download_name}"
+            "Content-Disposition": (
+                f'attachment; filename="{safe_download_name}"; '
+                f"filename*=UTF-8''{quote(filename)}"
+            )
         }
     )
-
 @app.post("/assets/{asset_id}/authorize")
 async def authorize_asset(
     asset_id: str,
