@@ -2468,14 +2468,8 @@ def get_uploaded_chat_asset_rows(
     """
     Gets context for one specific file/photo/doc uploaded inside the current chat.
 
-    Important:
-    - Used ONLY when frontend sends uploaded_asset_id.
-    - Does not search unrelated yacht documentation.
-    - Reads both:
-      1. asset_chunks
-      2. asset row fields like visual_description, ocr_text, extracted_text, summary
-
-    This makes chatbot-uploaded images/files answerable even if chunk lookup is weak.
+    Used only when frontend sends uploaded_asset_id.
+    Does not search unrelated Yacht Documentation.
     """
 
     if not uploaded_asset_id:
@@ -2519,18 +2513,6 @@ def get_uploaded_chat_asset_rows(
 
     asset = asset_res.data[0]
 
-    if asset.get("processing_status") == "failed":
-        raise HTTPException(
-            status_code=400,
-            detail="The uploaded file could not be processed: " + str(asset.get("processing_error") or "")
-        )
-
-    if asset.get("processing_status") not in ["processed", "processing", "pending"]:
-        raise HTTPException(
-            status_code=400,
-            detail="The uploaded file is not ready yet. Please try again."
-        )
-
     rows = []
 
     file_name = (
@@ -2541,10 +2523,16 @@ def get_uploaded_chat_asset_rows(
 
     file_type = asset.get("file_type") or "file"
 
-    direct_parts = []
+    direct_parts = [
+        f"File name: {file_name}",
+        f"File type: {file_type}",
+        f"Processing status: {asset.get('processing_status') or ''}",
+    ]
 
-    direct_parts.append(f"File name: {file_name}")
-    direct_parts.append(f"File type: {file_type}")
+    if asset.get("processing_error"):
+        direct_parts.append(
+            "Processing error:\n" + str(asset.get("processing_error"))
+        )
 
     if asset.get("visual_description"):
         direct_parts.append(
@@ -2553,7 +2541,7 @@ def get_uploaded_chat_asset_rows(
 
     if asset.get("ocr_text"):
         direct_parts.append(
-            "OCR text from image/file:\n" + str(asset.get("ocr_text"))
+            "OCR text:\n" + str(asset.get("ocr_text"))
         )
 
     if asset.get("extracted_text"):
@@ -2637,6 +2625,7 @@ def get_uploaded_chat_asset_rows(
         print("UPLOADED CHAT CHUNKS LOOKUP ERROR:", type(e).__name__, str(e))
 
     return rows
+    
 def build_sources_from_asset_results(results: list[dict]) -> list[dict]:
     seen = set()
     sources = []
@@ -2662,6 +2651,81 @@ def build_sources_from_asset_results(results: list[dict]) -> list[dict]:
         })
 
     return sources
+
+def answer_from_uploaded_chat_asset(
+    query: str,
+    context: str,
+    matched_rows: list[dict]
+):
+    """
+    Special mode for files/photos/docs uploaded inside the chatbot.
+
+    This is NOT Yacht Documentation search.
+    This answers only from the file the user just uploaded in the chat.
+    """
+
+    clean_context = (context or "").strip()
+
+    if not clean_context:
+        return {
+            "answer": (
+                "I received the uploaded file, but I could not read or analyze its contents yet. "
+                "Please try uploading it again, or check the backend processing_error for this asset."
+            ),
+            "sources": []
+        }
+
+    try:
+        answer = ask_llm(
+            query=query,
+            context=f"""
+You are BridgeOS.
+
+The user just uploaded a file/photo/document inside the chatbot and asked a question about it.
+
+You must answer using ONLY the uploaded file context below.
+
+Important rules:
+- This is a chatbot upload, not Yacht Documentation.
+- Do NOT say "Please ask your admin to upload it" because the user already uploaded it.
+- Do NOT search other yacht documents.
+- Do NOT use general knowledge unless it is only to describe what is visible/readable in the uploaded file.
+- If it is a photo, use "Image visual description" and "OCR text" if available.
+- If it is a document, use "Extracted document text" if available.
+- If the user asks "what is this about?", summarize what the uploaded file/photo appears to contain.
+- If the user asks to analyze it, analyze only what is visible or written in the uploaded file.
+- If the uploaded context is weak, say exactly what you can see/read and say what is unclear.
+- Never use the fallback "Sorry, I don't have this data yet. Please ask your admin to upload it." in this uploaded-file mode.
+
+User question:
+{query}
+
+Uploaded file context:
+{clean_context}
+""".strip()
+        )
+
+        answer = str(answer or "").strip()
+
+    except Exception as e:
+        print("UPLOADED CHAT ASSET LLM ERROR:", type(e).__name__, str(e))
+        answer = ""
+
+    if not answer:
+        answer = (
+            "I received the uploaded file, but I could not generate an analysis from it. "
+            "Please try again or check whether the file was processed successfully."
+        )
+
+    sources = []
+
+    if matched_rows:
+        sources = build_sources_from_asset_results([matched_rows[0]])
+
+    return {
+        "answer": answer,
+        "sources": sources
+    }
 # ------------------------
 # DOCUMENT ACCESS
 # ------------------------
@@ -3239,10 +3303,7 @@ def keyword_search_asset_chunks(
 ) -> list[dict]:
     """
     Compatibility wrapper.
-
-    chat() calls keyword_search_asset_chunks(...), but the real implementation
-    is keyword_match_asset_chunks(...). Without this wrapper, normal chat search
-    crashes and returns the fallback answer.
+    chat() calls keyword_search_asset_chunks, while the real implementation is keyword_match_asset_chunks.
     """
 
     return keyword_match_asset_chunks(
@@ -3569,6 +3630,35 @@ def chat(
         print("LOCAL CHAT DOCUMENT SEARCH ERROR:", type(e).__name__, str(e))
         matched_rows = []
         context = ""
+
+        if uploaded_asset_id:
+            uploaded_result = answer_from_uploaded_chat_asset(
+                query=query,
+                context=context,
+                matched_rows=matched_rows
+            )
+
+            answer = uploaded_result["answer"]
+            sources = uploaded_result["sources"]
+
+            supabase.table("messages").insert({
+                "chat_id": chat_id,
+                "yacht_id": yacht_id,
+                "crew_id": crew_id,
+                "role": "assistant",
+                "content": answer
+            }).execute()
+
+            supabase.table("chats").update({
+                "updated_at": "now()"
+            }).eq("id", chat_id).eq("crew_id", crew_id).eq("yacht_id", yacht_id).execute()
+
+            return {
+                "answer": answer,
+                "sources": sources,
+                "uploaded_asset_id": uploaded_asset_id,
+                "mode": "uploaded_chat_asset"
+            }
 
     if context.strip():
         raw_answer = ask_llm(
