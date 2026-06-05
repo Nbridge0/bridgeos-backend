@@ -2225,7 +2225,36 @@ def upload_asset(
             "duplicate": False
         }
 
+def clean_text_for_postgres(value: str | None) -> str:
+    """
+    Removes characters Postgres/Supabase cannot store in text fields.
+    Fixes errors like:
+    unsupported Unicode escape sequence
+    \\u0000 cannot be converted to text
+    """
 
+    if value is None:
+        return ""
+
+    text = str(value)
+
+    # Remove NULL bytes and escaped NULL sequences
+    text = text.replace("\x00", "")
+    text = text.replace("\\u0000", "")
+    text = text.replace("\u0000", "")
+
+    # Remove other unsafe control characters but keep normal whitespace
+    cleaned_chars = []
+
+    for char in text:
+        code = ord(char)
+
+        if char in ["\n", "\r", "\t"]:
+            cleaned_chars.append(char)
+        elif code >= 32:
+            cleaned_chars.append(char)
+
+    return "".join(cleaned_chars).strip()
 
 def process_uploaded_asset(
     asset_id: str,
@@ -2257,6 +2286,8 @@ def process_uploaded_asset(
                 filename=filename,
                 file_type=file_type
             )
+
+            extracted_text = clean_text_for_postgres(extracted_text)
 
         if file_type == "image":
             file.seek(0)
