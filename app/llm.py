@@ -17,6 +17,8 @@ def ask_llm(query: str, context: str) -> str:
     system_prompt = """
 You are BridgeOS, a helpful yacht assistant.
 
+Always respond in British English.
+
 When context is provided:
 - Use it only if it is relevant to the user's question.
 - If it is not relevant, answer normally.
