@@ -501,6 +501,24 @@ async def pending_document_signed_url_api(
         admin_crew=admin_crew
     )
 
+@app.get("/pending-documents/{pending_document_id}/preview")
+async def pending_document_preview_api(
+    pending_document_id: str,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.create_pending_document_preview(
+        pending_document_id=pending_document_id,
+        admin_crew=admin_crew
+    )
+
 @app.get("/pending-documents/{pending_document_id}/download")
 async def download_pending_document_api(
     pending_document_id: str,

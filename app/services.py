@@ -2005,6 +2005,65 @@ def create_pending_document_signed_url(
         "signed_url": signed_url
     }
 
+def create_pending_document_preview(
+    pending_document_id: str,
+    admin_crew: dict
+):
+    if int(admin_crew["security_level"]) != 1:
+        raise HTTPException(
+            status_code=403,
+            detail="Only Tier 1 admins can preview pending documents"
+        )
+
+    res = supabase.table("pending_documents") \
+        .select("*") \
+        .eq("id", pending_document_id) \
+        .eq("yacht_id", admin_crew["yacht_id"]) \
+        .execute()
+
+    if not res.data:
+        raise HTTPException(
+            status_code=404,
+            detail="Pending document not found"
+        )
+
+    pending_doc = res.data[0]
+
+    storage_path = pending_doc.get("storage_path")
+
+    if not storage_path:
+        raise HTTPException(
+            status_code=404,
+            detail="This pending document has no stored file to preview"
+        )
+
+    signed = storage_admin.storage.from_(BUCKET_NAME).create_signed_url(
+        storage_path,
+        60 * 10
+    )
+
+    signed_url = signed.get("signedURL") or signed.get("signed_url")
+
+    if not signed_url:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not create pending document preview URL"
+        )
+
+    title = (
+        pending_doc.get("original_file_name")
+        or pending_doc.get("file_name")
+        or "Pending document preview"
+    )
+
+    return {
+        "pending_document_id": pending_document_id,
+        "title": title,
+        "preview_type": "url",
+        "url": signed_url,
+        "mime_type": pending_doc.get("mime_type") or "application/octet-stream"
+    }
+
 def get_pending_document_for_download(
     pending_document_id: str,
     admin_crew: dict
