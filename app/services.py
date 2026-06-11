@@ -1579,6 +1579,77 @@ def get_asset_for_download(asset_id: str, crew: dict):
 
     return res.data[0]
 
+def move_asset_to_folder(
+    asset_id: str,
+    folder_name: str | None,
+    admin_crew: dict
+):
+    """
+    Moves one asset into another virtual folder.
+
+    Folders are virtual:
+    - There is no folders table.
+    - A folder exists because assets have folder_name.
+    - Moving a file means updating assets.folder_name.
+    """
+
+    if int(admin_crew["security_level"]) != 1:
+        raise HTTPException(
+            status_code=403,
+            detail="Only Tier 1 admins can move assets"
+        )
+
+    clean_folder_name = (folder_name or "").strip()
+
+    asset_res = supabase.table("assets") \
+        .select("*") \
+        .eq("id", asset_id) \
+        .eq("yacht_id", admin_crew["yacht_id"]) \
+        .execute()
+
+    if not asset_res.data:
+        raise HTTPException(status_code=404, detail="Asset not found")
+
+    folder_security_level = None
+
+    if clean_folder_name:
+        existing_folder_res = supabase.table("assets") \
+            .select("folder_security_level, security_level") \
+            .eq("yacht_id", admin_crew["yacht_id"]) \
+            .eq("folder_name", clean_folder_name) \
+            .limit(1) \
+            .execute()
+
+        if existing_folder_res.data:
+            existing_folder = existing_folder_res.data[0]
+            folder_security_level = (
+                existing_folder.get("folder_security_level")
+                or existing_folder.get("security_level")
+            )
+
+    try:
+        moved_res = supabase.table("assets") \
+            .update({
+                "folder_name": clean_folder_name or None,
+                "folder_security_level": folder_security_level
+            }) \
+            .eq("id", asset_id) \
+            .eq("yacht_id", admin_crew["yacht_id"]) \
+            .execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not move asset: {str(e)}"
+        )
+
+    if not moved_res.data:
+        raise HTTPException(status_code=404, detail="Asset not found")
+
+    return {
+        "message": "Asset moved successfully",
+        "asset": moved_res.data[0]
+    }
+
 def delete_asset(asset_id: str, admin_crew: dict):
     """
     Deletes one asset from:

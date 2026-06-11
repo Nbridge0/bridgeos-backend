@@ -124,6 +124,9 @@ class SeedAssetRequest(BaseModel):
     content: str
     security_level: int = 1
 
+class MoveAssetRequest(BaseModel):
+    folder_name: Optional[str] = None
+
 @app.post("/auth/dev-login")
 async def dev_login(body: DevLoginRequest):
     return services.dev_login(
@@ -893,6 +896,26 @@ async def delete_asset_api(
 
     return services.delete_asset(
         asset_id=asset_id,
+        admin_crew=admin_crew
+    )
+
+@app.patch("/assets/{asset_id}/move")
+async def move_asset_api(
+    asset_id: str,
+    body: MoveAssetRequest,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.move_asset_to_folder(
+        asset_id=asset_id,
+        folder_name=body.folder_name,
         admin_crew=admin_crew
     )
 
