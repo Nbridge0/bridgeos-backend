@@ -1650,6 +1650,89 @@ def move_asset_to_folder(
         "asset": moved_res.data[0]
     }
 
+def rename_asset(
+    asset_id: str,
+    new_name: str,
+    admin_crew: dict
+):
+    """
+    Renames one asset for display in Yacht Documentation.
+
+    This updates the database display name only.
+    It does not rename the physical file path in Supabase Storage.
+
+    Audit fields updated:
+    - previous_file_name
+    - renamed_at
+    - renamed_by
+    """
+
+    if int(admin_crew["security_level"]) != 1:
+        raise HTTPException(
+            status_code=403,
+            detail="Only Tier 1 admins can rename assets"
+        )
+
+    clean_name = (new_name or "").strip()
+
+    if not clean_name:
+        raise HTTPException(
+            status_code=400,
+            detail="File name is required"
+        )
+
+    if len(clean_name) > 180:
+        clean_name = clean_name[:180]
+
+    asset_res = supabase.table("assets") \
+        .select("*") \
+        .eq("id", asset_id) \
+        .eq("yacht_id", admin_crew["yacht_id"]) \
+        .execute()
+
+    if not asset_res.data:
+        raise HTTPException(status_code=404, detail="Asset not found")
+
+    asset = asset_res.data[0]
+
+    previous_name = (
+        asset.get("original_file_name")
+        or asset.get("file_name")
+        or ""
+    )
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    try:
+        renamed_res = supabase.table("assets") \
+            .update({
+                "original_file_name": clean_name,
+                "file_name": clean_name,
+                "previous_file_name": previous_name,
+                "renamed_at": now,
+                "renamed_by": admin_crew["id"]
+            }) \
+            .eq("id", asset_id) \
+            .eq("yacht_id", admin_crew["yacht_id"]) \
+            .execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not rename asset: {str(e)}"
+        )
+
+    if not renamed_res.data:
+        raise HTTPException(status_code=404, detail="Asset not found")
+
+    return {
+        "message": "Asset renamed successfully",
+        "previous_file_name": previous_name,
+        "new_file_name": clean_name,
+        "renamed_at": now,
+        "renamed_by": admin_crew["id"],
+        "asset": renamed_res.data[0]
+    }
+
 def delete_asset(asset_id: str, admin_crew: dict):
     """
     Deletes one asset from:

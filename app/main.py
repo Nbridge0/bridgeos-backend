@@ -91,6 +91,9 @@ class CreateChatRequest(BaseModel):
 class UpdateChatRequest(BaseModel):
     title: str
 
+class RenameAssetRequest(BaseModel):
+    name: str
+
 class AuthorizeDocumentRequest(BaseModel):
     crew_id: str
 
@@ -879,6 +882,26 @@ async def download_asset(
                 f"filename*=UTF-8''{quote(filename)}"
             )
         }
+    )
+
+@app.patch("/assets/{asset_id}/rename")
+async def rename_asset_api(
+    asset_id: str,
+    body: RenameAssetRequest,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.rename_asset(
+        asset_id=asset_id,
+        new_name=body.name,
+        admin_crew=admin_crew
     )
 
 @app.delete("/assets/{asset_id}")
