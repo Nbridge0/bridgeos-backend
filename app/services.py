@@ -1508,12 +1508,15 @@ def create_asset_preview(asset_id: str, crew: dict):
         or "Document preview"
     )
 
-    extracted_text = (
-        asset.get("extracted_text")
-        or asset.get("ocr_text")
-        or asset.get("visual_description")
-        or ""
-    )
+    visual_description = asset.get("visual_description") or ""
+    ocr_text = asset.get("ocr_text") or ""
+    normal_text = asset.get("extracted_text") or ""
+
+    extracted_text = "\n\n".join([
+        "Image visual description:\n" + visual_description if visual_description else "",
+        "OCR text:\n" + ocr_text if ocr_text else "",
+        "Extracted document text:\n" + normal_text if normal_text else ""
+    ]).strip()
 
     storage_path = asset.get("storage_path")
     mime_type = asset.get("mime_type") or "application/octet-stream"
@@ -2508,6 +2511,9 @@ def process_uploaded_asset(
 
             file.seek(0)
             ocr_text = extract_ocr_from_image(file, filename)
+
+            visual_description = clean_text_for_postgres(visual_description)
+            ocr_text = clean_text_for_postgres(ocr_text)
 
         combined_text = "\n\n".join([
             f"File name: {filename}",

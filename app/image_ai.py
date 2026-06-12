@@ -1,6 +1,6 @@
 import base64
+import mimetypes
 from openai import OpenAI
-
 from app.config import OPENAI_API_KEY
 
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -11,29 +11,28 @@ def _file_to_data_url(file, filename: str) -> str:
     data = file.read()
     file.seek(0)
 
-    ext = filename.lower().split(".")[-1]
+    mime_type, _ = mimetypes.guess_type(filename)
 
-    mime_type = "image/jpeg"
+    if not mime_type:
+        ext = filename.lower().split(".")[-1]
 
-    if ext == "png":
-        mime_type = "image/png"
-    elif ext == "webp":
-        mime_type = "image/webp"
-    elif ext in ["jpg", "jpeg"]:
-        mime_type = "image/jpeg"
-    elif ext == "gif":
-        mime_type = "image/gif"
+        if ext in ["jpg", "jpeg"]:
+            mime_type = "image/jpeg"
+        elif ext == "png":
+            mime_type = "image/png"
+        elif ext == "webp":
+            mime_type = "image/webp"
+        elif ext == "gif":
+            mime_type = "image/gif"
+        else:
+            mime_type = "image/jpeg"
 
     encoded = base64.b64encode(data).decode("utf-8")
+
     return f"data:{mime_type};base64,{encoded}"
 
 
 def describe_image(file, filename: str) -> str:
-    """
-    Creates a visual description of an uploaded image/photo.
-    This is stored in assets.visual_description and asset_chunks.
-    """
-
     try:
         image_url = _file_to_data_url(file, filename)
 
@@ -46,11 +45,10 @@ def describe_image(file, filename: str) -> str:
                         {
                             "type": "input_text",
                             "text": (
-                                "Describe this yacht-related uploaded photo clearly. "
-                                "Mention visible objects, people if any, location/setting, "
-                                "condition, labels, signs, documents, equipment, dates, "
-                                "and anything useful for later search. "
-                                "Do not invent anything not visible."
+                                "Describe this uploaded image clearly. "
+                                "Mention visible objects, people if any, location or setting, "
+                                "condition, labels, signs, documents, equipment, dates, and anything "
+                                "useful for later search. Do not invent anything not visible."
                             )
                         },
                         {
@@ -70,11 +68,6 @@ def describe_image(file, filename: str) -> str:
 
 
 def extract_ocr_from_image(file, filename: str) -> str:
-    """
-    Extracts readable text from an uploaded image/photo.
-    This is stored in assets.ocr_text and asset_chunks.
-    """
-
     try:
         image_url = _file_to_data_url(file, filename)
 
@@ -107,7 +100,8 @@ def extract_ocr_from_image(file, filename: str) -> str:
             "empty string",
             "no readable text",
             "there is no readable text",
-            "none"
+            "none",
+            "n/a"
         ]:
             return ""
 
