@@ -944,9 +944,10 @@ def create_crew_user(
     MAIN account creates SUB accounts under the SAME yacht.
 
     MAIN decides security_level:
-    1 = can access all yacht assets/docs
-    2 = limited, only explicitly granted assets/docs
-    3 = limited, only explicitly granted assets/docs
+    1 = can access Tier 1, 2, and 3 documents
+    2 = can access Tier 2 and 3 documents
+    3 = can access Tier 3 documents only
+    4 = custom access only, must be manually granted files in asset_access
     """
 
     if int(admin_crew["security_level"]) != 1:
@@ -957,10 +958,10 @@ def create_crew_user(
 
     security_level = int(security_level)
 
-    if security_level not in [1, 2, 3]:
+    if security_level not in [1, 2, 3, 4]:
         raise HTTPException(
             status_code=400,
-            detail="security_level must be 1, 2, or 3"
+            detail="security_level must be 1, 2, 3, or 4"
         )
 
     try:
@@ -1077,10 +1078,10 @@ def update_crew_user(
     if security_level is not None:
         security_level = int(security_level)
 
-        if security_level not in [1, 2, 3]:
+        if security_level not in [1, 2, 3, 4]:
             raise HTTPException(
                 status_code=400,
-                detail="security_level must be 1, 2, or 3"
+                detail="security_level must be 1, 2, 3, or 4"
             )
 
         updates["security_level"] = security_level
@@ -1334,31 +1335,56 @@ def delete_crew_user(
 
 def get_accessible_asset_ids(crew_id: str, yacht_id: str, security_level: int):
     """
-    Level 1:
-        Can access all assets for the yacht.
+    Synced document permission model.
 
-    Level 2 and 3:
-        Can only access assets explicitly granted in asset_access.
+    Crew Tier 1:
+        Can access assets with security_level 1, 2, or 3.
+
+    Crew Tier 2:
+        Can access assets with security_level 2 or 3.
+
+    Crew Tier 3:
+        Can access assets with security_level 3 only.
+
+    Crew Tier 4:
+        Custom only. No automatic tier access.
+        Can access only assets manually granted in asset_access.
+
+    Manual grants:
+        Any crew member can also access assets explicitly granted in asset_access.
     """
 
     security_level = int(security_level)
 
-    if security_level == 1:
-        assets = supabase.table("assets") \
+    if security_level not in [1, 2, 3, 4]:
+        return []
+
+    allowed_ids = set()
+
+    if security_level in [1, 2, 3]:
+        base_assets = supabase.table("assets") \
             .select("id") \
             .eq("yacht_id", yacht_id) \
+            .gte("security_level", security_level) \
             .execute()
 
-        return [asset["id"] for asset in assets.data]
+        allowed_ids = {
+            asset["id"]
+            for asset in (base_assets.data or [])
+            if asset.get("id")
+        }
 
-    access = supabase.table("asset_access") \
+    manual_access = supabase.table("asset_access") \
         .select("asset_id, assets!inner(yacht_id)") \
         .eq("crew_id", crew_id) \
         .eq("assets.yacht_id", yacht_id) \
         .execute()
 
-    return [row["asset_id"] for row in access.data]
+    for row in manual_access.data or []:
+        if row.get("asset_id"):
+            allowed_ids.add(row["asset_id"])
 
+    return list(allowed_ids)
 
 def authorize_asset_access(
     asset_id: str,
@@ -1661,13 +1687,14 @@ def rename_asset(
     """
     Renames one asset for display in Yacht Documentation.
 
-    This updates the database display name only.
-    It does not rename the physical file path in Supabase Storage.
+    Database sync:
+    - assets.original_file_name
+    - assets.file_name
+    - assets.previous_file_name
+    - assets.renamed_at
+    - assets.renamed_by
 
-    Audit fields updated:
-    - previous_file_name
-    - renamed_at
-    - renamed_by
+    It does not rename the physical storage path.
     """
 
     if int(admin_crew["security_level"]) != 1:
@@ -1679,10 +1706,7 @@ def rename_asset(
     clean_name = (new_name or "").strip()
 
     if not clean_name:
-        raise HTTPException(
-            status_code=400,
-            detail="File name is required"
-        )
+        raise HTTPException(status_code=400, detail="File name is required")
 
     if len(clean_name) > 180:
         clean_name = clean_name[:180]
@@ -1706,23 +1730,17 @@ def rename_asset(
 
     now = datetime.now(timezone.utc).isoformat()
 
-    try:
-        renamed_res = supabase.table("assets") \
-            .update({
-                "original_file_name": clean_name,
-                "file_name": clean_name,
-                "previous_file_name": previous_name,
-                "renamed_at": now,
-                "renamed_by": admin_crew["id"]
-            }) \
-            .eq("id", asset_id) \
-            .eq("yacht_id", admin_crew["yacht_id"]) \
-            .execute()
-    except Exception as e:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Could not rename asset: {str(e)}"
-        )
+    renamed_res = supabase.table("assets") \
+        .update({
+            "original_file_name": clean_name,
+            "file_name": clean_name,
+            "previous_file_name": previous_name,
+            "renamed_at": now,
+            "renamed_by": admin_crew["id"]
+        }) \
+        .eq("id", asset_id) \
+        .eq("yacht_id", admin_crew["yacht_id"]) \
+        .execute()
 
     if not renamed_res.data:
         raise HTTPException(status_code=404, detail="Asset not found")
@@ -1735,19 +1753,19 @@ def rename_asset(
         "renamed_by": admin_crew["id"],
         "asset": renamed_res.data[0]
     }
-
+    
 def rename_asset_folder(
     old_folder_name: str,
     new_folder_name: str,
     admin_crew: dict
 ):
     """
-    Renames a virtual folder in Yacht Documentation.
+    Renames a virtual folder.
 
     Folders are virtual:
     - There is no folders table.
-    - A folder exists because assets have folder_name.
-    - Renaming a folder means updating assets.folder_name for every file inside it.
+    - Folder exists because assets have folder_name.
+    - Renaming a folder updates assets.folder_name for every file inside it.
     """
 
     if int(admin_crew["security_level"]) != 1:
@@ -1760,16 +1778,10 @@ def rename_asset_folder(
     clean_new_name = (new_folder_name or "").strip()
 
     if not clean_old_name:
-        raise HTTPException(
-            status_code=400,
-            detail="Current folder name is required"
-        )
+        raise HTTPException(status_code=400, detail="Current folder name is required")
 
     if not clean_new_name:
-        raise HTTPException(
-            status_code=400,
-            detail="New folder name is required"
-        )
+        raise HTTPException(status_code=400, detail="New folder name is required")
 
     if len(clean_new_name) > 180:
         clean_new_name = clean_new_name[:180]
@@ -1790,10 +1802,7 @@ def rename_asset_folder(
         .execute()
 
     if not existing_old.data:
-        raise HTTPException(
-            status_code=404,
-            detail="Folder not found"
-        )
+        raise HTTPException(status_code=404, detail="Folder not found")
 
     existing_new = supabase.table("assets") \
         .select("id") \
@@ -1810,21 +1819,15 @@ def rename_asset_folder(
 
     now = datetime.now(timezone.utc).isoformat()
 
-    try:
-        renamed_res = supabase.table("assets") \
-            .update({
-                "folder_name": clean_new_name,
-                "renamed_at": now,
-                "renamed_by": admin_crew["id"]
-            }) \
-            .eq("yacht_id", admin_crew["yacht_id"]) \
-            .eq("folder_name", clean_old_name) \
-            .execute()
-    except Exception as e:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Could not rename folder: {str(e)}"
-        )
+    renamed_res = supabase.table("assets") \
+        .update({
+            "folder_name": clean_new_name,
+            "renamed_at": now,
+            "renamed_by": admin_crew["id"]
+        }) \
+        .eq("yacht_id", admin_crew["yacht_id"]) \
+        .eq("folder_name", clean_old_name) \
+        .execute()
 
     return {
         "message": "Folder renamed successfully",
@@ -1833,7 +1836,7 @@ def rename_asset_folder(
         "updated_count": len(renamed_res.data or []),
         "assets": renamed_res.data or []
     }
-
+    
 def delete_asset(asset_id: str, admin_crew: dict):
     """
     Deletes one asset from:
@@ -3074,6 +3077,227 @@ Uploaded file context:
         "answer": answer,
         "sources": sources
     }
+
+def get_asset_permissions(
+    asset_id: str,
+    admin_crew: dict
+):
+    """
+    Returns current document permissions.
+
+    Synced permission sources:
+    - assets.security_level controls automatic Tier 1 / 2 / 3 access.
+    - asset_access controls manual custom grants, including Tier 4 users.
+    """
+
+    if int(admin_crew["security_level"]) != 1:
+        raise HTTPException(
+            status_code=403,
+            detail="Only Tier 1 admins can view asset permissions"
+        )
+
+    asset_res = supabase.table("assets") \
+        .select("*") \
+        .eq("id", asset_id) \
+        .eq("yacht_id", admin_crew["yacht_id"]) \
+        .execute()
+
+    if not asset_res.data:
+        raise HTTPException(status_code=404, detail="Asset not found for this yacht")
+
+    asset = asset_res.data[0]
+    asset_security_level = int(asset.get("security_level") or 1)
+
+    crew_res = supabase.table("crew") \
+        .select("id, email, full_name, role, position, security_level") \
+        .eq("yacht_id", admin_crew["yacht_id"]) \
+        .order("security_level") \
+        .order("full_name") \
+        .execute()
+
+    access_res = supabase.table("asset_access") \
+        .select("asset_id, crew_id, granted_by, created_at") \
+        .eq("asset_id", asset_id) \
+        .execute()
+
+    manual_access_by_crew_id = {
+        row["crew_id"]: row
+        for row in (access_res.data or [])
+        if row.get("crew_id")
+    }
+
+    people = []
+
+    for crew in crew_res.data or []:
+        crew_security_level = int(crew.get("security_level") or 4)
+
+        if crew_security_level in [1, 2, 3]:
+            has_tier_access = asset_security_level >= crew_security_level
+        else:
+            has_tier_access = False
+
+        has_manual_access = crew["id"] in manual_access_by_crew_id
+
+        people.append({
+            "crew_id": crew["id"],
+            "email": crew.get("email"),
+            "full_name": crew.get("full_name"),
+            "role": crew.get("role"),
+            "position": crew.get("position"),
+            "security_level": crew_security_level,
+            "has_tier_access": has_tier_access,
+            "has_manual_access": has_manual_access,
+            "can_view": has_tier_access or has_manual_access,
+            "manual_access_row": manual_access_by_crew_id.get(crew["id"])
+        })
+
+    return {
+        "asset": {
+            "id": asset["id"],
+            "file_name": asset.get("file_name"),
+            "original_file_name": asset.get("original_file_name"),
+            "security_level": asset_security_level
+        },
+        "tier_options": [
+            {
+                "security_level": 1,
+                "label": "Tier 1 only",
+                "description": "Tier 1 users can view automatically. Others need manual access."
+            },
+            {
+                "security_level": 2,
+                "label": "Tier 1 and Tier 2",
+                "description": "Tier 1 and Tier 2 users can view automatically. Tier 3 and 4 need manual access."
+            },
+            {
+                "security_level": 3,
+                "label": "Tier 1, Tier 2, and Tier 3",
+                "description": "Tier 1, Tier 2, and Tier 3 users can view automatically. Tier 4 still needs manual access."
+            }
+        ],
+        "people": people
+    }
+
+
+def update_asset_permissions(
+    asset_id: str,
+    security_level: int,
+    crew_ids: list[str],
+    admin_crew: dict
+):
+    """
+    Updates document permissions and keeps database in sync.
+
+    Database sync:
+    - assets.security_level controls automatic Tier 1 / 2 / 3 access.
+    - asset_chunks.security_level stays synced for retrieval.
+    - asset_access controls manual grants for Tier 4 and optional extra grants for Tier 2/3.
+    """
+
+    if int(admin_crew["security_level"]) != 1:
+        raise HTTPException(
+            status_code=403,
+            detail="Only Tier 1 admins can update asset permissions"
+        )
+
+    security_level = int(security_level)
+
+    if security_level not in [1, 2, 3]:
+        raise HTTPException(
+            status_code=400,
+            detail="Document security_level must be 1, 2, or 3. Tier 4 is custom user access only."
+        )
+
+    asset_res = supabase.table("assets") \
+        .select("*") \
+        .eq("id", asset_id) \
+        .eq("yacht_id", admin_crew["yacht_id"]) \
+        .execute()
+
+    if not asset_res.data:
+        raise HTTPException(status_code=404, detail="Asset not found for this yacht")
+
+    clean_crew_ids = []
+
+    for crew_id in crew_ids or []:
+        clean_crew_id = str(crew_id).strip()
+
+        if clean_crew_id and clean_crew_id not in clean_crew_ids:
+            clean_crew_ids.append(clean_crew_id)
+
+    if clean_crew_ids:
+        crew_res = supabase.table("crew") \
+            .select("id") \
+            .eq("yacht_id", admin_crew["yacht_id"]) \
+            .in_("id", clean_crew_ids) \
+            .execute()
+
+        valid_crew_ids = {
+            row["id"]
+            for row in (crew_res.data or [])
+        }
+
+        missing_ids = [
+            crew_id
+            for crew_id in clean_crew_ids
+            if crew_id not in valid_crew_ids
+        ]
+
+        if missing_ids:
+            raise HTTPException(
+                status_code=404,
+                detail="One or more crew members were not found for this yacht"
+            )
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    try:
+        supabase.table("assets") \
+            .update({
+                "security_level": security_level,
+                "permissions_updated_at": now,
+                "permissions_updated_by": admin_crew["id"]
+            }) \
+            .eq("id", asset_id) \
+            .eq("yacht_id", admin_crew["yacht_id"]) \
+            .execute()
+
+        supabase.table("asset_chunks") \
+            .update({
+                "security_level": security_level
+            }) \
+            .eq("asset_id", asset_id) \
+            .eq("yacht_id", admin_crew["yacht_id"]) \
+            .execute()
+
+        supabase.table("asset_access") \
+            .delete() \
+            .eq("asset_id", asset_id) \
+            .execute()
+
+        rows = [
+            {
+                "asset_id": asset_id,
+                "crew_id": crew_id,
+                "granted_by": admin_crew["id"]
+            }
+            for crew_id in clean_crew_ids
+        ]
+
+        if rows:
+            supabase.table("asset_access").insert(rows).execute()
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not update asset permissions: {str(e)}"
+        )
+
+    return get_asset_permissions(
+        asset_id=asset_id,
+        admin_crew=admin_crew
+    )
+    
 # ------------------------
 # DOCUMENT ACCESS
 # ------------------------

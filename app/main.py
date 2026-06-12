@@ -97,6 +97,11 @@ class RenameAssetRequest(BaseModel):
 class RenameFolderRequest(BaseModel):
     name: str
 
+
+class UpdateAssetPermissionsRequest(BaseModel):
+    security_level: int
+    crew_ids: list[str] = []
+
 class AuthorizeDocumentRequest(BaseModel):
     crew_id: str
 
@@ -1036,6 +1041,46 @@ async def seed_asset_api(
         yacht_id=crew["yacht_id"],
         uploaded_by=crew["id"],
         security_level=body.security_level
+    )
+
+@app.get("/assets/{asset_id}/permissions")
+async def get_asset_permissions_api(
+    asset_id: str,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.get_asset_permissions(
+        asset_id=asset_id,
+        admin_crew=admin_crew
+    )
+
+
+@app.put("/assets/{asset_id}/permissions")
+async def update_asset_permissions_api(
+    asset_id: str,
+    body: UpdateAssetPermissionsRequest,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.update_asset_permissions(
+        asset_id=asset_id,
+        security_level=body.security_level,
+        crew_ids=body.crew_ids,
+        admin_crew=admin_crew
     )
 # ------------------------
 # CHAT
