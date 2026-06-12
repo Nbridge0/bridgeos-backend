@@ -1736,6 +1736,104 @@ def rename_asset(
         "asset": renamed_res.data[0]
     }
 
+def rename_asset_folder(
+    old_folder_name: str,
+    new_folder_name: str,
+    admin_crew: dict
+):
+    """
+    Renames a virtual folder in Yacht Documentation.
+
+    Folders are virtual:
+    - There is no folders table.
+    - A folder exists because assets have folder_name.
+    - Renaming a folder means updating assets.folder_name for every file inside it.
+    """
+
+    if int(admin_crew["security_level"]) != 1:
+        raise HTTPException(
+            status_code=403,
+            detail="Only Tier 1 admins can rename folders"
+        )
+
+    clean_old_name = (old_folder_name or "").strip()
+    clean_new_name = (new_folder_name or "").strip()
+
+    if not clean_old_name:
+        raise HTTPException(
+            status_code=400,
+            detail="Current folder name is required"
+        )
+
+    if not clean_new_name:
+        raise HTTPException(
+            status_code=400,
+            detail="New folder name is required"
+        )
+
+    if len(clean_new_name) > 180:
+        clean_new_name = clean_new_name[:180]
+
+    if clean_old_name == clean_new_name:
+        return {
+            "message": "Folder name unchanged",
+            "old_folder_name": clean_old_name,
+            "new_folder_name": clean_new_name,
+            "updated_count": 0
+        }
+
+    existing_old = supabase.table("assets") \
+        .select("id") \
+        .eq("yacht_id", admin_crew["yacht_id"]) \
+        .eq("folder_name", clean_old_name) \
+        .limit(1) \
+        .execute()
+
+    if not existing_old.data:
+        raise HTTPException(
+            status_code=404,
+            detail="Folder not found"
+        )
+
+    existing_new = supabase.table("assets") \
+        .select("id") \
+        .eq("yacht_id", admin_crew["yacht_id"]) \
+        .eq("folder_name", clean_new_name) \
+        .limit(1) \
+        .execute()
+
+    if existing_new.data:
+        raise HTTPException(
+            status_code=409,
+            detail="A folder with this name already exists"
+        )
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    try:
+        renamed_res = supabase.table("assets") \
+            .update({
+                "folder_name": clean_new_name,
+                "renamed_at": now,
+                "renamed_by": admin_crew["id"]
+            }) \
+            .eq("yacht_id", admin_crew["yacht_id"]) \
+            .eq("folder_name", clean_old_name) \
+            .execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not rename folder: {str(e)}"
+        )
+
+    return {
+        "message": "Folder renamed successfully",
+        "old_folder_name": clean_old_name,
+        "new_folder_name": clean_new_name,
+        "updated_count": len(renamed_res.data or []),
+        "assets": renamed_res.data or []
+    }
+
 def delete_asset(asset_id: str, admin_crew: dict):
     """
     Deletes one asset from:

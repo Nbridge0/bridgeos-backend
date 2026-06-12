@@ -94,6 +94,9 @@ class UpdateChatRequest(BaseModel):
 class RenameAssetRequest(BaseModel):
     name: str
 
+class RenameFolderRequest(BaseModel):
+    name: str
+
 class AuthorizeDocumentRequest(BaseModel):
     crew_id: str
 
@@ -939,6 +942,26 @@ async def move_asset_api(
     return services.move_asset_to_folder(
         asset_id=asset_id,
         folder_name=body.folder_name,
+        admin_crew=admin_crew
+    )
+
+@app.patch("/assets/folders/{folder_name}/rename")
+async def rename_folder_assets_api(
+    folder_name: str,
+    body: RenameFolderRequest,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.rename_asset_folder(
+        old_folder_name=folder_name,
+        new_folder_name=body.name,
         admin_crew=admin_crew
     )
 
