@@ -3766,6 +3766,242 @@ def get_latest_chat_asset_id(
 # ------------------------
 # CHAT SECURE
 # ------------------------
+def is_file_listing_query(query: str) -> bool:
+    """
+    Detects generic questions asking what uploaded files/documents exist.
+    """
+
+    clean = (query or "").lower().strip()
+
+    listing_phrases = [
+        "what invoices",
+        "which invoices",
+        "list invoices",
+        "show invoices",
+        "uploaded invoices",
+
+        "what documents",
+        "which documents",
+        "list documents",
+        "show documents",
+        "uploaded documents",
+
+        "what files",
+        "which files",
+        "list files",
+        "show files",
+        "uploaded files",
+
+        "what docs",
+        "which docs",
+        "list docs",
+        "show docs",
+
+        "what do we have uploaded",
+        "what have we uploaded",
+        "what is uploaded",
+        "what's uploaded"
+    ]
+
+    return any(phrase in clean for phrase in listing_phrases)
+
+def answer_file_listing_directly(
+    query: str,
+    rows: list[dict]
+) -> dict:
+    """
+    Answers file/document/invoice listing questions directly from asset metadata.
+
+    This avoids the LLM returning the fallback even when files exist.
+    """
+
+    clean_query = (query or "").lower()
+
+    if not rows:
+        return {
+            "answer": FALLBACK_NO_DATA_ANSWER,
+            "sources": []
+        }
+
+    filtered_rows = []
+
+    for row in rows:
+        file_name = (
+            row.get("original_file_name")
+            or row.get("file_name")
+            or "Untitled document"
+        )
+
+        content = str(row.get("content") or "").lower()
+        file_name_lower = file_name.lower()
+
+        if "invoice" in clean_query:
+            if "invoice" not in file_name_lower and "invoice" not in content:
+                continue
+
+        filtered_rows.append(row)
+
+    if not filtered_rows:
+        return {
+            "answer": FALLBACK_NO_DATA_ANSWER,
+            "sources": []
+        }
+
+    lines = []
+
+    if "invoice" in clean_query:
+        lines.append("The uploaded invoice files I can see are:")
+    else:
+        lines.append("The uploaded documents/files I can see are:")
+
+    for row in filtered_rows:
+        file_name = (
+            row.get("original_file_name")
+            or row.get("file_name")
+            or "Untitled document"
+        )
+
+        file_type = row.get("file_type") or "file"
+        status = row.get("processing_status") or ""
+
+        extra = []
+
+        if file_type:
+            extra.append(file_type)
+
+        if status:
+            extra.append(status)
+
+        if extra:
+            lines.append(f"- {file_name} ({', '.join(extra)})")
+        else:
+            lines.append(f"- {file_name}")
+
+    return {
+        "answer": "\n".join(lines),
+        "sources": build_sources_from_asset_results(filtered_rows)
+    }
+
+def get_asset_metadata_rows_for_listing(
+    query: str,
+    yacht_id: str,
+    allowed_asset_ids: list[str],
+    limit: int = 50
+) -> list[dict]:
+    """
+    Returns asset metadata rows when the user asks what files/documents exist.
+
+    This prevents valid file-listing questions from falling back just because
+    the answer is in asset metadata rather than inside a document paragraph.
+    """
+
+    if not allowed_asset_ids:
+        return []
+
+    clean_query = (query or "").lower()
+
+    try:
+        res = supabase.table("assets") \
+            .select("""
+                id,
+                yacht_id,
+                chat_id,
+                security_level,
+                file_name,
+                original_file_name,
+                file_type,
+                mime_type,
+                processing_status,
+                processing_error,
+                summary,
+                extracted_text,
+                visual_description,
+                ocr_text,
+                detected_year,
+                tags,
+                created_at
+            """) \
+            .eq("yacht_id", yacht_id) \
+            .in_("id", allowed_asset_ids) \
+            .order("created_at", desc=True) \
+            .limit(limit) \
+            .execute()
+
+    except Exception as e:
+        print("ASSET METADATA LISTING ERROR:", type(e).__name__, str(e))
+        return []
+
+    rows = []
+
+    for asset in res.data or []:
+        file_name = (
+            asset.get("original_file_name")
+            or asset.get("file_name")
+            or "Untitled document"
+        )
+
+        file_name_lower = file_name.lower()
+        summary = asset.get("summary") or ""
+        extracted_text = asset.get("extracted_text") or ""
+        visual_description = asset.get("visual_description") or ""
+        ocr_text = asset.get("ocr_text") or ""
+
+        # For invoice questions, prefer invoice-like files.
+        # This is generic by file name/content, not hardcoded to any vendor.
+        if "invoice" in clean_query:
+            searchable = " ".join([
+                file_name_lower,
+                summary.lower(),
+                extracted_text.lower(),
+                visual_description.lower(),
+                ocr_text.lower()
+            ])
+
+            if "invoice" not in searchable:
+                continue
+
+        content = f"""
+File name: {file_name}
+File type: {asset.get("file_type") or ""}
+MIME type: {asset.get("mime_type") or ""}
+Processing status: {asset.get("processing_status") or ""}
+Processing error: {asset.get("processing_error") or ""}
+Detected year: {asset.get("detected_year") or ""}
+Tags: {", ".join(asset.get("tags") or [])}
+
+Summary:
+{summary}
+
+Extracted text preview:
+{extracted_text[:2000]}
+
+Image visual description:
+{visual_description[:1000]}
+
+OCR text:
+{ocr_text[:1000]}
+""".strip()
+
+        rows.append({
+            "asset_id": asset.get("id"),
+            "yacht_id": asset.get("yacht_id"),
+            "chat_id": asset.get("chat_id"),
+            "security_level": asset.get("security_level"),
+            "content": content,
+            "content_type": "asset_metadata_listing",
+            "chunk_index": 0,
+            "detected_date": None,
+            "detected_year": asset.get("detected_year"),
+            "tags": asset.get("tags") or [],
+            "file_name": asset.get("file_name"),
+            "original_file_name": asset.get("original_file_name"),
+            "file_type": asset.get("file_type")
+        })
+
+    return rows
+ 
+
+
 def chat(
     query: str,
     crew_id: str,
@@ -4351,121 +4587,3 @@ def test_login_response():
         "crew": crew
     }
 
-def get_asset_metadata_rows_for_listing(
-    query: str,
-    yacht_id: str,
-    allowed_asset_ids: list[str],
-    limit: int = 50
-) -> list[dict]:
-    """
-    Returns asset metadata rows when the user asks what files/documents exist.
-
-    This prevents valid file-listing questions from falling back just because
-    the answer is in asset metadata rather than inside a document paragraph.
-    """
-
-    if not allowed_asset_ids:
-        return []
-
-    clean_query = (query or "").lower()
-
-    try:
-        res = supabase.table("assets") \
-            .select("""
-                id,
-                yacht_id,
-                chat_id,
-                security_level,
-                file_name,
-                original_file_name,
-                file_type,
-                mime_type,
-                processing_status,
-                processing_error,
-                summary,
-                extracted_text,
-                visual_description,
-                ocr_text,
-                detected_year,
-                tags,
-                created_at
-            """) \
-            .eq("yacht_id", yacht_id) \
-            .in_("id", allowed_asset_ids) \
-            .order("created_at", desc=True) \
-            .limit(limit) \
-            .execute()
-
-    except Exception as e:
-        print("ASSET METADATA LISTING ERROR:", type(e).__name__, str(e))
-        return []
-
-    rows = []
-
-    for asset in res.data or []:
-        file_name = (
-            asset.get("original_file_name")
-            or asset.get("file_name")
-            or "Untitled document"
-        )
-
-        file_name_lower = file_name.lower()
-        summary = asset.get("summary") or ""
-        extracted_text = asset.get("extracted_text") or ""
-        visual_description = asset.get("visual_description") or ""
-        ocr_text = asset.get("ocr_text") or ""
-
-        # For invoice questions, prefer invoice-like files.
-        # This is generic by file name/content, not hardcoded to any vendor.
-        if "invoice" in clean_query:
-            searchable = " ".join([
-                file_name_lower,
-                summary.lower(),
-                extracted_text.lower(),
-                visual_description.lower(),
-                ocr_text.lower()
-            ])
-
-            if "invoice" not in searchable:
-                continue
-
-        content = f"""
-File name: {file_name}
-File type: {asset.get("file_type") or ""}
-MIME type: {asset.get("mime_type") or ""}
-Processing status: {asset.get("processing_status") or ""}
-Processing error: {asset.get("processing_error") or ""}
-Detected year: {asset.get("detected_year") or ""}
-Tags: {", ".join(asset.get("tags") or [])}
-
-Summary:
-{summary}
-
-Extracted text preview:
-{extracted_text[:2000]}
-
-Image visual description:
-{visual_description[:1000]}
-
-OCR text:
-{ocr_text[:1000]}
-""".strip()
-
-        rows.append({
-            "asset_id": asset.get("id"),
-            "yacht_id": asset.get("yacht_id"),
-            "chat_id": asset.get("chat_id"),
-            "security_level": asset.get("security_level"),
-            "content": content,
-            "content_type": "asset_metadata_listing",
-            "chunk_index": 0,
-            "detected_date": None,
-            "detected_year": asset.get("detected_year"),
-            "tags": asset.get("tags") or [],
-            "file_name": asset.get("file_name"),
-            "original_file_name": asset.get("original_file_name"),
-            "file_type": asset.get("file_type")
-        })
-
-    return rows
- 
