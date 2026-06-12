@@ -1841,6 +1841,16 @@ def rename_asset_folder(
         .eq("yacht_id", admin_crew["yacht_id"]) \
         .eq("folder_name", clean_old_name) \
         .execute()
+    
+    supabase.table("asset_folders") \
+        .update({
+            "name": clean_new_name,
+            "renamed_at": now,
+            "renamed_by": admin_crew["id"]
+        }) \
+        .eq("yacht_id", admin_crew["yacht_id"]) \
+        .eq("name", clean_old_name) \
+        .execute()
 
     return {
         "message": "Folder renamed successfully",
@@ -1974,6 +1984,102 @@ def delete_folder_assets(folder_name: str, admin_crew: dict):
         "deleted_count": len(deleted),
         "deleted_assets": deleted
     }
+
+def create_asset_folder(
+    folder_name: str,
+    security_level: int,
+    admin_crew: dict
+):
+    """
+    Creates an empty folder in the database.
+
+    This is needed because folders are no longer only virtual from assets.folder_name.
+    """
+
+    if int(admin_crew["security_level"]) != 1:
+        raise HTTPException(
+            status_code=403,
+            detail="Only Tier 1 admins can create folders"
+        )
+
+    clean_name = (folder_name or "").strip()
+
+    if not clean_name:
+        raise HTTPException(status_code=400, detail="Folder name is required")
+
+    if len(clean_name) > 180:
+        clean_name = clean_name[:180]
+
+    security_level = int(security_level)
+
+    if security_level not in [1, 2, 3, 4]:
+        raise HTTPException(
+            status_code=400,
+            detail="security_level must be 1, 2, 3, or 4"
+        )
+
+    existing = supabase.table("asset_folders") \
+        .select("*") \
+        .eq("yacht_id", admin_crew["yacht_id"]) \
+        .ilike("name", clean_name) \
+        .limit(1) \
+        .execute()
+
+    if existing.data:
+        raise HTTPException(
+            status_code=409,
+            detail="A folder with this name already exists"
+        )
+
+    try:
+        res = supabase.table("asset_folders").insert({
+            "yacht_id": admin_crew["yacht_id"],
+            "name": clean_name,
+            "security_level": security_level,
+            "created_by": admin_crew["id"]
+        }).execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not create folder: {str(e)}"
+        )
+
+    if not res.data:
+        raise HTTPException(status_code=400, detail="Could not create folder")
+
+    return {
+        "message": "Folder created successfully",
+        "folder": res.data[0]
+    }
+
+
+def list_my_asset_folders(crew: dict):
+    """
+    Lists folders visible to the current user.
+
+    Tier 1 sees all folders.
+    Tier 2 sees folder security_level 2, 3, and manual documents separately.
+    Tier 3 sees folder security_level 3.
+    Tier 4 sees no folders automatically unless you later add folder_access.
+    """
+
+    security_level = int(crew["security_level"])
+
+    query = supabase.table("asset_folders") \
+        .select("*") \
+        .eq("yacht_id", crew["yacht_id"])
+
+    if security_level == 1:
+        return query.order("created_at", desc=True).execute()
+
+    if security_level in [2, 3]:
+        return query \
+            .gte("security_level", security_level) \
+            .lte("security_level", 3) \
+            .order("created_at", desc=True) \
+            .execute()
+
+    return {"data": []}
 
 def seed_text_asset(
     file_name: str,

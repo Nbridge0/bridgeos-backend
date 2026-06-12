@@ -138,6 +138,10 @@ class SeedAssetRequest(BaseModel):
 class MoveAssetRequest(BaseModel):
     folder_name: Optional[str] = None
 
+class CreateAssetFolderRequest(BaseModel):
+    name: str
+    security_level: int = 1
+
 @app.post("/auth/dev-login")
 async def dev_login(body: DevLoginRequest):
     return services.dev_login(
@@ -949,6 +953,40 @@ async def move_asset_api(
         folder_name=body.folder_name,
         admin_crew=admin_crew
     )
+
+@app.post("/assets/folders")
+async def create_asset_folder_api(
+    body: CreateAssetFolderRequest,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.create_asset_folder(
+        folder_name=body.name,
+        security_level=body.security_level,
+        admin_crew=admin_crew
+    )
+
+
+@app.get("/assets/folders/my")
+async def list_my_asset_folders_api(
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    crew = services.get_crew(user["sub"])
+
+    if not crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.list_my_asset_folders(crew)
 
 @app.patch("/assets/folders/{folder_name}/rename")
 async def rename_folder_assets_api(
