@@ -3876,6 +3876,23 @@ def chat(
 
                     retrieval_queries = build_retrieval_queries(retrieval_query_input)
                     matched_rows_by_key = {}
+                    if is_file_listing_query(query):
+                        listing_rows = get_asset_metadata_rows_for_listing(
+                            query=query,
+                            yacht_id=yacht_id,
+                            allowed_asset_ids=allowed_asset_ids,
+                            limit=50
+                        )
+
+                        for row in listing_rows:
+                            key = (
+                                row.get("asset_id"),
+                                row.get("chunk_index"),
+                                row.get("content_type")
+                            )
+
+                            if key not in matched_rows_by_key:
+                                matched_rows_by_key[key] = row
 
                     for retrieval_query in retrieval_queries:
                         filters = extract_query_filters(retrieval_query)
@@ -4042,6 +4059,13 @@ Strict rules:
 - Return JSON only. Do not wrap it in markdown.
 - Use the memory-aware retrieval query only to understand follow-up context. The factual answer must still come only from the uploaded document context.
 - Never say "the document does not provide additional details" for a topic that is not explicitly in the document. Use the fallback answer instead.
+Invoice rule:
+- If the user asks what invoices exist, list invoice files found in the uploaded context.
+- If the user asks for spend, totals, line items, beef, meat, fish, vegetables, provisions, subtotal, tax, or total due, calculate only from explicit readable values in the uploaded context.
+- PDF form fields are valid extracted document evidence.
+- Never invent missing amounts.
+- If an invoice exists but readable line items/totals are missing, say the invoice was found but the needed values were not extracted.
+- Do not use the generic fallback when invoice files are present.
 
 Memory-aware retrieval query:
 {retrieval_query_input}
@@ -4326,4 +4350,122 @@ def test_login_response():
         },
         "crew": crew
     }
+
+def get_asset_metadata_rows_for_listing(
+    query: str,
+    yacht_id: str,
+    allowed_asset_ids: list[str],
+    limit: int = 50
+) -> list[dict]:
+    """
+    Returns asset metadata rows when the user asks what files/documents exist.
+
+    This prevents valid file-listing questions from falling back just because
+    the answer is in asset metadata rather than inside a document paragraph.
+    """
+
+    if not allowed_asset_ids:
+        return []
+
+    clean_query = (query or "").lower()
+
+    try:
+        res = supabase.table("assets") \
+            .select("""
+                id,
+                yacht_id,
+                chat_id,
+                security_level,
+                file_name,
+                original_file_name,
+                file_type,
+                mime_type,
+                processing_status,
+                processing_error,
+                summary,
+                extracted_text,
+                visual_description,
+                ocr_text,
+                detected_year,
+                tags,
+                created_at
+            """) \
+            .eq("yacht_id", yacht_id) \
+            .in_("id", allowed_asset_ids) \
+            .order("created_at", desc=True) \
+            .limit(limit) \
+            .execute()
+
+    except Exception as e:
+        print("ASSET METADATA LISTING ERROR:", type(e).__name__, str(e))
+        return []
+
+    rows = []
+
+    for asset in res.data or []:
+        file_name = (
+            asset.get("original_file_name")
+            or asset.get("file_name")
+            or "Untitled document"
+        )
+
+        file_name_lower = file_name.lower()
+        summary = asset.get("summary") or ""
+        extracted_text = asset.get("extracted_text") or ""
+        visual_description = asset.get("visual_description") or ""
+        ocr_text = asset.get("ocr_text") or ""
+
+        # For invoice questions, prefer invoice-like files.
+        # This is generic by file name/content, not hardcoded to any vendor.
+        if "invoice" in clean_query:
+            searchable = " ".join([
+                file_name_lower,
+                summary.lower(),
+                extracted_text.lower(),
+                visual_description.lower(),
+                ocr_text.lower()
+            ])
+
+            if "invoice" not in searchable:
+                continue
+
+        content = f"""
+File name: {file_name}
+File type: {asset.get("file_type") or ""}
+MIME type: {asset.get("mime_type") or ""}
+Processing status: {asset.get("processing_status") or ""}
+Processing error: {asset.get("processing_error") or ""}
+Detected year: {asset.get("detected_year") or ""}
+Tags: {", ".join(asset.get("tags") or [])}
+
+Summary:
+{summary}
+
+Extracted text preview:
+{extracted_text[:2000]}
+
+Image visual description:
+{visual_description[:1000]}
+
+OCR text:
+{ocr_text[:1000]}
+""".strip()
+
+        rows.append({
+            "asset_id": asset.get("id"),
+            "yacht_id": asset.get("yacht_id"),
+            "chat_id": asset.get("chat_id"),
+            "security_level": asset.get("security_level"),
+            "content": content,
+            "content_type": "asset_metadata_listing",
+            "chunk_index": 0,
+            "detected_date": None,
+            "detected_year": asset.get("detected_year"),
+            "tags": asset.get("tags") or [],
+            "file_name": asset.get("file_name"),
+            "original_file_name": asset.get("original_file_name"),
+            "file_type": asset.get("file_type")
+        })
+
+    return rows
  
