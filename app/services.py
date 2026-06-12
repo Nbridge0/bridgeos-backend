@@ -1337,21 +1337,21 @@ def get_accessible_asset_ids(crew_id: str, yacht_id: str, security_level: int):
     """
     Synced document permission model.
 
-    Crew Tier 1:
-        Can access assets with security_level 1, 2, or 3.
+    Document security_level:
+    1 = Tier 1 only
+    2 = Tier 1 and Tier 2
+    3 = Tier 1, Tier 2, and Tier 3
+    4 = Custom only
 
-    Crew Tier 2:
-        Can access assets with security_level 2 or 3.
+    Crew security_level:
+    1 = admin/full access
+    2 = sees doc levels 2 and 3, plus manual grants
+    3 = sees doc level 3, plus manual grants
+    4 = custom only, manual grants only
 
-    Crew Tier 3:
-        Can access assets with security_level 3 only.
-
-    Crew Tier 4:
-        Custom only. No automatic tier access.
-        Can access only assets manually granted in asset_access.
-
-    Manual grants:
-        Any crew member can also access assets explicitly granted in asset_access.
+    Tier 4 documents:
+    - Tier 1 admins can always see/manage them.
+    - Tier 2, 3, and 4 users only see them if manually granted in asset_access.
     """
 
     security_level = int(security_level)
@@ -1361,11 +1361,24 @@ def get_accessible_asset_ids(crew_id: str, yacht_id: str, security_level: int):
 
     allowed_ids = set()
 
-    if security_level in [1, 2, 3]:
+    if security_level == 1:
+        assets = supabase.table("assets") \
+            .select("id") \
+            .eq("yacht_id", yacht_id) \
+            .execute()
+
+        allowed_ids = {
+            asset["id"]
+            for asset in (assets.data or [])
+            if asset.get("id")
+        }
+
+    elif security_level in [2, 3]:
         base_assets = supabase.table("assets") \
             .select("id") \
             .eq("yacht_id", yacht_id) \
             .gte("security_level", security_level) \
+            .lte("security_level", 3) \
             .execute()
 
         allowed_ids = {
@@ -1385,7 +1398,7 @@ def get_accessible_asset_ids(crew_id: str, yacht_id: str, security_level: int):
             allowed_ids.add(row["asset_id"])
 
     return list(allowed_ids)
-
+    
 def authorize_asset_access(
     asset_id: str,
     target_crew_id: str,

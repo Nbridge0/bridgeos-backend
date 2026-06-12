@@ -664,10 +664,10 @@ async def upload_asset_api(
     try:
         final_security_level = int(security_level)
 
-        if final_security_level not in [1, 2, 3]:
+        if final_security_level not in [1, 2, 3, 4]:
             raise HTTPException(
                 status_code=400,
-                detail="security_level must be 1, 2, or 3"
+                detail="security_level must be 1, 2, 3, or 4"
             )
 
         return services.upload_asset(
@@ -715,10 +715,10 @@ async def upload_assets_batch_api(
 
     final_security_level = int(security_level)
 
-    if final_security_level not in [1, 2, 3]:
+    if final_security_level not in [1, 2, 3, 4]:
         raise HTTPException(
             status_code=400,
-            detail="security_level must be 1, 2, or 3"
+            detail="security_level must be 1, 2, 3, or 4"
         )
 
     results = []
