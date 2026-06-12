@@ -25,6 +25,8 @@ def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 150):
     return chunks
 
 
+
+
 def extract_plain_text(file, filename: str) -> str:
     file.seek(0)
     raw = file.read()
@@ -33,17 +35,22 @@ def extract_plain_text(file, filename: str) -> str:
 
 
 def extract_pdf_text(file) -> str:
-    file.seek(0)
-
     reader = PdfReader(file)
-    parts = []
+
+    text_parts = []
 
     for page in reader.pages:
         text = page.extract_text() or ""
-        if text.strip():
-            parts.append(text)
 
-    return "\n\n".join(parts)
+        if text.strip():
+            text_parts.append(text.strip())
+
+    form_text = extract_pdf_form_fields(reader)
+
+    if form_text:
+        text_parts.append(form_text)
+
+    return "\n\n".join(text_parts).strip()
 
 
 def extract_docx_text(file) -> str:
@@ -71,3 +78,44 @@ def extract_text_by_file_type(file, filename: str, file_type: str) -> str:
         return extract_docx_text(file)
 
     return ""
+
+def extract_pdf_form_fields(reader) -> str:
+    """
+    Extracts all fillable PDF form fields generically.
+
+    This is needed for invoices/forms where values are stored as AcroForm fields
+    instead of normal visible PDF body text.
+    """
+
+    try:
+        fields = reader.get_fields() or {}
+    except Exception:
+        return ""
+
+    if not fields:
+        return ""
+
+    lines = ["PDF form fields:"]
+
+    for field_name, field_data in fields.items():
+        value = ""
+
+        if isinstance(field_data, dict):
+            value = (
+                field_data.get("/V")
+                or field_data.get("V")
+                or field_data.get("/DV")
+                or field_data.get("DV")
+                or ""
+            )
+        else:
+            value = field_data
+
+        value = str(value or "").strip()
+
+        if not value:
+            continue
+
+        lines.append(f"{field_name}: {value}")
+
+    return "\n".join(lines).strip()
