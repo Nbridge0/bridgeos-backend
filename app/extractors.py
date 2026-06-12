@@ -1,6 +1,7 @@
 from pypdf import PdfReader
 from docx import Document
 
+
 def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 150):
     """
     Splits text into overlapping chunks.
@@ -25,8 +26,6 @@ def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 150):
     return chunks
 
 
-
-
 def extract_plain_text(file, filename: str) -> str:
     file.seek(0)
     raw = file.read()
@@ -34,57 +33,12 @@ def extract_plain_text(file, filename: str) -> str:
     return raw.decode("utf-8", errors="ignore")
 
 
-def extract_pdf_text(file) -> str:
-    reader = PdfReader(file)
-
-    text_parts = []
-
-    for page in reader.pages:
-        text = page.extract_text() or ""
-
-        if text.strip():
-            text_parts.append(text.strip())
-
-    form_text = extract_pdf_form_fields(reader)
-
-    if form_text:
-        text_parts.append(form_text)
-
-    return "\n\n".join(text_parts).strip()
-
-
-def extract_docx_text(file) -> str:
-    file.seek(0)
-
-    document = Document(file)
-    parts = []
-
-    for paragraph in document.paragraphs:
-        text = paragraph.text.strip()
-        if text:
-            parts.append(text)
-
-    return "\n".join(parts)
-    
-
-def extract_text_by_file_type(file, filename: str, file_type: str) -> str:
-    if file_type == "text":
-        return extract_plain_text(file, filename)
-
-    if file_type == "pdf":
-        return extract_pdf_text(file)
-
-    if file_type == "docx":
-        return extract_docx_text(file)
-
-    return ""
-
 def extract_pdf_form_fields(reader) -> str:
     """
-    Extracts all fillable PDF form fields generically.
+    Extracts fillable PDF form fields generically.
 
-    This is needed for invoices/forms where values are stored as AcroForm fields
-    instead of normal visible PDF body text.
+    Some invoices/forms store values as AcroForm fields instead of normal page text,
+    so page.extract_text() can miss line items, prices, quantities, and totals.
     """
 
     try:
@@ -119,3 +73,53 @@ def extract_pdf_form_fields(reader) -> str:
         lines.append(f"{field_name}: {value}")
 
     return "\n".join(lines).strip()
+
+
+def extract_pdf_text(file) -> str:
+    file.seek(0)
+
+    reader = PdfReader(file)
+
+    text_parts = []
+
+    for page in reader.pages:
+        text = page.extract_text() or ""
+
+        if text.strip():
+            text_parts.append(text.strip())
+
+    form_text = extract_pdf_form_fields(reader)
+
+    if form_text:
+        text_parts.append(form_text)
+
+    return "\n\n".join(text_parts).strip()
+
+
+def extract_docx_text(file) -> str:
+    file.seek(0)
+
+    document = Document(file)
+
+    parts = []
+
+    for paragraph in document.paragraphs:
+        text = paragraph.text or ""
+
+        if text.strip():
+            parts.append(text.strip())
+
+    return "\n\n".join(parts).strip()
+
+
+def extract_text_by_file_type(file, filename: str, file_type: str) -> str:
+    if file_type == "text":
+        return extract_plain_text(file, filename)
+
+    if file_type == "pdf":
+        return extract_pdf_text(file)
+
+    if file_type == "docx":
+        return extract_docx_text(file)
+
+    return ""
