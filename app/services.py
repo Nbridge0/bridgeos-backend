@@ -1767,99 +1767,6 @@ def rename_asset(
         "asset": renamed_res.data[0]
     }
     
-def rename_asset_folder(
-    old_folder_name: str,
-    new_folder_name: str,
-    admin_crew: dict
-):
-    """
-    Renames a virtual folder.
-
-    Folders are virtual:
-    - There is no folders table.
-    - Folder exists because assets have folder_name.
-    - Renaming a folder updates assets.folder_name for every file inside it.
-    """
-
-    if int(admin_crew["security_level"]) != 1:
-        raise HTTPException(
-            status_code=403,
-            detail="Only Tier 1 admins can rename folders"
-        )
-
-    clean_old_name = (old_folder_name or "").strip()
-    clean_new_name = (new_folder_name or "").strip()
-
-    if not clean_old_name:
-        raise HTTPException(status_code=400, detail="Current folder name is required")
-
-    if not clean_new_name:
-        raise HTTPException(status_code=400, detail="New folder name is required")
-
-    if len(clean_new_name) > 180:
-        clean_new_name = clean_new_name[:180]
-
-    if clean_old_name == clean_new_name:
-        return {
-            "message": "Folder name unchanged",
-            "old_folder_name": clean_old_name,
-            "new_folder_name": clean_new_name,
-            "updated_count": 0
-        }
-
-    existing_old = supabase.table("assets") \
-        .select("id") \
-        .eq("yacht_id", admin_crew["yacht_id"]) \
-        .eq("folder_name", clean_old_name) \
-        .limit(1) \
-        .execute()
-
-    if not existing_old.data:
-        raise HTTPException(status_code=404, detail="Folder not found")
-
-    existing_new = supabase.table("assets") \
-        .select("id") \
-        .eq("yacht_id", admin_crew["yacht_id"]) \
-        .eq("folder_name", clean_new_name) \
-        .limit(1) \
-        .execute()
-
-    if existing_new.data:
-        raise HTTPException(
-            status_code=409,
-            detail="A folder with this name already exists"
-        )
-
-    now = datetime.now(timezone.utc).isoformat()
-
-    renamed_res = supabase.table("assets") \
-        .update({
-            "folder_name": clean_new_name,
-            "renamed_at": now,
-            "renamed_by": admin_crew["id"]
-        }) \
-        .eq("yacht_id", admin_crew["yacht_id"]) \
-        .eq("folder_name", clean_old_name) \
-        .execute()
-    
-    supabase.table("asset_folders") \
-        .update({
-            "name": clean_new_name,
-            "renamed_at": now,
-            "renamed_by": admin_crew["id"]
-        }) \
-        .eq("yacht_id", admin_crew["yacht_id"]) \
-        .eq("name", clean_old_name) \
-        .execute()
-
-    return {
-        "message": "Folder renamed successfully",
-        "old_folder_name": clean_old_name,
-        "new_folder_name": clean_new_name,
-        "updated_count": len(renamed_res.data or []),
-        "assets": renamed_res.data or []
-    }
-    
 def delete_asset(asset_id: str, admin_crew: dict):
     """
     Deletes one asset from:
@@ -1936,54 +1843,7 @@ def delete_asset(asset_id: str, admin_crew: dict):
         "deleted_file_name": asset.get("original_file_name") or asset.get("file_name")
     }
 
-def delete_folder_assets(folder_name: str, admin_crew: dict):
-    """
-    Deletes every asset inside one folder_name for this yacht.
 
-    Folder is virtual:
-    - There is no folders table.
-    - Folder exists because assets have folder_name.
-    - Deleting the folder means deleting all assets with that folder_name.
-    """
-
-    if int(admin_crew["security_level"]) != 1:
-        raise HTTPException(
-            status_code=403,
-            detail="Only Tier 1 admins can delete folders"
-        )
-
-    clean_folder_name = (folder_name or "").strip()
-
-    if not clean_folder_name:
-        raise HTTPException(status_code=400, detail="Folder name is required")
-
-    folder_assets_res = supabase.table("assets") \
-        .select("id, file_name, original_file_name, folder_name") \
-        .eq("yacht_id", admin_crew["yacht_id"]) \
-        .eq("folder_name", clean_folder_name) \
-        .execute()
-
-    folder_assets = folder_assets_res.data or []
-
-    if not folder_assets:
-        raise HTTPException(status_code=404, detail="Folder not found or empty")
-
-    deleted = []
-
-    for asset in folder_assets:
-        result = delete_asset(
-            asset_id=asset["id"],
-            admin_crew=admin_crew
-        )
-
-        deleted.append(result)
-
-    return {
-        "message": "Folder deleted successfully",
-        "folder_name": clean_folder_name,
-        "deleted_count": len(deleted),
-        "deleted_assets": deleted
-    }
 
 def create_asset_folder(
     folder_name: str,
@@ -1991,9 +1851,13 @@ def create_asset_folder(
     admin_crew: dict
 ):
     """
-    Creates an empty folder in the database.
+    Creates an empty folder in asset_folders.
 
-    This is needed because folders are no longer only virtual from assets.folder_name.
+    Uses service-role Supabase client because backend already checked:
+    - logged-in user
+    - crew profile
+    - Tier 1 admin
+    - yacht_id ownership
     """
 
     if int(admin_crew["security_level"]) != 1:
@@ -2018,12 +1882,18 @@ def create_asset_folder(
             detail="security_level must be 1, 2, 3, or 4"
         )
 
-    existing = supabase.table("asset_folders") \
-        .select("*") \
-        .eq("yacht_id", admin_crew["yacht_id"]) \
-        .ilike("name", clean_name) \
-        .limit(1) \
-        .execute()
+    try:
+        existing = storage_admin.table("asset_folders") \
+            .select("*") \
+            .eq("yacht_id", admin_crew["yacht_id"]) \
+            .ilike("name", clean_name) \
+            .limit(1) \
+            .execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not check existing folder: {str(e)}"
+        )
 
     if existing.data:
         raise HTTPException(
@@ -2032,7 +1902,7 @@ def create_asset_folder(
         )
 
     try:
-        res = supabase.table("asset_folders").insert({
+        res = storage_admin.table("asset_folders").insert({
             "yacht_id": admin_crew["yacht_id"],
             "name": clean_name,
             "security_level": security_level,
@@ -2056,16 +1926,12 @@ def create_asset_folder(
 def list_my_asset_folders(crew: dict):
     """
     Lists folders visible to the current user.
-
-    Tier 1 sees all folders.
-    Tier 2 sees folder security_level 2, 3, and manual documents separately.
-    Tier 3 sees folder security_level 3.
-    Tier 4 sees no folders automatically unless you later add folder_access.
+    Uses service role because backend already knows the user's yacht and tier.
     """
 
     security_level = int(crew["security_level"])
 
-    query = supabase.table("asset_folders") \
+    query = storage_admin.table("asset_folders") \
         .select("*") \
         .eq("yacht_id", crew["yacht_id"])
 
@@ -2081,6 +1947,188 @@ def list_my_asset_folders(crew: dict):
 
     return {"data": []}
 
+
+def rename_asset_folder(
+    old_folder_name: str,
+    new_folder_name: str,
+    admin_crew: dict
+):
+    """
+    Renames a folder in both:
+    - assets.folder_name
+    - asset_folders.name
+
+    Works even if folder is empty.
+    """
+
+    if int(admin_crew["security_level"]) != 1:
+        raise HTTPException(
+            status_code=403,
+            detail="Only Tier 1 admins can rename folders"
+        )
+
+    clean_old_name = (old_folder_name or "").strip()
+    clean_new_name = (new_folder_name or "").strip()
+
+    if not clean_old_name:
+        raise HTTPException(status_code=400, detail="Current folder name is required")
+
+    if not clean_new_name:
+        raise HTTPException(status_code=400, detail="New folder name is required")
+
+    if len(clean_new_name) > 180:
+        clean_new_name = clean_new_name[:180]
+
+    if clean_old_name == clean_new_name:
+        return {
+            "message": "Folder name unchanged",
+            "old_folder_name": clean_old_name,
+            "new_folder_name": clean_new_name,
+            "updated_count": 0
+        }
+
+    existing_old_folder = storage_admin.table("asset_folders") \
+        .select("*") \
+        .eq("yacht_id", admin_crew["yacht_id"]) \
+        .eq("name", clean_old_name) \
+        .limit(1) \
+        .execute()
+
+    existing_old_assets = storage_admin.table("assets") \
+        .select("id") \
+        .eq("yacht_id", admin_crew["yacht_id"]) \
+        .eq("folder_name", clean_old_name) \
+        .limit(1) \
+        .execute()
+
+    if not existing_old_folder.data and not existing_old_assets.data:
+        raise HTTPException(status_code=404, detail="Folder not found")
+
+    existing_new = storage_admin.table("asset_folders") \
+        .select("id") \
+        .eq("yacht_id", admin_crew["yacht_id"]) \
+        .ilike("name", clean_new_name) \
+        .limit(1) \
+        .execute()
+
+    if existing_new.data:
+        raise HTTPException(
+            status_code=409,
+            detail="A folder with this name already exists"
+        )
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    renamed_assets_res = storage_admin.table("assets") \
+        .update({
+            "folder_name": clean_new_name,
+            "renamed_at": now,
+            "renamed_by": admin_crew["id"]
+        }) \
+        .eq("yacht_id", admin_crew["yacht_id"]) \
+        .eq("folder_name", clean_old_name) \
+        .execute()
+
+    if existing_old_folder.data:
+        storage_admin.table("asset_folders") \
+            .update({
+                "name": clean_new_name,
+                "renamed_at": now,
+                "renamed_by": admin_crew["id"]
+            }) \
+            .eq("yacht_id", admin_crew["yacht_id"]) \
+            .eq("name", clean_old_name) \
+            .execute()
+    else:
+        storage_admin.table("asset_folders") \
+            .insert({
+                "yacht_id": admin_crew["yacht_id"],
+                "name": clean_new_name,
+                "security_level": 1,
+                "created_by": admin_crew["id"],
+                "renamed_at": now,
+                "renamed_by": admin_crew["id"]
+            }) \
+            .execute()
+
+    return {
+        "message": "Folder renamed successfully",
+        "old_folder_name": clean_old_name,
+        "new_folder_name": clean_new_name,
+        "updated_count": len(renamed_assets_res.data or []),
+        "assets": renamed_assets_res.data or []
+    }
+
+
+def delete_folder_assets(folder_name: str, admin_crew: dict):
+    """
+    Deletes a folder.
+
+    If folder has files:
+    - deletes all assets inside it
+    - deletes asset_folders row
+
+    If folder is empty:
+    - deletes only asset_folders row
+    """
+
+    if int(admin_crew["security_level"]) != 1:
+        raise HTTPException(
+            status_code=403,
+            detail="Only Tier 1 admins can delete folders"
+        )
+
+    clean_folder_name = (folder_name or "").strip()
+
+    if not clean_folder_name:
+        raise HTTPException(status_code=400, detail="Folder name is required")
+
+    folder_row_res = storage_admin.table("asset_folders") \
+        .select("*") \
+        .eq("yacht_id", admin_crew["yacht_id"]) \
+        .eq("name", clean_folder_name) \
+        .limit(1) \
+        .execute()
+
+    folder_assets_res = storage_admin.table("assets") \
+        .select("id, file_name, original_file_name, folder_name") \
+        .eq("yacht_id", admin_crew["yacht_id"]) \
+        .eq("folder_name", clean_folder_name) \
+        .execute()
+
+    folder_assets = folder_assets_res.data or []
+
+    if not folder_row_res.data and not folder_assets:
+        raise HTTPException(status_code=404, detail="Folder not found")
+
+    deleted = []
+
+    for asset in folder_assets:
+        result = delete_asset(
+            asset_id=asset["id"],
+            admin_crew=admin_crew
+        )
+
+        deleted.append(result)
+
+    try:
+        storage_admin.table("asset_folders") \
+            .delete() \
+            .eq("yacht_id", admin_crew["yacht_id"]) \
+            .eq("name", clean_folder_name) \
+            .execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Folder assets were deleted, but folder row could not be removed: {str(e)}"
+        )
+
+    return {
+        "message": "Folder deleted successfully",
+        "folder_name": clean_folder_name,
+        "deleted_count": len(deleted),
+        "deleted_assets": deleted
+    }
 def seed_text_asset(
     file_name: str,
     content: str,
@@ -5013,7 +5061,6 @@ def ensure_demo_account():
 
     return crew_insert.data[0]
 
-
 def test_login_response():
     crew = ensure_demo_account()
 
@@ -5027,4 +5074,5 @@ def test_login_response():
         },
         "crew": crew
     }
+
 
