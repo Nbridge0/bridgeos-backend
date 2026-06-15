@@ -353,7 +353,8 @@ def dev_login(email: str, full_name: str = "Test Admin", yacht_name: str = "Test
 def chat_with_runpod_bridgeos(
     query: str,
     crew: dict,
-    chat_id: str
+    chat_id: str,
+    uploaded_asset_id: str | None = None
 ):
     """
     Sends the BridgeOS chat request to the RunPod AI API.
@@ -371,12 +372,28 @@ def chat_with_runpod_bridgeos(
         yacht_id=crew["yacht_id"]
     )
 
+    uploaded_asset = None
+
+    if uploaded_asset_id:
+        asset_res = supabase.table("assets") \
+            .select("id, file_name, original_file_name, mime_type, yacht_id, chat_id") \
+            .eq("id", uploaded_asset_id) \    
+            .eq("yacht_id", crew["yacht_id"]) \
+            .execute()
+
+        if asset_res.data:
+            uploaded_asset = asset_res.data[0]
+
     supabase.table("messages").insert({
         "chat_id": chat_id,
         "yacht_id": crew["yacht_id"],
         "crew_id": crew["id"],
         "role": "user",
-        "content": query
+        "content": query,
+        "uploaded_asset_id": uploaded_asset.get("id") if uploaded_asset else None,
+        "file_name": uploaded_asset.get("file_name") if uploaded_asset else None,
+        "original_file_name": uploaded_asset.get("original_file_name") if uploaded_asset else None,
+        "mime_type": uploaded_asset.get("mime_type") if uploaded_asset else None
     }).execute()
 
     if not RUNPOD_BASE_URL:
