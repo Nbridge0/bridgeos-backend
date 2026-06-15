@@ -142,6 +142,9 @@ class CreateAssetFolderRequest(BaseModel):
     name: str
     security_level: int = 1
 
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
 @app.post("/auth/dev-login")
 async def dev_login(body: DevLoginRequest):
     return services.dev_login(
@@ -438,6 +441,10 @@ async def list_documents_admin(
         raise HTTPException(status_code=403, detail="No access")
 
     return services.list_documents_for_admin(admin_crew)
+
+@app.post("/auth/forgot-password")
+async def forgot_password(body: ForgotPasswordRequest):
+    return services.forgot_password(email=body.email)
 
 
 # ------------------------

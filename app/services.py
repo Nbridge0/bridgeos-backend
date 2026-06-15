@@ -5075,4 +5075,20 @@ def test_login_response():
         "crew": crew
     }
 
+def forgot_password(email: str):
+    """
+    Sends a Supabase password reset email.
+    The user will receive Supabase's recovery email.
+    """
 
+    try:
+        auth_admin.auth.reset_password_for_email(email)
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not send password reset email: {str(e)}"
+        )
+
+    return {
+        "message": "If this email exists, a password reset link has been sent."
+    }
