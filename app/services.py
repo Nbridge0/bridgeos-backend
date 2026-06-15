@@ -375,11 +375,13 @@ def chat_with_runpod_bridgeos(
     uploaded_asset = None
 
     if uploaded_asset_id:
-        asset_res = supabase.table("assets") \
-            .select("id, file_name, original_file_name, mime_type, yacht_id, chat_id") \
-            .eq("id", uploaded_asset_id) \    
-            .eq("yacht_id", crew["yacht_id"]) \
+        asset_res = (
+            supabase.table("assets")
+            .select("id, file_name, original_file_name, mime_type, yacht_id, chat_id")
+            .eq("id", uploaded_asset_id)
+            .eq("yacht_id", crew["yacht_id"])
             .execute()
+        )
 
         if asset_res.data:
             uploaded_asset = asset_res.data[0]
