@@ -1517,7 +1517,8 @@ def create_api_connection(
     base_url: str,
     auth_type: str = "none",
     api_key: str | None = None,
-    extra_headers: dict | None = None
+    extra_headers: dict | None = None,
+    security_level: int = 1
 ):
     """
     Creates a reusable external API connection for this yacht.
@@ -1571,7 +1572,8 @@ def create_api_connection(
             "base_url": clean_base_url,
             "auth_type": clean_auth_type,
             "api_key": api_key,
-            "extra_headers": safe_headers
+            "extra_headers": safe_headers,
+            "security_level": security_level
         }).execute()
     except Exception as e:
         raise HTTPException(
@@ -1663,18 +1665,15 @@ def sync_api_connection(
 
     _require_tier_1_admin(admin_crew)
 
+    connection = get_api_connection_for_admin(connection_id=connection_id, admin_crew=admin_crew)
+
+    if security_level is None:
+        security_level = connection.get("security_level") or 1
+
     security_level = int(security_level)
 
     if security_level not in [1, 2, 3]:
-        raise HTTPException(
-            status_code=400,
-            detail="security_level must be 1, 2, or 3"
-        )
-
-    connection = get_api_connection_for_admin(
-        connection_id=connection_id,
-        admin_crew=admin_crew
-    )
+        raise HTTPException(status_code=400, detail="security_level must be 1, 2, or 3")
 
     base_url = connection["base_url"].rstrip("/")
     clean_path = (endpoint_path or "").strip()

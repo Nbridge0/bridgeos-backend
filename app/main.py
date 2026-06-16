@@ -151,15 +151,14 @@ class CreateApiConnectionRequest(BaseModel):
     auth_type: str = "none"
     api_key: Optional[str] = None
     extra_headers: dict = {}
-
+    security_level: int = 1
 
 class SyncApiConnectionRequest(BaseModel):
     endpoint_path: Optional[str] = None
     method: str = "GET"
     payload: Optional[dict] = None
     file_name: Optional[str] = None
-    security_level: int = 1
-
+    security_level: Optional[int] = None
 
 class DirectApiIngestRequest(BaseModel):
     source_name: str
@@ -1154,7 +1153,6 @@ async def update_asset_permissions_api(
 # ------------------------
 # API CONNECTIONS
 # ------------------------
-
 @app.post("/api-connections")
 async def create_api_connection_api(
     body: CreateApiConnectionRequest,
@@ -1174,9 +1172,9 @@ async def create_api_connection_api(
         base_url=body.base_url,
         auth_type=body.auth_type,
         api_key=body.api_key,
-        extra_headers=body.extra_headers
+        extra_headers=body.extra_headers,
+        security_level=body.security_level
     )
-
 
 @app.get("/api-connections")
 async def list_api_connections_api(
