@@ -3,7 +3,7 @@ import requests
 import json
 from app.database import supabase
 from app.embeddings import embed
-from app.config import BUCKET_NAME, RUNPOD_BASE_URL, BRIDGEOS_API_KEY
+from app.config import BUCKET_NAME, RUNPOD_BASE_URL, BRIDGEOS_API_KEY, API_SYNC_TIMEOUT_SECONDS
 from app.llm import ask_llm, FALLBACK_NO_DATA_ANSWER
 from app.file_utils import detect_file_type, calculate_file_hash, safe_filename
 from app.metadata_utils import (
@@ -1477,6 +1477,370 @@ def list_my_assets(crew: dict):
         .eq("yacht_id", crew["yacht_id"]) \
         .order("created_at", desc=True) \
         .execute()
+
+# ------------------------
+# API CONNECTIONS
+# ------------------------
+
+def _require_tier_1_admin(crew: dict):
+    if not crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    if int(crew.get("security_level") or 4) != 1:
+        raise HTTPException(
+            status_code=403,
+            detail="Only Tier 1 admins can manage API connections"
+        )
+
+
+def _mask_secret(value: str | None) -> str | None:
+    if not value:
+        return None
+
+    value = str(value)
+
+    if len(value) <= 6:
+        return "***"
+
+    return f"{value[:3]}***{value[-4:]}"
+
+
+def _clean_api_connection(row: dict) -> dict:
+    clean = dict(row)
+    clean["api_key"] = _mask_secret(clean.get("api_key"))
+    return clean
+
+
+def create_api_connection(
+    admin_crew: dict,
+    name: str,
+    base_url: str,
+    auth_type: str = "none",
+    api_key: str | None = None,
+    extra_headers: dict | None = None
+):
+    """
+    Creates a reusable external API connection for this yacht.
+
+    auth_type:
+    - none
+    - bearer
+    - x-api-key
+    """
+
+    _require_tier_1_admin(admin_crew)
+
+    clean_name = (name or "").strip()
+    clean_base_url = (base_url or "").strip()
+    clean_auth_type = (auth_type or "none").strip().lower()
+
+    if not clean_name:
+        raise HTTPException(status_code=400, detail="Connection name is required")
+
+    if not clean_base_url:
+        raise HTTPException(status_code=400, detail="base_url is required")
+
+    if not clean_base_url.startswith("http://") and not clean_base_url.startswith("https://"):
+        raise HTTPException(
+            status_code=400,
+            detail="base_url must start with http:// or https://"
+        )
+
+    if clean_auth_type not in ["none", "bearer", "x-api-key"]:
+        raise HTTPException(
+            status_code=400,
+            detail="auth_type must be one of: none, bearer, x-api-key"
+        )
+
+    if clean_auth_type != "none" and not api_key:
+        raise HTTPException(
+            status_code=400,
+            detail="api_key is required when auth_type is bearer or x-api-key"
+        )
+
+    safe_headers = extra_headers or {}
+
+    if not isinstance(safe_headers, dict):
+        raise HTTPException(status_code=400, detail="extra_headers must be an object")
+
+    try:
+        res = supabase.table("api_connections").insert({
+            "yacht_id": admin_crew["yacht_id"],
+            "created_by": admin_crew["id"],
+            "name": clean_name,
+            "base_url": clean_base_url,
+            "auth_type": clean_auth_type,
+            "api_key": api_key,
+            "extra_headers": safe_headers
+        }).execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not create API connection: {str(e)}"
+        )
+
+    if not res.data:
+        raise HTTPException(status_code=400, detail="Could not create API connection")
+
+    return {
+        "message": "API connection created successfully",
+        "connection": _clean_api_connection(res.data[0])
+    }
+
+
+def list_api_connections(admin_crew: dict):
+    _require_tier_1_admin(admin_crew)
+
+    try:
+        res = supabase.table("api_connections") \
+            .select("*") \
+            .eq("yacht_id", admin_crew["yacht_id"]) \
+            .order("created_at", desc=True) \
+            .execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not list API connections: {str(e)}"
+        )
+
+    return {
+        "data": [_clean_api_connection(row) for row in (res.data or [])]
+    }
+
+
+def get_api_connection_for_admin(connection_id: str, admin_crew: dict) -> dict:
+    _require_tier_1_admin(admin_crew)
+
+    res = supabase.table("api_connections") \
+        .select("*") \
+        .eq("id", connection_id) \
+        .eq("yacht_id", admin_crew["yacht_id"]) \
+        .execute()
+
+    if not res.data:
+        raise HTTPException(status_code=404, detail="API connection not found")
+
+    return res.data[0]
+
+
+def delete_api_connection(connection_id: str, admin_crew: dict):
+    _require_tier_1_admin(admin_crew)
+
+    try:
+        res = supabase.table("api_connections") \
+            .delete() \
+            .eq("id", connection_id) \
+            .eq("yacht_id", admin_crew["yacht_id"]) \
+            .execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not delete API connection: {str(e)}"
+        )
+
+    if not res.data:
+        raise HTTPException(status_code=404, detail="API connection not found")
+
+    return {
+        "message": "API connection deleted successfully",
+        "deleted_connection_id": connection_id
+    }
+
+
+def sync_api_connection(
+    connection_id: str,
+    admin_crew: dict,
+    endpoint_path: str | None = None,
+    method: str = "GET",
+    payload: dict | None = None,
+    file_name: str | None = None,
+    security_level: int = 1
+):
+    """
+    Calls the external API, converts the response into text, and saves it
+    as a searchable asset using the existing asset/chunk pipeline.
+    """
+
+    _require_tier_1_admin(admin_crew)
+
+    security_level = int(security_level)
+
+    if security_level not in [1, 2, 3]:
+        raise HTTPException(
+            status_code=400,
+            detail="security_level must be 1, 2, or 3"
+        )
+
+    connection = get_api_connection_for_admin(
+        connection_id=connection_id,
+        admin_crew=admin_crew
+    )
+
+    base_url = connection["base_url"].rstrip("/")
+    clean_path = (endpoint_path or "").strip()
+
+    if clean_path:
+        url = f"{base_url}/{clean_path.lstrip('/')}"
+    else:
+        url = base_url
+
+    headers = {
+        "Accept": "application/json"
+    }
+
+    extra_headers = connection.get("extra_headers") or {}
+
+    if isinstance(extra_headers, dict):
+        headers.update(extra_headers)
+
+    auth_type = (connection.get("auth_type") or "none").lower()
+    api_key = connection.get("api_key")
+
+    if auth_type == "bearer":
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    if auth_type == "x-api-key":
+        headers["x-api-key"] = api_key
+
+    clean_method = (method or "GET").upper()
+
+    if clean_method not in ["GET", "POST"]:
+        raise HTTPException(status_code=400, detail="method must be GET or POST")
+
+    try:
+        if clean_method == "POST":
+            response = requests.post(
+                url,
+                json=payload or {},
+                headers=headers,
+                timeout=API_SYNC_TIMEOUT_SECONDS
+            )
+        else:
+            response = requests.get(
+                url,
+                headers=headers,
+                timeout=API_SYNC_TIMEOUT_SECONDS
+            )
+
+    except Exception as e:
+        error_text = f"{type(e).__name__}: {str(e)}"
+
+        supabase.table("api_connections").update({
+            "last_synced_at": datetime.now(timezone.utc).isoformat(),
+            "last_sync_status": "failed",
+            "last_sync_error": error_text
+        }).eq("id", connection_id).eq("yacht_id", admin_crew["yacht_id"]).execute()
+
+        raise HTTPException(
+            status_code=502,
+            detail=f"External API request failed: {error_text}"
+        )
+
+    if response.status_code >= 400:
+        error_text = response.text[:1000]
+
+        supabase.table("api_connections").update({
+            "last_synced_at": datetime.now(timezone.utc).isoformat(),
+            "last_sync_status": "failed",
+            "last_sync_error": error_text
+        }).eq("id", connection_id).eq("yacht_id", admin_crew["yacht_id"]).execute()
+
+        raise HTTPException(
+            status_code=502,
+            detail=f"External API returned {response.status_code}: {error_text}"
+        )
+
+    content_type = response.headers.get("content-type", "")
+
+    try:
+        if "application/json" in content_type:
+            extracted_content = json.dumps(response.json(), indent=2, ensure_ascii=False)
+        else:
+            extracted_content = response.text
+    except Exception:
+        extracted_content = response.text
+
+    extracted_content = clean_text_for_postgres(extracted_content)
+
+    if not extracted_content.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="External API returned empty content"
+        )
+
+    final_file_name = (
+        file_name
+        or f"api-{connection.get('name', 'connection')}-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.json"
+    )
+
+    asset_result = seed_text_asset(
+        file_name=final_file_name,
+        content=extracted_content,
+        yacht_id=admin_crew["yacht_id"],
+        uploaded_by=admin_crew["id"],
+        security_level=security_level
+    )
+
+    supabase.table("api_connections").update({
+        "last_synced_at": datetime.now(timezone.utc).isoformat(),
+        "last_sync_status": "success",
+        "last_sync_error": None
+    }).eq("id", connection_id).eq("yacht_id", admin_crew["yacht_id"]).execute()
+
+    return {
+        "message": "API connection synced successfully",
+        "connection_id": connection_id,
+        "url": url,
+        "asset_result": asset_result
+    }
+
+
+def ingest_api_data_directly(
+    admin_crew: dict,
+    source_name: str,
+    content: dict | list | str,
+    file_name: str | None = None,
+    security_level: int = 1
+):
+    """
+    Allows a client system to push data directly into BridgeOS by API.
+    This is useful for Zapier, Make, webhooks, CRMs, PMS systems, etc.
+    """
+
+    _require_tier_1_admin(admin_crew)
+
+    security_level = int(security_level)
+
+    if security_level not in [1, 2, 3]:
+        raise HTTPException(
+            status_code=400,
+            detail="security_level must be 1, 2, or 3"
+        )
+
+    clean_source_name = (source_name or "api-data").strip()
+
+    if isinstance(content, str):
+        extracted_content = content
+    else:
+        extracted_content = json.dumps(content, indent=2, ensure_ascii=False)
+
+    extracted_content = clean_text_for_postgres(extracted_content)
+
+    if not extracted_content.strip():
+        raise HTTPException(status_code=400, detail="content is required")
+
+    final_file_name = (
+        file_name
+        or f"{clean_source_name}-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.json"
+    )
+
+    return seed_text_asset(
+        file_name=final_file_name,
+        content=extracted_content,
+        yacht_id=admin_crew["yacht_id"],
+        uploaded_by=admin_crew["id"],
+        security_level=security_level
+    )
 
 
 def get_asset_status(asset_id: str, yacht_id: str):

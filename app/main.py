@@ -145,6 +145,28 @@ class CreateAssetFolderRequest(BaseModel):
 class ForgotPasswordRequest(BaseModel):
     email: EmailStr
 
+class CreateApiConnectionRequest(BaseModel):
+    name: str
+    base_url: str
+    auth_type: str = "none"
+    api_key: Optional[str] = None
+    extra_headers: dict = {}
+
+
+class SyncApiConnectionRequest(BaseModel):
+    endpoint_path: Optional[str] = None
+    method: str = "GET"
+    payload: Optional[dict] = None
+    file_name: Optional[str] = None
+    security_level: int = 1
+
+
+class DirectApiIngestRequest(BaseModel):
+    source_name: str
+    content: object
+    file_name: Optional[str] = None
+    security_level: int = 1
+
 @app.post("/auth/dev-login")
 async def dev_login(body: DevLoginRequest):
     return services.dev_login(
@@ -784,6 +806,7 @@ async def list_my_assets(
 
     return services.list_my_assets(crew)
 
+
 @app.get("/assets/{asset_id}/status")
 async def asset_status(
     asset_id: str,
@@ -1127,6 +1150,114 @@ async def update_asset_permissions_api(
         crew_ids=body.crew_ids,
         admin_crew=admin_crew
     )
+
+# ------------------------
+# API CONNECTIONS
+# ------------------------
+
+@app.post("/api-connections")
+async def create_api_connection_api(
+    body: CreateApiConnectionRequest,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.create_api_connection(
+        admin_crew=admin_crew,
+        name=body.name,
+        base_url=body.base_url,
+        auth_type=body.auth_type,
+        api_key=body.api_key,
+        extra_headers=body.extra_headers
+    )
+
+
+@app.get("/api-connections")
+async def list_api_connections_api(
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.list_api_connections(admin_crew)
+
+
+@app.delete("/api-connections/{connection_id}")
+async def delete_api_connection_api(
+    connection_id: str,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.delete_api_connection(
+        connection_id=connection_id,
+        admin_crew=admin_crew
+    )
+
+
+@app.post("/api-connections/{connection_id}/sync")
+async def sync_api_connection_api(
+    connection_id: str,
+    body: SyncApiConnectionRequest,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.sync_api_connection(
+        connection_id=connection_id,
+        admin_crew=admin_crew,
+        endpoint_path=body.endpoint_path,
+        method=body.method,
+        payload=body.payload,
+        file_name=body.file_name,
+        security_level=body.security_level
+    )
+
+
+@app.post("/api-ingest")
+async def direct_api_ingest_api(
+    body: DirectApiIngestRequest,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.ingest_api_data_directly(
+        admin_crew=admin_crew,
+        source_name=body.source_name,
+        content=body.content,
+        file_name=body.file_name,
+        security_level=body.security_level
+    )
+    
 # ------------------------
 # CHAT
 # ------------------------
