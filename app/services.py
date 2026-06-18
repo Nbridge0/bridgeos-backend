@@ -1,6 +1,10 @@
 from fastapi import HTTPException
 import requests
 import json
+import random
+import hashlib
+import smtplib
+from email.message import EmailMessage
 from app.database import supabase
 from app.embeddings import embed
 from app.config import BUCKET_NAME, RUNPOD_BASE_URL, BRIDGEOS_API_KEY, API_SYNC_TIMEOUT_SECONDS
@@ -28,9 +32,19 @@ import uuid
 import jwt as pyjwt
 import io
 from urllib.parse import quote
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
-from app.config import SUPABASE_JWT_SECRET, SUPABASE_URL, SUPABASE_SERVICE_KEY
+from app.config import (
+    SUPABASE_JWT_SECRET,
+    SUPABASE_URL,
+    SUPABASE_SERVICE_KEY,
+    SMTP_HOST,
+    SMTP_PORT,
+    SMTP_USERNAME,
+    SMTP_PASSWORD,
+    SMTP_FROM_EMAIL,
+    SMTP_FROM_NAME
+)
 from supabase import create_client
 
 auth_admin = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
@@ -5457,20 +5471,231 @@ def test_login_response():
         "crew": crew
     }
 
-def forgot_password(email: str):
-    """
-    Sends a Supabase password reset email.
-    The user will receive Supabase's recovery email.
-    """
+def _clean_reset_email(email: str) -> str:
+    return (email or "").strip().lower()
+
+
+def _make_reset_code() -> str:
+    return str(random.randint(100000, 999999))
+
+
+def _hash_reset_code(email: str, code: str) -> str:
+    raw = f"{_clean_reset_email(email)}:{code}:{SUPABASE_JWT_SECRET}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _send_password_reset_code_email(email: str, code: str):
+    if not SMTP_HOST or not SMTP_USERNAME or not SMTP_PASSWORD or not SMTP_FROM_EMAIL:
+        raise HTTPException(
+            status_code=500,
+            detail="Password reset email is not configured. Missing SMTP settings."
+        )
+
+    message = EmailMessage()
+    message["Subject"] = "Your BridgeOS password reset code"
+    message["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
+    message["To"] = email
+
+    message.set_content(
+        f"""
+Hello,
+
+Your BridgeOS password reset code is:
+
+{code}
+
+This code expires in 15 minutes.
+
+If you did not request this password reset, you can ignore this email.
+
+BridgeOS
+""".strip()
+    )
 
     try:
-        auth_admin.auth.reset_password_for_email(email)
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.send_message(message)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
-            status_code=400,
+            status_code=500,
             detail=f"Could not send password reset email: {str(e)}"
         )
 
+
+def forgot_password(email: str):
+    """
+    Sends a 6-digit password reset verification code by email.
+
+    Security behaviour:
+    - Always returns a generic message.
+    - Does not reveal whether the email exists.
+    - Stores only a hash of the code.
+    - Code expires after 15 minutes.
+    """
+
+    clean_email = _clean_reset_email(email)
+
+    if not clean_email:
+        raise HTTPException(status_code=400, detail="Email is required")
+
+    crew_res = supabase.table("crew") \
+        .select("id, email") \
+        .ilike("email", clean_email) \
+        .limit(1) \
+        .execute()
+
+    generic_response = {
+        "message": "If this email exists, a verification code has been sent."
+    }
+
+    if not crew_res.data:
+        return generic_response
+
+    code = _make_reset_code()
+    code_hash = _hash_reset_code(clean_email, code)
+    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat()
+
+    try:
+        supabase.table("password_reset_codes") \
+            .update({
+                "used_at": datetime.now(timezone.utc).isoformat()
+            }) \
+            .ilike("email", clean_email) \
+            .is_("used_at", "null") \
+            .execute()
+
+        supabase.table("password_reset_codes").insert({
+            "email": clean_email,
+            "code_hash": code_hash,
+            "expires_at": expires_at
+        }).execute()
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not create password reset code: {str(e)}"
+        )
+
+    _send_password_reset_code_email(clean_email, code)
+
+    return generic_response
+
+
+def confirm_forgot_password(email: str, code: str, new_password: str):
+    """
+    Verifies the emailed code and updates the user's Supabase Auth password.
+    """
+
+    clean_email = _clean_reset_email(email)
+    clean_code = (code or "").strip()
+
+    if not clean_email:
+        raise HTTPException(status_code=400, detail="Email is required")
+
+    if not clean_code:
+        raise HTTPException(status_code=400, detail="Verification code is required")
+
+    if not new_password or len(new_password) < 8:
+        raise HTTPException(
+            status_code=400,
+            detail="Password must be at least 8 characters"
+        )
+
+    code_hash = _hash_reset_code(clean_email, clean_code)
+    now = datetime.now(timezone.utc)
+
+    try:
+        code_res = supabase.table("password_reset_codes") \
+            .select("*") \
+            .ilike("email", clean_email) \
+            .eq("code_hash", code_hash) \
+            .is_("used_at", "null") \
+            .order("created_at", desc=True) \
+            .limit(1) \
+            .execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not verify reset code: {str(e)}"
+        )
+
+    if not code_res.data:
+        raise HTTPException(status_code=400, detail="Invalid or expired verification code")
+
+    reset_row = code_res.data[0]
+
+    attempts = int(reset_row.get("attempts") or 0)
+
+    if attempts >= 5:
+        raise HTTPException(
+            status_code=400,
+            detail="Too many attempts. Please request a new code."
+        )
+
+    expires_at_raw = reset_row.get("expires_at")
+
+    try:
+        expires_at = datetime.fromisoformat(str(expires_at_raw).replace("Z", "+00:00"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid or expired verification code")
+
+    if expires_at < now:
+        raise HTTPException(status_code=400, detail="Invalid or expired verification code")
+
+    crew_res = supabase.table("crew") \
+        .select("id, email, yacht_id") \
+        .ilike("email", clean_email) \
+        .limit(1) \
+        .execute()
+
+    if not crew_res.data:
+        raise HTTPException(status_code=400, detail="Invalid or expired verification code")
+
+    crew = crew_res.data[0]
+    crew_id = crew["id"]
+
+    try:
+        auth_admin.auth.admin.update_user_by_id(
+            crew_id,
+            {
+                "password": new_password
+            }
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not reset password in Supabase Auth: {str(e)}"
+        )
+
+    try:
+        supabase.table("password_reset_codes") \
+            .update({
+                "used_at": now.isoformat(),
+                "attempts": attempts + 1
+            }) \
+            .eq("id", reset_row["id"]) \
+            .execute()
+
+        supabase.table("crew") \
+            .update({
+                "password_updated_at": now.isoformat(),
+                "password_updated_by": crew_id,
+                "password_reset_by_role": "forgot_password",
+                "must_change_password": False
+            }) \
+            .eq("id", crew_id) \
+            .execute()
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Password was reset, but database sync failed: {str(e)}"
+        )
+
     return {
-        "message": "If this email exists, a password reset link has been sent."
+        "message": "Password reset successfully. Please log in with your new password."
     }

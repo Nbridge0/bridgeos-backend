@@ -145,6 +145,11 @@ class CreateAssetFolderRequest(BaseModel):
 class ForgotPasswordRequest(BaseModel):
     email: EmailStr
 
+class ConfirmForgotPasswordRequest(BaseModel):
+    email: EmailStr
+    code: str
+    password: str
+
 class CreateApiConnectionRequest(BaseModel):
     name: str
     base_url: str
@@ -466,6 +471,14 @@ async def list_documents_admin(
 @app.post("/auth/forgot-password")
 async def forgot_password(body: ForgotPasswordRequest):
     return services.forgot_password(email=body.email)
+
+@app.post("/auth/forgot-password/confirm")
+async def confirm_forgot_password(body: ConfirmForgotPasswordRequest):
+    return services.confirm_forgot_password(
+        email=body.email,
+        code=body.code,
+        new_password=body.password
+    )
 
 
 # ------------------------

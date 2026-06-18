@@ -15,6 +15,12 @@ RUNPOD_BASE_URL = os.environ.get("RUNPOD_BASE_URL")
 BRIDGEOS_API_KEY = os.environ.get("BRIDGEOS_API_KEY")
 FRONTEND_ORIGINS = os.environ.get("FRONTEND_ORIGINS", "*")
 API_SYNC_TIMEOUT_SECONDS = int(os.environ.get("API_SYNC_TIMEOUT_SECONDS", "60"))
+SMTP_HOST = os.environ.get("SMTP_HOST")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USERNAME = os.environ.get("SMTP_USERNAME")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
+SMTP_FROM_EMAIL = os.environ.get("SMTP_FROM_EMAIL")
+SMTP_FROM_NAME = os.environ.get("SMTP_FROM_NAME", "BridgeOS")
 
 if not SUPABASE_URL:
     raise RuntimeError("SUPABASE_URL is missing.")
