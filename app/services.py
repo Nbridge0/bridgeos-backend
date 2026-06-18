@@ -5513,18 +5513,27 @@ BridgeOS
     )
 
     try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.starttls()
-            server.login(SMTP_USERNAME, SMTP_PASSWORD)
-            server.send_message(message)
-    except HTTPException:
-        raise
+        smtp_port = int(SMTP_PORT)
+
+        if smtp_port == 465:
+            with smtplib.SMTP_SSL(SMTP_HOST, smtp_port, timeout=20) as server:
+                server.login(SMTP_USERNAME, SMTP_PASSWORD)
+                server.send_message(message)
+        else:
+            with smtplib.SMTP(SMTP_HOST, smtp_port, timeout=20) as server:
+                server.ehlo()
+                server.starttls()
+                server.ehlo()
+                server.login(SMTP_USERNAME, SMTP_PASSWORD)
+                server.send_message(message)
+
     except Exception as e:
+        print("SMTP PASSWORD RESET ERROR:", type(e).__name__, str(e))
+
         raise HTTPException(
             status_code=500,
-            detail=f"Could not send password reset email: {str(e)}"
+            detail=f"Could not send password reset email: {type(e).__name__}: {str(e)}"
         )
-
 
 def forgot_password(email: str):
     """
@@ -5560,7 +5569,7 @@ def forgot_password(email: str):
     expires_at = (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat()
 
     try:
-        supabase.table("password_reset_codes") \
+        auth_admin.table("password_reset_codes") \
             .update({
                 "used_at": datetime.now(timezone.utc).isoformat()
             }) \
@@ -5568,7 +5577,7 @@ def forgot_password(email: str):
             .is_("used_at", "null") \
             .execute()
 
-        supabase.table("password_reset_codes").insert({
+        auth_admin.table("password_reset_codes").insert({
             "email": clean_email,
             "code_hash": code_hash,
             "expires_at": expires_at
@@ -5580,7 +5589,11 @@ def forgot_password(email: str):
             detail=f"Could not create password reset code: {str(e)}"
         )
 
+    print("PASSWORD RESET DEBUG: sending email to", clean_email)
+
     _send_password_reset_code_email(clean_email, code)
+
+    print("PASSWORD RESET DEBUG: email sent successfully")
 
     return generic_response
 
@@ -5609,7 +5622,7 @@ def confirm_forgot_password(email: str, code: str, new_password: str):
     now = datetime.now(timezone.utc)
 
     try:
-        code_res = supabase.table("password_reset_codes") \
+        code_res = auth_admin.table("password_reset_codes") \
             .select("*") \
             .ilike("email", clean_email) \
             .eq("code_hash", code_hash) \
@@ -5672,7 +5685,7 @@ def confirm_forgot_password(email: str, code: str, new_password: str):
         )
 
     try:
-        supabase.table("password_reset_codes") \
+        auth_admin.table("password_reset_codes") \
             .update({
                 "used_at": now.isoformat(),
                 "attempts": attempts + 1
