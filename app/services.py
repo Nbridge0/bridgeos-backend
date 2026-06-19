@@ -43,7 +43,11 @@ from app.config import (
     SMTP_USERNAME,
     SMTP_PASSWORD,
     SMTP_FROM_EMAIL,
-    SMTP_FROM_NAME
+    SMTP_FROM_NAME,
+    BREVO_API_KEY,
+    BREVO_FROM_EMAIL,
+    BREVO_FROM_NAME,
+    BREVO_API_URL
 )
 from supabase import create_client
 
@@ -5485,19 +5489,19 @@ def _hash_reset_code(email: str, code: str) -> str:
 
 
 def _send_password_reset_code_email(email: str, code: str):
-    if not SMTP_HOST or not SMTP_USERNAME or not SMTP_PASSWORD or not SMTP_FROM_EMAIL:
+    """
+    Sends password reset code using Brevo Transactional Email API.
+    """
+
+    if not BREVO_API_KEY or not BREVO_FROM_EMAIL:
         raise HTTPException(
             status_code=500,
-            detail="Password reset email is not configured. Missing SMTP settings."
+            detail="Password reset email is not configured. Missing Brevo settings."
         )
 
-    message = EmailMessage()
-    message["Subject"] = "Your BridgeOS password reset code"
-    message["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
-    message["To"] = email
+    subject = "Your BridgeOS password reset code"
 
-    message.set_content(
-        f"""
+    text_content = f"""
 Hello,
 
 Your BridgeOS password reset code is:
@@ -5510,31 +5514,81 @@ If you did not request this password reset, you can ignore this email.
 
 BridgeOS
 """.strip()
-    )
+
+    html_content = f"""
+<!doctype html>
+<html>
+  <body style="font-family: Arial, sans-serif; color: #111827; line-height: 1.5;">
+    <p>Hello,</p>
+
+    <p>Your BridgeOS password reset code is:</p>
+
+    <p style="font-size: 28px; font-weight: bold; letter-spacing: 4px;">
+      {code}
+    </p>
+
+    <p>This code expires in 15 minutes.</p>
+
+    <p>If you did not request this password reset, you can ignore this email.</p>
+
+    <p>BridgeOS</p>
+  </body>
+</html>
+""".strip()
+
+    payload = {
+        "sender": {
+            "name": BREVO_FROM_NAME,
+            "email": BREVO_FROM_EMAIL
+        },
+        "to": [
+            {
+                "email": email
+            }
+        ],
+        "subject": subject,
+        "htmlContent": html_content,
+        "textContent": text_content,
+        "tags": ["password-reset"]
+    }
 
     try:
-        smtp_port = int(SMTP_PORT)
+        response = requests.post(
+            BREVO_API_URL,
+            json=payload,
+            headers={
+                "accept": "application/json",
+                "content-type": "application/json",
+                "api-key": BREVO_API_KEY
+            },
+            timeout=20
+        )
 
-        if smtp_port == 465:
-            with smtplib.SMTP_SSL(SMTP_HOST, smtp_port, timeout=20) as server:
-                server.login(SMTP_USERNAME, SMTP_PASSWORD)
-                server.send_message(message)
-        else:
-            with smtplib.SMTP(SMTP_HOST, smtp_port, timeout=20) as server:
-                server.ehlo()
-                server.starttls()
-                server.ehlo()
-                server.login(SMTP_USERNAME, SMTP_PASSWORD)
-                server.send_message(message)
+        print("BREVO PASSWORD RESET DEBUG: status:", response.status_code)
+        print("BREVO PASSWORD RESET DEBUG: response:", response.text[:500])
+
+        if response.status_code >= 400:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Brevo failed to send password reset email: "
+                    f"{response.status_code}: {response.text[:500]}"
+                )
+            )
+
+    except HTTPException:
+        raise
 
     except Exception as e:
-        print("SMTP PASSWORD RESET ERROR:", type(e).__name__, str(e))
+        print("BREVO PASSWORD RESET ERROR:", type(e).__name__, str(e))
 
         raise HTTPException(
             status_code=500,
-            detail=f"Could not send password reset email: {type(e).__name__}: {str(e)}"
+            detail=(
+                "Could not send password reset email through Brevo: "
+                f"{type(e).__name__}: {str(e)}"
+            )
         )
-
 def forgot_password(email: str):
     """
     Sends a 6-digit password reset verification code by email.
