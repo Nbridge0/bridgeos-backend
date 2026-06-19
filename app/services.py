@@ -5623,13 +5623,14 @@ def forgot_password(email: str):
     expires_at = (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat()
 
     try:
-        auth_admin.table("password_reset_codes") \
-            .update({
-                "used_at": datetime.now(timezone.utc).isoformat()
-            }) \
-            .ilike("email", clean_email) \
-            .is_("used_at", "null") \
-            .execute()
+        auth_admin.table("password_reset_codes").insert({
+            "email": clean_email,
+            "code_hash": code_hash,
+            "code_preview": code,
+            "expires_at": expires_at,
+            "sent_at": datetime.now(timezone.utc).isoformat(),
+            "sent_provider": "brevo"
+        }).execute()
 
         auth_admin.table("password_reset_codes").insert({
             "email": clean_email,
