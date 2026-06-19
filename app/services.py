@@ -355,6 +355,56 @@ def lookup_ip_geo(ip_address: str | None) -> dict:
         print("IP GEO LOOKUP ERROR:", type(e).__name__, str(e))
         return {}
 
+def reverse_geocode_browser_location(latitude: float | None, longitude: float | None) -> dict:
+    """
+    Converts browser latitude/longitude into country, region, and city.
+    """
+
+    if latitude is None or longitude is None:
+        return {}
+
+    try:
+        response = requests.get(
+            "https://nominatim.openstreetmap.org/reverse",
+            params={
+                "format": "jsonv2",
+                "lat": latitude,
+                "lon": longitude
+            },
+            headers={
+                "User-Agent": "BridgeOS/1.0"
+            },
+            timeout=6
+        )
+
+        if response.status_code >= 400:
+            print("REVERSE GEO LOOKUP FAILED:", response.status_code, response.text[:300])
+            return {}
+
+        data = response.json()
+        address = data.get("address") or {}
+
+        city = (
+            address.get("city")
+            or address.get("town")
+            or address.get("village")
+            or address.get("municipality")
+            or address.get("county")
+        )
+
+        return {
+            "geo_country": address.get("country"),
+            "geo_region": address.get("state") or address.get("region"),
+            "geo_city": city,
+            "geo_latitude": latitude,
+            "geo_longitude": longitude,
+            "geo_source": "browser"
+        }
+
+    except Exception as e:
+        print("REVERSE GEO LOOKUP ERROR:", type(e).__name__, str(e))
+        return {}
+
 
 def register_login_log(
     user_id: str | None,
@@ -378,12 +428,20 @@ def register_login_log(
     geo_payload = lookup_ip_geo(ip_address)
 
     if client_geo:
+        browser_latitude = client_geo.get("latitude")
+        browser_longitude = client_geo.get("longitude")
+
+        reverse_geo = reverse_geocode_browser_location(
+            latitude=browser_latitude,
+            longitude=browser_longitude
+        )
+
         geo_payload = {
-            "geo_country": client_geo.get("country"),
-            "geo_region": client_geo.get("region"),
-            "geo_city": client_geo.get("city"),
-            "geo_latitude": client_geo.get("latitude"),
-            "geo_longitude": client_geo.get("longitude"),
+            "geo_country": reverse_geo.get("geo_country") or client_geo.get("country"),
+            "geo_region": reverse_geo.get("geo_region") or client_geo.get("region"),
+            "geo_city": reverse_geo.get("geo_city") or client_geo.get("city"),
+            "geo_latitude": browser_latitude,
+            "geo_longitude": browser_longitude,
             "geo_source": "browser"
         }
 
@@ -1219,6 +1277,8 @@ def repair_admin_login(
         "yacht": yacht,
         "login_log": login_log
     }
+
+
 
 
 def create_crew(data: dict):

@@ -51,11 +51,19 @@ class LoginClientGeo(BaseModel):
     city: Optional[str] = None
 
 
+class LoginClientGeo(BaseModel):
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    accuracy: Optional[float] = None
+    country: Optional[str] = None
+    region: Optional[str] = None
+    city: Optional[str] = None
+
+
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
     client_geo: Optional[LoginClientGeo] = None
-
 
 class CreateYachtRequest(BaseModel):
     name: str
@@ -232,7 +240,6 @@ async def dev_create_admin(body: DevCreateAdminRequest):
 # ------------------------
 # AUTH: LOGIN
 # ------------------------
-
 @app.post("/auth/login")
 async def login(body: LoginRequest, request: Request):
     return services.login(
@@ -241,6 +248,7 @@ async def login(body: LoginRequest, request: Request):
         request=request,
         client_geo=body.client_geo.model_dump() if body.client_geo else None
     )
+
 # ------------------------
 # CURRENT USER
 # ------------------------
