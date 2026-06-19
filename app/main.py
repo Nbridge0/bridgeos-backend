@@ -1418,16 +1418,18 @@ async def chat_api(
     if not body.chat_id:
         raise HTTPException(status_code=422, detail="Missing chat_id")
 
-    print("CHAT DEBUG: using shared RunPod BridgeOS chat")
+    print("CHAT DEBUG: using local Supabase asset search")
     print("CHAT DEBUG: chat_id:", body.chat_id)
     print("CHAT DEBUG: crew_id:", crew["id"])
     print("CHAT DEBUG: yacht_id:", crew["yacht_id"])
     print("CHAT DEBUG: security_level:", crew["security_level"])
     print("CHAT DEBUG: query:", query)
 
-    return services.chat_with_runpod_bridgeos(
+    return services.chat(
         query=query,
-        crew=crew,
+        crew_id=crew["id"],
+        yacht_id=crew["yacht_id"],
+        security_level=crew["security_level"],
         chat_id=body.chat_id,
         uploaded_asset_id=body.uploaded_asset_id
     )
