@@ -1,4 +1,4 @@
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 import requests
 import json
 import random
@@ -250,15 +250,213 @@ def dev_create_admin(email: str, password: str, full_name: str, yacht_name: str)
         "crew": crew_res.data[0]
     }
 
+def get_request_ip(request: Request | None) -> str | None:
+    if not request:
+        return None
 
-def login(email: str, password: str):
+    cloudflare_ip = request.headers.get("cf-connecting-ip")
+    if cloudflare_ip:
+        return cloudflare_ip.strip()
+
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+
+    real_ip = request.headers.get("x-real-ip")
+    if real_ip:
+        return real_ip.strip()
+
+    if request.client and request.client.host:
+        return request.client.host
+
+    return None
+
+
+def parse_user_agent(user_agent: str | None) -> dict:
+    value = (user_agent or "").lower()
+
+    device_type = "desktop"
+    browser = "unknown"
+    operating_system = "unknown"
+
+    if "mobile" in value or "iphone" in value or "android" in value:
+        device_type = "mobile"
+
+    if "ipad" in value or "tablet" in value:
+        device_type = "tablet"
+
+    if "edg/" in value:
+        browser = "edge"
+    elif "chrome/" in value and "safari/" in value:
+        browser = "chrome"
+    elif "firefox/" in value:
+        browser = "firefox"
+    elif "safari/" in value and "chrome/" not in value:
+        browser = "safari"
+
+    if "windows" in value:
+        operating_system = "windows"
+    elif "mac os" in value or "macintosh" in value:
+        operating_system = "macos"
+    elif "iphone" in value or "ipad" in value or "ios" in value:
+        operating_system = "ios"
+    elif "android" in value:
+        operating_system = "android"
+    elif "linux" in value:
+        operating_system = "linux"
+
+    return {
+        "device_type": device_type,
+        "browser": browser,
+        "operating_system": operating_system
+    }
+
+
+def lookup_ip_geo(ip_address: str | None) -> dict:
+    if not ip_address:
+        return {}
+
+    if ip_address.startswith("127.") or ip_address in ["localhost", "::1"]:
+        return {}
+
+    if ip_address.startswith("10.") or ip_address.startswith("192.168."):
+        return {}
+
+    if ip_address.startswith("172."):
+        try:
+            second = int(ip_address.split(".")[1])
+            if 16 <= second <= 31:
+                return {}
+        except Exception:
+            pass
+
+    try:
+        response = requests.get(
+            f"https://ipapi.co/{ip_address}/json/",
+            timeout=4
+        )
+
+        if response.status_code >= 400:
+            print("IP GEO LOOKUP FAILED:", response.status_code, response.text[:200])
+            return {}
+
+        data = response.json()
+
+        return {
+            "geo_country": data.get("country_name"),
+            "geo_region": data.get("region"),
+            "geo_city": data.get("city"),
+            "geo_latitude": data.get("latitude"),
+            "geo_longitude": data.get("longitude"),
+            "geo_source": "ip"
+        }
+
+    except Exception as e:
+        print("IP GEO LOOKUP ERROR:", type(e).__name__, str(e))
+        return {}
+
+
+def register_login_log(
+    user_id: str | None,
+    email: str | None,
+    login_type: str = "password",
+    success: bool = True,
+    request: Request | None = None,
+    client_geo: dict | None = None
+):
+    if not user_id:
+        print("LOGIN LOG SKIPPED: missing user_id")
+        return None
+
+    clean_email = (email or "").strip().lower()
+    login_time = datetime.now(timezone.utc).isoformat()
+
+    ip_address = get_request_ip(request)
+    user_agent = request.headers.get("user-agent") if request else None
+    parsed_agent = parse_user_agent(user_agent)
+
+    geo_payload = lookup_ip_geo(ip_address)
+
+    if client_geo:
+        geo_payload = {
+            "geo_country": client_geo.get("country"),
+            "geo_region": client_geo.get("region"),
+            "geo_city": client_geo.get("city"),
+            "geo_latitude": client_geo.get("latitude"),
+            "geo_longitude": client_geo.get("longitude"),
+            "geo_source": "browser"
+        }
+
+    crew = None
+
+    try:
+        crew_res = auth_admin.table("crew") \
+            .select("id, yacht_id, email") \
+            .eq("id", user_id) \
+            .limit(1) \
+            .execute()
+
+        if crew_res.data:
+            crew = crew_res.data[0]
+
+    except Exception as e:
+        print("LOGIN LOG CREW LOOKUP ERROR:", type(e).__name__, str(e))
+
+    payload = {
+        "user_id": user_id,
+        "crew_id": crew.get("id") if crew else user_id,
+        "yacht_id": crew.get("yacht_id") if crew else None,
+        "email": clean_email or (crew.get("email") if crew else None),
+        "login_type": login_type,
+        "success": success,
+        "login_at": login_time,
+        "ip_address": ip_address,
+        "user_agent": user_agent,
+        "device_type": parsed_agent.get("device_type"),
+        "browser": parsed_agent.get("browser"),
+        "operating_system": parsed_agent.get("operating_system"),
+        "geo_country": geo_payload.get("geo_country"),
+        "geo_region": geo_payload.get("geo_region"),
+        "geo_city": geo_payload.get("geo_city"),
+        "geo_latitude": geo_payload.get("geo_latitude"),
+        "geo_longitude": geo_payload.get("geo_longitude"),
+        "geo_source": geo_payload.get("geo_source")
+    }
+
+    try:
+        log_res = auth_admin.table("login_logs").insert(payload).execute()
+
+        print("LOGIN LOG INSERT PAYLOAD:", payload)
+        print("LOGIN LOG INSERT RESPONSE:", log_res)
+
+        if not log_res.data:
+            raise Exception("Supabase returned no inserted login_logs row")
+
+        return log_res.data[0]
+
+    except Exception as e:
+        print("LOGIN LOG INSERT FAILED:", type(e).__name__, str(e))
+        raise HTTPException(
+            status_code=500,
+            detail=f"Login succeeded, but login_logs insert failed: {type(e).__name__}: {str(e)}"
+        )
+
+def login(
+    email: str,
+    password: str,
+    request: Request | None = None,
+    client_geo: dict | None = None
+):
     """
     Logs in a user using Supabase Auth and returns a clean token response.
+    Also writes one row to login_logs.
     """
+
+    clean_email = (email or "").strip().lower()
 
     try:
         auth_res = supabase.auth.sign_in_with_password({
-            "email": email,
+            "email": clean_email,
             "password": password
         })
     except Exception as e:
@@ -277,32 +475,16 @@ def login(email: str, password: str):
         raise HTTPException(status_code=401, detail="No access token returned from Supabase")
 
     user_id = auth_res.user.id if auth_res.user else None
-    user_email = auth_res.user.email if auth_res.user else email
-    crew = None
+    user_email = auth_res.user.email if auth_res.user else clean_email
 
-    if user_id:
-        try:
-            crew_res = supabase.table("crew") \
-                .select("id, yacht_id, email") \
-                .eq("id", user_id) \
-                .limit(1) \
-                .execute()
-
-            if crew_res.data:
-                crew = crew_res.data[0]
-
-            supabase.table("login_logs").insert({
-                "user_id": user_id,
-                "crew_id": crew.get("id") if crew else user_id,
-                "yacht_id": crew.get("yacht_id") if crew else None,
-                "email": user_email,
-                "login_at": datetime.now(timezone.utc).isoformat(),
-                "login_type": "password",
-                "success": True
-            }).execute()
-
-        except Exception as e:
-            print("LOGIN LOG INSERT ERROR:", type(e).__name__, str(e))
+    login_log = register_login_log(
+        user_id=user_id,
+        email=user_email,
+        login_type="password",
+        success=True,
+        request=request,
+        client_geo=client_geo
+    )
 
     return {
         "access_token": auth_res.session.access_token,
@@ -311,10 +493,16 @@ def login(email: str, password: str):
         "user": {
             "id": user_id,
             "email": user_email
-        }
+        },
+        "login_log": login_log
     }
 
-def dev_login(email: str, full_name: str = "Test Admin", yacht_name: str = "Test Yacht"):
+def dev_login(
+    email: str,
+    full_name: str = "Test Admin",
+    yacht_name: str = "Test Yacht",
+    request: Request | None = None
+):
     """
     DEV LOGIN ONLY.
 
@@ -384,6 +572,13 @@ def dev_login(email: str, full_name: str = "Test Admin", yacht_name: str = "Test
     except Exception as e:
         print("DEV LOGIN LOG INSERT ERROR:", type(e).__name__, str(e))
 
+    login_log = register_login_log(
+        user_id=user_id,
+        email=email,
+        login_type="dev-login",
+        success=True,
+        request=request
+    )
     now = int(time.time())
 
     token = pyjwt.encode(
@@ -407,7 +602,8 @@ def dev_login(email: str, full_name: str = "Test Admin", yacht_name: str = "Test
             "id": user_id,
             "email": email
         },
-        "crew": crew
+        "crew": crew,
+        "login_log": login_log
     }
 
 def chat_with_runpod_bridgeos(
@@ -901,7 +1097,13 @@ def get_chat_messages(chat_id: str, crew_id: str, yacht_id: str):
         .order("created_at") \
         .execute()
 
-def repair_admin_login(email: str, password: str, full_name: str, yacht_name: str):
+def repair_admin_login(
+    email: str,
+    password: str,
+    full_name: str,
+    yacht_name: str,
+    request: Request | None = None
+):
     """
     TEMP SETUP / REPAIR LOGIN.
 
@@ -944,6 +1146,14 @@ def repair_admin_login(email: str, password: str, full_name: str, yacht_name: st
     if crew_res.data:
         crew = crew_res.data[0]
 
+        login_log = register_login_log(
+            user_id=user_id,
+            email=auth_res.user.email or email,
+            login_type="repair-admin-login",
+            success=True,
+            request=request
+        )
+
         return {
             "message": "Login successful. Crew profile already exists.",
             "access_token": auth_res.session.access_token,
@@ -953,7 +1163,8 @@ def repair_admin_login(email: str, password: str, full_name: str, yacht_name: st
                 "id": user_id,
                 "email": auth_res.user.email or email
             },
-            "crew": crew
+            "crew": crew,
+            "login_log": login_log
         }
 
     yacht_res = supabase.table("yachts") \
@@ -987,6 +1198,14 @@ def repair_admin_login(email: str, password: str, full_name: str, yacht_name: st
     if not crew_insert.data:
         raise HTTPException(status_code=500, detail="Could not create crew row")
 
+    login_log = register_login_log(
+        user_id=user_id,
+        email=auth_res.user.email or email,
+        login_type="repair-admin-login",
+        success=True,
+        request=request
+    )
+
     return {
         "message": "Login successful. Admin crew profile repaired.",
         "access_token": auth_res.session.access_token,
@@ -997,7 +1216,8 @@ def repair_admin_login(email: str, password: str, full_name: str, yacht_name: st
             "email": auth_res.user.email or email
         },
         "crew": crew_insert.data[0],
-        "yacht": yacht
+        "yacht": yacht,
+        "login_log": login_log
     }
 
 

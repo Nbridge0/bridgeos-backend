@@ -43,9 +43,18 @@ class AuthorizeAssetRequest(BaseModel):
     crew_id: str
 
 
+class LoginClientGeo(BaseModel):
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    country: Optional[str] = None
+    region: Optional[str] = None
+    city: Optional[str] = None
+
+
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
+    client_geo: Optional[LoginClientGeo] = None
 
 
 class CreateYachtRequest(BaseModel):
@@ -172,13 +181,13 @@ class DirectApiIngestRequest(BaseModel):
     security_level: int = 1
 
 @app.post("/auth/dev-login")
-async def dev_login(body: DevLoginRequest):
+async def dev_login(body: DevLoginRequest, request: Request):
     return services.dev_login(
         email=body.email,
         full_name=body.full_name or "Test Admin",
-        yacht_name=body.yacht_name or "Test Yacht"
+        yacht_name=body.yacht_name or "Test Yacht",
+        request=request
     )
-
 
 @app.get("/health")
 async def health():
@@ -225,13 +234,13 @@ async def dev_create_admin(body: DevCreateAdminRequest):
 # ------------------------
 
 @app.post("/auth/login")
-async def login(body: LoginRequest):
+async def login(body: LoginRequest, request: Request):
     return services.login(
         email=body.email,
-        password=body.password
+        password=body.password,
+        request=request,
+        client_geo=body.client_geo.model_dump() if body.client_geo else None
     )
-
-
 # ------------------------
 # CURRENT USER
 # ------------------------
@@ -345,12 +354,13 @@ async def list_crew(request: Request):
     return services.list_crew_for_yacht(admin_crew)
 
 @app.post("/auth/repair-admin-login")
-async def repair_admin_login(body: RepairAdminLoginRequest):
+async def repair_admin_login(body: RepairAdminLoginRequest, request: Request):
     return services.repair_admin_login(
         email=body.email,
         password=body.password,
         full_name=body.full_name,
-        yacht_name=body.yacht_name
+        yacht_name=body.yacht_name,
+        request=request
     )
 
 @app.patch("/crew/{crew_id}")
