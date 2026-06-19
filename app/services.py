@@ -276,13 +276,41 @@ def login(email: str, password: str):
     if not auth_res.session.access_token:
         raise HTTPException(status_code=401, detail="No access token returned from Supabase")
 
+    user_id = auth_res.user.id if auth_res.user else None
+    user_email = auth_res.user.email if auth_res.user else email
+    crew = None
+
+    if user_id:
+        try:
+            crew_res = supabase.table("crew") \
+                .select("id, yacht_id, email") \
+                .eq("id", user_id) \
+                .limit(1) \
+                .execute()
+
+            if crew_res.data:
+                crew = crew_res.data[0]
+
+            supabase.table("login_logs").insert({
+                "user_id": user_id,
+                "crew_id": crew.get("id") if crew else user_id,
+                "yacht_id": crew.get("yacht_id") if crew else None,
+                "email": user_email,
+                "login_at": datetime.now(timezone.utc).isoformat(),
+                "login_type": "password",
+                "success": True
+            }).execute()
+
+        except Exception as e:
+            print("LOGIN LOG INSERT ERROR:", type(e).__name__, str(e))
+
     return {
         "access_token": auth_res.session.access_token,
         "refresh_token": auth_res.session.refresh_token,
         "token_type": "bearer",
         "user": {
-            "id": auth_res.user.id if auth_res.user else None,
-            "email": auth_res.user.email if auth_res.user else email
+            "id": user_id,
+            "email": user_email
         }
     }
 
@@ -341,6 +369,20 @@ def dev_login(email: str, full_name: str = "Test Admin", yacht_name: str = "Test
             raise HTTPException(status_code=500, detail="Could not create crew profile")
 
         crew = crew_insert.data[0]
+
+    try:
+        supabase.table("login_logs").insert({
+            "user_id": user_id,
+            "crew_id": crew.get("id") if crew else user_id,
+            "yacht_id": crew.get("yacht_id") if crew else None,
+            "email": email,
+            "login_at": datetime.now(timezone.utc).isoformat(),
+            "login_type": "dev-login",
+            "success": True
+        }).execute()
+
+    except Exception as e:
+        print("DEV LOGIN LOG INSERT ERROR:", type(e).__name__, str(e))
 
     now = int(time.time())
 
