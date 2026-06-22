@@ -3273,10 +3273,10 @@ def upload_asset(
     file_type = detect_file_type(clean_filename, mime_type)
     security_level = int(security_level)
 
-    if security_level not in [1, 2, 3]:
+    if security_level not in [1, 2, 3, 4]:
         raise HTTPException(
             status_code=400,
-            detail="security_level must be 1, 2, or 3"
+            detail="security_level must be 1, 2, 3, or 4"
         )
         
     if chat_id:
