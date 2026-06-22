@@ -1988,6 +1988,156 @@ def delete_api_connection(connection_id: str, admin_crew: dict):
         "deleted_connection_id": connection_id
     }
 
+def sync_one_google_drive_file(
+    drive_file: dict,
+    connection: dict,
+    admin_crew: dict,
+    security_level: int
+) -> dict:
+    file_id = drive_file.get("id")
+    file_name = drive_file.get("name") or "google-drive-file"
+    mime_type = drive_file.get("mimeType") or ""
+
+    if not file_id:
+        return {
+            "file_name": file_name,
+            "status": "skipped",
+            "reason": "Missing Google Drive file id"
+        }
+
+    if mime_type == "application/vnd.google-apps.folder":
+        return {
+            "file_name": file_name,
+            "file_id": file_id,
+            "status": "skipped",
+            "reason": "Folder skipped"
+        }
+
+    if mime_type == "application/vnd.google-apps.document":
+        download_url = f"https://www.googleapis.com/drive/v3/files/{file_id}/export?mimeType=text/plain"
+        final_file_name = file_name if file_name.lower().endswith(".txt") else f"{file_name}.txt"
+
+    elif mime_type == "application/vnd.google-apps.spreadsheet":
+        download_url = f"https://www.googleapis.com/drive/v3/files/{file_id}/export?mimeType=text/csv"
+        final_file_name = file_name if file_name.lower().endswith(".csv") else f"{file_name}.csv"
+
+    elif mime_type == "application/vnd.google-apps.presentation":
+        download_url = f"https://www.googleapis.com/drive/v3/files/{file_id}/export?mimeType=text/plain"
+        final_file_name = file_name if file_name.lower().endswith(".txt") else f"{file_name}.txt"
+
+    else:
+        download_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
+        final_file_name = file_name
+
+    headers = {
+        "Accept": "*/*"
+    }
+
+    extra_headers = connection.get("extra_headers") or {}
+
+    if isinstance(extra_headers, dict):
+        headers.update(extra_headers)
+
+    auth_type = (connection.get("auth_type") or "none").lower()
+    api_key = connection.get("api_key")
+
+    if auth_type == "bearer" and api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    if auth_type == "x-api-key" and api_key:
+        headers["x-api-key"] = api_key
+
+    try:
+        response = requests.get(
+            download_url,
+            headers=headers,
+            timeout=API_SYNC_TIMEOUT_SECONDS
+        )
+    except Exception as e:
+        return {
+            "file_name": file_name,
+            "file_id": file_id,
+            "status": "failed",
+            "reason": f"{type(e).__name__}: {str(e)}"
+        }
+
+    if response.status_code >= 400:
+        return {
+            "file_name": file_name,
+            "file_id": file_id,
+            "status": "failed",
+            "reason": f"Google Drive returned {response.status_code}: {response.text[:500]}"
+        }
+
+    extracted_content = ""
+
+    try:
+        downloaded_bytes = response.content or b""
+        file_type = detect_file_type(final_file_name, response.headers.get("content-type"))
+
+        if file_type in ["pdf", "docx", "text"]:
+            extracted_content = extract_text_by_file_type(
+                file=io.BytesIO(downloaded_bytes),
+                filename=final_file_name,
+                file_type=file_type
+            )
+        else:
+            extracted_content = downloaded_bytes.decode("utf-8", errors="ignore")
+
+    except Exception as e:
+        return {
+            "file_name": file_name,
+            "file_id": file_id,
+            "status": "failed",
+            "reason": f"Could not extract text: {type(e).__name__}: {str(e)}"
+        }
+
+    extracted_content = (extracted_content or "").strip()
+
+    if not extracted_content:
+        return {
+            "file_name": file_name,
+            "file_id": file_id,
+            "status": "skipped",
+            "reason": "No readable text extracted"
+        }
+
+    source_header = f"""
+Google Drive source metadata:
+File name: {file_name}
+Google Drive file id: {file_id}
+Google Drive MIME type: {mime_type}
+Modified time: {drive_file.get("modifiedTime") or ""}
+Web link: {drive_file.get("webViewLink") or ""}
+""".strip()
+
+    final_content = f"{source_header}\n\n---\n\n{extracted_content}"
+
+    try:
+        seeded = seed_text_asset(
+            file_name=final_file_name,
+            content=final_content,
+            yacht_id=admin_crew["yacht_id"],
+            uploaded_by=admin_crew["id"],
+            security_level=security_level
+        )
+
+        return {
+            "file_name": final_file_name,
+            "file_id": file_id,
+            "status": "synced",
+            "asset_id": seeded.get("asset", {}).get("id"),
+            "duplicate": seeded.get("duplicate", False)
+        }
+
+    except Exception as e:
+        return {
+            "file_name": file_name,
+            "file_id": file_id,
+            "status": "failed",
+            "reason": f"Could not save asset: {type(e).__name__}: {str(e)}"
+        }
+
 
 def sync_api_connection(
     connection_id: str,
@@ -2090,6 +2240,49 @@ def sync_api_connection(
         )
 
     content_type = response.headers.get("content-type", "")
+    # ------------------------
+    # GOOGLE DRIVE FOLDER / FILE CONTENT SYNC
+    # ------------------------
+    is_google_drive_url = "www.googleapis.com/drive/v3/files" in url
+
+    if is_google_drive_url and "application/json" in content_type:
+        try:
+            data = response.json()
+        except Exception:
+            data = None
+
+        if isinstance(data, dict) and isinstance(data.get("files"), list):
+            results = []
+
+            for drive_file in data.get("files") or []:
+                result = sync_one_google_drive_file(
+                    drive_file=drive_file,
+                    connection=connection,
+                    admin_crew=admin_crew,
+                    security_level=security_level
+                )
+                results.append(result)
+
+            synced_count = len([r for r in results if r.get("status") == "synced"])
+            skipped_count = len([r for r in results if r.get("status") == "skipped"])
+            failed_count = len([r for r in results if r.get("status") == "failed"])
+
+            supabase.table("api_connections").update({
+                "last_synced_at": datetime.now(timezone.utc).isoformat(),
+                "last_sync_status": "success" if synced_count > 0 else "failed",
+                "last_sync_error": None if synced_count > 0 else "No Google Drive files were synced"
+            }).eq("id", connection_id).eq("yacht_id", admin_crew["yacht_id"]).execute()
+
+            return {
+                "message": "Google Drive content sync completed",
+                "connection_id": connection_id,
+                "url": url,
+                "provider": "google_drive",
+                "synced_count": synced_count,
+                "skipped_count": skipped_count,
+                "failed_count": failed_count,
+                "results": results
+            }
 
     try:
         if "application/json" in content_type:
