@@ -3715,15 +3715,16 @@ def get_uploaded_chat_asset_rows(
     if not uploaded_asset_id:
         return []
 
-    accessible_asset_ids = get_accessible_asset_ids(
-        crew_id=crew_id,
-        yacht_id=yacht_id,
-        security_level=security_level
-    )
+    asset_owner_check = supabase.table("assets") \
+        .select("id, uploaded_by, chat_id, yacht_id") \
+        .eq("id", uploaded_asset_id) \
+        .eq("yacht_id", yacht_id) \
+        .eq("chat_id", chat_id) \
+        .eq("uploaded_by", crew_id) \
+        .execute()
 
-    if uploaded_asset_id not in accessible_asset_ids:
+    if not asset_owner_check.data:
         raise HTTPException(status_code=403, detail="No access to this uploaded file")
-
     asset_res = supabase.table("assets") \
         .select("""
             id,
@@ -5852,6 +5853,9 @@ BridgeOS
     <p>This code expires in 15 minutes.</p>
 
     <p>If you did not request this password reset, you can ignore this email.</p>
+
+    <p>If you don’t see this email in your inbox, please check your spam or junk folder.</p>
+
 
     <p>BridgeOS</p>
   </body>

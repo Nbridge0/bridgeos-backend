@@ -718,14 +718,28 @@ async def upload_asset_api(
     if not crew:
         raise HTTPException(status_code=403, detail="No access")
 
-    if int(crew["security_level"]) != 1:
-        raise HTTPException(
-            status_code=403,
-            detail="Only security level 1 can upload assets"
+    is_chat_upload = bool(chat_id)
+
+    if is_chat_upload:
+        services.verify_chat_access(
+            chat_id=chat_id,
+            crew_id=crew["id"],
+            yacht_id=crew["yacht_id"]
         )
+    else:
+        if int(crew["security_level"]) != 1:
+            raise HTTPException(
+                status_code=403,
+                detail="Only security level 1 can upload yacht documentation"
+            )
 
     try:
-        final_security_level = int(security_level)
+        if is_chat_upload:
+            final_security_level = int(crew["security_level"])
+            final_folder_name = None
+        else:
+            final_security_level = int(security_level)
+            final_folder_name = folder_name
 
         if final_security_level not in [1, 2, 3, 4]:
             raise HTTPException(
@@ -741,7 +755,7 @@ async def upload_asset_api(
             uploaded_by=crew["id"],
             chat_id=chat_id,
             security_level=final_security_level,
-            folder_name=folder_name,
+            folder_name=final_folder_name,
             folder_security_level=None
         )
 
