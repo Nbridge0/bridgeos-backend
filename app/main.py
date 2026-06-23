@@ -7,6 +7,7 @@ from pydantic import BaseModel, EmailStr
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 from app.config import FRONTEND_ORIGINS, BUCKET_NAME
+from app.embeddings import embed
 
 from app.auth import get_user
 from app import services
@@ -42,6 +43,8 @@ class SignupAdminRequest(BaseModel):
 class AuthorizeAssetRequest(BaseModel):
     crew_id: str
 
+class EmbedRequest(BaseModel):
+    input: str
 
 class LoginClientGeo(BaseModel):
     latitude: Optional[float] = None
@@ -499,6 +502,18 @@ async def confirm_forgot_password(body: ConfirmForgotPasswordRequest):
     )
 
 
+@app.post("/api/bridgeos/embed")
+def bridgeos_embed(
+    request: EmbedRequest,
+    x_api_key: str = Header(None)
+):
+    verify_api_key("bridgeos", x_api_key)
+
+    embedding = embed(request.input or "")
+
+    return {
+        "embedding": embedding
+    }
 # ------------------------
 # LIST MY ACCESSIBLE DOCUMENTS
 # ------------------------
@@ -1453,11 +1468,9 @@ async def chat_api(
     print("CHAT DEBUG: security_level:", crew["security_level"])
     print("CHAT DEBUG: query:", query)
 
-    return services.chat(
+    return services.chat_with_runpod_bridgeos(
         query=query,
-        crew_id=crew["id"],
-        yacht_id=crew["yacht_id"],
-        security_level=crew["security_level"],
+        crew=crew,
         chat_id=body.chat_id,
         uploaded_asset_id=body.uploaded_asset_id
     )

@@ -1,8 +1,6 @@
-from openai import OpenAI
+import requests
 
-from app.config import OPENAI_API_KEY
-
-client = OpenAI(api_key=OPENAI_API_KEY)
+from app.config import RUNPOD_BASE_URL, BRIDGEOS_API_KEY
 
 
 FALLBACK_NO_DATA_ANSWER = (
@@ -11,41 +9,54 @@ FALLBACK_NO_DATA_ANSWER = (
 
 
 def ask_llm(query: str, context: str) -> str:
-    if not context or not context.strip():
+    if not RUNPOD_BASE_URL:
+        print("RUNPOD LLM ERROR: RUNPOD_BASE_URL missing")
         return FALLBACK_NO_DATA_ANSWER
 
-    system_prompt = """
-You are BridgeOS, a helpful yacht assistant.
+    if not BRIDGEOS_API_KEY:
+        print("RUNPOD LLM ERROR: BRIDGEOS_API_KEY missing")
+        return FALLBACK_NO_DATA_ANSWER
 
-Always respond in British English.
+    url = f"{RUNPOD_BASE_URL.rstrip('/')}/api/bridgeos/chat"
 
-When context is provided:
-- Use it only if it is relevant to the user's question.
-- If it is not relevant, answer normally.
-
-When no context is provided:
-- Answer normally and helpfully.
-
-Never claim a document was used unless the answer is actually based on the document context.
-"""
-    response = client.responses.create(
-        model="gpt-4.1-mini",
-        input=[
-            {
-                "role": "system",
-                "content": system_prompt
-            },
-            {
-                "role": "user",
-                "content": f"""
+    user_input = f"""
 Question:
 {query}
 
 Context:
-{context}
-"""
-            }
-        ]
-    )
+{context or ""}
+""".strip()
 
-    return response.output_text or FALLBACK_NO_DATA_ANSWER
+    try:
+        response = requests.post(
+            url,
+            json={
+                "user_input": user_input,
+                "history": [],
+                "backend_context": {}
+            },
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": BRIDGEOS_API_KEY
+            },
+            timeout=180
+        )
+
+        print("RUNPOD LLM DEBUG: url:", url)
+        print("RUNPOD LLM DEBUG: status:", response.status_code)
+        print("RUNPOD LLM DEBUG: response:", response.text[:500])
+
+        if response.status_code >= 400:
+            return FALLBACK_NO_DATA_ANSWER
+
+        data = response.json()
+
+        return (
+            data.get("response")
+            or data.get("answer")
+            or FALLBACK_NO_DATA_ANSWER
+        )
+
+    except Exception as e:
+        print("RUNPOD LLM REQUEST ERROR:", type(e).__name__, str(e))
+        return FALLBACK_NO_DATA_ANSWER
