@@ -7,7 +7,6 @@ from pydantic import BaseModel, EmailStr
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 from app.config import FRONTEND_ORIGINS, BUCKET_NAME
-from app.embeddings import embed
 
 from app.auth import get_user
 from app import services
@@ -42,9 +41,6 @@ class SignupAdminRequest(BaseModel):
 
 class AuthorizeAssetRequest(BaseModel):
     crew_id: str
-
-class EmbedRequest(BaseModel):
-    input: str
 
 class LoginClientGeo(BaseModel):
     latitude: Optional[float] = None
@@ -501,19 +497,6 @@ async def confirm_forgot_password(body: ConfirmForgotPasswordRequest):
         new_password=body.password
     )
 
-
-@app.post("/api/bridgeos/embed")
-def bridgeos_embed(
-    request: EmbedRequest,
-    x_api_key: str = Header(None)
-):
-    verify_api_key("bridgeos", x_api_key)
-
-    embedding = embed(request.input or "")
-
-    return {
-        "embedding": embedding
-    }
 # ------------------------
 # LIST MY ACCESSIBLE DOCUMENTS
 # ------------------------

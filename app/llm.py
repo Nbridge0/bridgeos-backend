@@ -12,45 +12,27 @@ def ask_llm(query: str, context: str) -> str:
     """
     BridgeOS LLM adapter.
 
-    IMPORTANT:
-    This keeps all existing BridgeOS logic in services.py.
-    services.py still handles:
-    - document retrieval
-    - uploaded-file logic
-    - sources
-    - metadata/file listing
-    - invoice rules
-    - memory-aware retrieval
-    - fallback rules
+    This keeps the existing BridgeOS logic in services.py.
+    services.chat() still handles retrieval, permissions, uploaded files,
+    sources, metadata logic, invoice logic, and JSON parsing.
 
-    This function only replaces the old OpenAI call with RunPod.
+    This function only replaces the old OpenAI call with RunPod generation.
     """
 
     if not RUNPOD_BASE_URL:
-        print("RUNPOD LLM ERROR: RUNPOD_BASE_URL missing")
+        print("RUNPOD GENERATE ERROR: RUNPOD_BASE_URL missing")
         return FALLBACK_NO_DATA_ANSWER
 
     if not BRIDGEOS_API_KEY:
-        print("RUNPOD LLM ERROR: BRIDGEOS_API_KEY missing")
+        print("RUNPOD GENERATE ERROR: BRIDGEOS_API_KEY missing")
         return FALLBACK_NO_DATA_ANSWER
 
-    url = f"{RUNPOD_BASE_URL.rstrip('/')}/api/bridgeos/chat"
+    url = f"{RUNPOD_BASE_URL.rstrip('/')}/api/bridgeos/generate"
 
-    system_rules = """
-You are BridgeOS, a secure yacht documentation assistant.
-
-Always respond in British English.
-
-Follow the user's provided instructions exactly.
-If the user asks you to return JSON only, return JSON only.
-If document context is provided, use only that context.
-Do not invent facts, files, procedures, amounts, dates, names, or sources.
-""".strip()
-
-    user_input = f"""
+    prompt = f"""
 {context or ""}
 
-User request:
+Current user request:
 {query}
 """.strip()
 
@@ -58,14 +40,7 @@ User request:
         response = requests.post(
             url,
             json={
-                "user_input": user_input,
-                "history": [
-                    {
-                        "role": "system",
-                        "content": system_rules
-                    }
-                ],
-                "backend_context": {}
+                "prompt": prompt
             },
             headers={
                 "Content-Type": "application/json",
@@ -74,9 +49,9 @@ User request:
             timeout=180
         )
 
-        print("RUNPOD LLM DEBUG: url:", url)
-        print("RUNPOD LLM DEBUG: status:", response.status_code)
-        print("RUNPOD LLM DEBUG: response:", response.text[:500])
+        print("RUNPOD GENERATE DEBUG: url:", url)
+        print("RUNPOD GENERATE DEBUG: status:", response.status_code)
+        print("RUNPOD GENERATE DEBUG: response:", response.text[:500])
 
         if response.status_code >= 400:
             return FALLBACK_NO_DATA_ANSWER
@@ -98,5 +73,5 @@ User request:
         return answer
 
     except Exception as e:
-        print("RUNPOD LLM REQUEST ERROR:", type(e).__name__, str(e))
+        print("RUNPOD GENERATE REQUEST ERROR:", type(e).__name__, str(e))
         return FALLBACK_NO_DATA_ANSWER
