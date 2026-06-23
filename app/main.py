@@ -1468,9 +1468,11 @@ async def chat_api(
     print("CHAT DEBUG: security_level:", crew["security_level"])
     print("CHAT DEBUG: query:", query)
 
-    return services.chat_with_runpod_bridgeos(
+    return services.chat(
         query=query,
-        crew=crew,
+        crew_id=crew["id"],
+        yacht_id=crew["yacht_id"],
+        security_level=crew["security_level"],
         chat_id=body.chat_id,
         uploaded_asset_id=body.uploaded_asset_id
     )

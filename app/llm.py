@@ -9,6 +9,23 @@ FALLBACK_NO_DATA_ANSWER = (
 
 
 def ask_llm(query: str, context: str) -> str:
+    """
+    BridgeOS LLM adapter.
+
+    IMPORTANT:
+    This keeps all existing BridgeOS logic in services.py.
+    services.py still handles:
+    - document retrieval
+    - uploaded-file logic
+    - sources
+    - metadata/file listing
+    - invoice rules
+    - memory-aware retrieval
+    - fallback rules
+
+    This function only replaces the old OpenAI call with RunPod.
+    """
+
     if not RUNPOD_BASE_URL:
         print("RUNPOD LLM ERROR: RUNPOD_BASE_URL missing")
         return FALLBACK_NO_DATA_ANSWER
@@ -19,12 +36,22 @@ def ask_llm(query: str, context: str) -> str:
 
     url = f"{RUNPOD_BASE_URL.rstrip('/')}/api/bridgeos/chat"
 
-    user_input = f"""
-Question:
-{query}
+    system_rules = """
+You are BridgeOS, a secure yacht documentation assistant.
 
-Context:
+Always respond in British English.
+
+Follow the user's provided instructions exactly.
+If the user asks you to return JSON only, return JSON only.
+If document context is provided, use only that context.
+Do not invent facts, files, procedures, amounts, dates, names, or sources.
+""".strip()
+
+    user_input = f"""
 {context or ""}
+
+User request:
+{query}
 """.strip()
 
     try:
@@ -32,7 +59,12 @@ Context:
             url,
             json={
                 "user_input": user_input,
-                "history": [],
+                "history": [
+                    {
+                        "role": "system",
+                        "content": system_rules
+                    }
+                ],
                 "backend_context": {}
             },
             headers={
@@ -51,11 +83,19 @@ Context:
 
         data = response.json()
 
-        return (
+        answer = (
             data.get("response")
             or data.get("answer")
-            or FALLBACK_NO_DATA_ANSWER
+            or data.get("message")
+            or ""
         )
+
+        answer = str(answer or "").strip()
+
+        if not answer:
+            return FALLBACK_NO_DATA_ANSWER
+
+        return answer
 
     except Exception as e:
         print("RUNPOD LLM REQUEST ERROR:", type(e).__name__, str(e))
