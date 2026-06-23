@@ -5739,9 +5739,8 @@ def chat(
     - Searches accessible uploaded yacht assets.
     - Supports uploaded chat files.
     - Uses semantic retrieval plus keyword/file-name fallback.
-    - Keeps sources when document context is used.
-    - Calls RunPod through ask_llm().
-    - Allows normal greetings/general questions when no document context exists.
+    - Shows sources ONLY when the final answer actually used document context.
+    - Allows normal greetings/general questions without showing sources.
     - Does not invent yacht-specific private data.
     """
 
@@ -5905,36 +5904,6 @@ def chat(
         matched_rows = []
         context = ""
 
-        if resolved_uploaded_asset_id:
-            uploaded_result = answer_from_uploaded_chat_asset(
-                query=query,
-                context=context,
-                matched_rows=matched_rows
-            )
-
-            answer = uploaded_result["answer"]
-            sources = uploaded_result["sources"]
-
-            supabase.table("messages").insert({
-                "chat_id": chat_id,
-                "yacht_id": yacht_id,
-                "crew_id": crew_id,
-                "role": "assistant",
-                "content": answer,
-                "sources": sources
-            }).execute()
-
-            supabase.table("chats").update({
-                "updated_at": "now()"
-            }).eq("id", chat_id).eq("crew_id", crew_id).eq("yacht_id", yacht_id).execute()
-
-            return {
-                "answer": answer,
-                "sources": sources,
-                "uploaded_asset_id": resolved_uploaded_asset_id,
-                "mode": "uploaded_chat_asset"
-            }
-
     if resolved_uploaded_asset_id:
         uploaded_result = answer_from_uploaded_chat_asset(
             query=query,
@@ -5973,6 +5942,10 @@ or:
 
 Rules:
 - If the context directly answers the user's question, answer from the context and set "document_used": true.
+- If the context contains invoice, receipt, quote, statement, purchase order, or financial values, you may calculate from the visible context values.
+- If calculating, show arithmetic briefly in the answer.
+- Do not invent missing invoice values.
+- If required numbers are missing, say exactly which numbers are missing.
 - If the answer is a normal general answer, greeting, maths, explanation, or anything not based on the uploaded context, set "document_used": false.
 - If the user asks for yacht-specific private information that is not in the context, answer exactly:
 {FALLBACK_NO_DATA_ANSWER}
@@ -5986,7 +5959,10 @@ Rules:
 
 Source numbering:
 The uploaded document context is built from matched_rows in order.
-Source number 1 means matched_rows[0], source number 2 means matched_rows[1], etc.
+Source number 1 means matched_rows[0].
+Source number 2 means matched_rows[1].
+Source number 3 means matched_rows[2].
+Continue the same pattern for later sources.
 
 User question:
 {query}
@@ -5994,54 +5970,58 @@ User question:
 Uploaded document context:
 {context}
 """.strip()
-    )
+        )
 
-    parsed = parse_llm_json_response(raw_answer)
+        parsed = parse_llm_json_response(raw_answer)
 
-    document_used = False
-    used_source_numbers = []
-
-    if parsed and isinstance(parsed, dict):
-        answer = str(parsed.get("answer") or "").strip()
-        document_used = bool(parsed.get("document_used"))
-
-        raw_used_numbers = parsed.get("used_source_numbers") or []
-
-        if isinstance(raw_used_numbers, list):
-            for number in raw_used_numbers:
-                try:
-                    number = int(number)
-                    if number > 0:
-                        used_source_numbers.append(number)
-                except Exception:
-                    pass
-    else:
-        print("LOCAL CHAT JSON SOURCE PARSE FAILED:", str(raw_answer)[:500])
-        answer = str(raw_answer or "").strip() or FALLBACK_NO_DATA_ANSWER
         document_used = False
         used_source_numbers = []
 
-    if not answer:
-        answer = FALLBACK_NO_DATA_ANSWER
-        document_used = False
-        used_source_numbers = []
+        if parsed and isinstance(parsed, dict):
+            answer = str(parsed.get("answer") or "").strip()
+            document_used = bool(parsed.get("document_used"))
 
-    if answer.strip() == FALLBACK_NO_DATA_ANSWER:
-        document_used = False
-        used_source_numbers = []
+            raw_used_numbers = parsed.get("used_source_numbers") or []
 
-    if document_used:
-        source_rows = []
+            if isinstance(raw_used_numbers, list):
+                for number in raw_used_numbers:
+                    try:
+                        number = int(number)
 
-        for source_number in used_source_numbers:
-            index = source_number - 1
+                        if number > 0:
+                            used_source_numbers.append(number)
 
-            if 0 <= index < len(matched_rows):
-                source_rows.append(matched_rows[index])
+                    except Exception:
+                        pass
 
-        sources = build_sources_from_asset_results(source_rows)
-    else:
-        sources = []
+        else:
+            print("LOCAL CHAT JSON SOURCE PARSE FAILED:", str(raw_answer)[:500])
+            answer = str(raw_answer or "").strip() or FALLBACK_NO_DATA_ANSWER
+            document_used = False
+            used_source_numbers = []
+
+        if not answer:
+            answer = FALLBACK_NO_DATA_ANSWER
+            document_used = False
+            used_source_numbers = []
+
+        if answer.strip() == FALLBACK_NO_DATA_ANSWER:
+            document_used = False
+            used_source_numbers = []
+
+        if document_used:
+            source_rows = []
+
+            for source_number in used_source_numbers:
+                index = source_number - 1
+
+                if 0 <= index < len(matched_rows):
+                    source_rows.append(matched_rows[index])
+
+            sources = build_sources_from_asset_results(source_rows)
+        else:
+            sources = []
+
     else:
         raw_answer = ask_llm(
             query=query,
