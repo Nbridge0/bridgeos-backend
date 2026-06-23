@@ -3692,26 +3692,56 @@ def process_uploaded_asset(
         if file_type == "pdf":
             should_run_pdf_ocr = False
 
-            # Scanned invoices often return almost no text from pypdf.
-            if not extracted_text or len(extracted_text.strip()) < 80:
+            extracted_clean = (extracted_text or "").strip()
+            digit_count = sum(char.isdigit() for char in extracted_clean)
+
+            # Scanned PDFs often return little or no text.
+            if len(extracted_clean) < 150:
                 should_run_pdf_ocr = True
 
-            # Also run OCR if the text looks weak for invoice calculations.
-            digit_count = sum(char.isdigit() for char in extracted_text or "")
-            if digit_count < 5:
+            # Invoices/receipts usually contain several numbers.
+            # If almost no numbers were extracted, OCR is needed.
+            if digit_count < 8:
+                should_run_pdf_ocr = True
+
+            # Also run OCR for likely financial files by filename.
+            # This is generic, not vendor-specific.
+            lower_filename = (filename or "").lower()
+            financial_file_words = [
+                "invoice",
+                "receipt",
+                "quote",
+                "statement",
+                "purchase",
+                "order",
+                "bill",
+                "payment",
+                "tax",
+                "vat",
+            ]
+
+            if any(word in lower_filename for word in financial_file_words):
                 should_run_pdf_ocr = True
 
             if should_run_pdf_ocr:
                 file.seek(0)
+
                 pdf_ocr_text = extract_ocr_from_pdf_pages(
                     file=file,
                     filename=filename,
-                    max_pages=8
+                    max_pages=12
                 )
 
                 pdf_ocr_text = clean_text_for_postgres(pdf_ocr_text)
 
                 if pdf_ocr_text:
+                    if extracted_text:
+                        extracted_text = clean_text_for_postgres(
+                            f"{extracted_text}\n\nPDF OCR fallback text:\n{pdf_ocr_text}"
+                        )
+                    else:
+                        extracted_text = pdf_ocr_text
+
                     ocr_text = pdf_ocr_text
 
         if file_type == "image":
@@ -4128,6 +4158,68 @@ def build_sources_from_asset_results(results: list[dict]) -> list[dict]:
 
     return sources
 
+def is_bad_uploaded_file_answer(answer: str, query: str) -> bool:
+    """
+    Generic quality guard for uploaded-file answers.
+    Prevents lazy, one-word, vague, or non-answer replies.
+    No content hard-coding.
+    """
+
+    clean_answer = (answer or "").strip()
+    clean_query = (query or "").strip().lower()
+
+    if not clean_answer:
+        return True
+
+    lower_answer = clean_answer.lower().strip(" .,!?\n\t")
+
+    bad_short_answers = {
+        "good",
+        "bad",
+        "yes",
+        "no",
+        "maybe",
+        "ok",
+        "okay",
+        "fine",
+        "unclear",
+        "not sure",
+    }
+
+    if lower_answer in bad_short_answers:
+        return True
+
+    if len(clean_answer.split()) < 8:
+        return True
+
+    vague_phrases = [
+        "the uploaded file appears",
+        "the uploaded file is",
+        "the image appears",
+        "the image is",
+    ]
+
+    asks_specific_followup = any(
+        phrase in clean_query
+        for phrase in [
+            "what type",
+            "what kind",
+            "why",
+            "is this good",
+            "good or no",
+            "tell me more",
+            "explain",
+            "calculate",
+            "how much",
+            "total",
+        ]
+    )
+
+    if asks_specific_followup and any(clean_answer.lower().startswith(p) for p in vague_phrases):
+        return True
+
+    return False
+
 def answer_from_uploaded_chat_asset(
     query: str,
     context: str,
@@ -4141,6 +4233,7 @@ def answer_from_uploaded_chat_asset(
     """
 
     clean_context = (context or "").strip()
+    clean_query = (query or "").strip()
 
     if not clean_context:
         return {
@@ -4151,41 +4244,50 @@ def answer_from_uploaded_chat_asset(
             "sources": []
         }
 
-    try:
-        answer = ask_llm(
-            query=query,
-            context=f"""
+    prompt = f"""
 You are BridgeOS.
 
-The user uploaded a file/photo/document inside this chatbot and is asking about that uploaded file.
+The user uploaded a file, photo, image, PDF, invoice, receipt, quote, purchase order, or document inside this chatbot.
 
-Answer the user's CURRENT QUESTION directly using ONLY the uploaded file context.
+You must answer the user's CURRENT QUESTION directly using ONLY the uploaded file context below.
 
-Critical response rules:
-- Do not repeat the whole image description unless the user asks for a full description.
-- Do not start with "The uploaded file appears..." unless the user asks generally what it is.
-- If the user asks a specific question, answer that specific question first.
-- Keep the answer concise.
+Core rules:
+- Answer the CURRENT QUESTION first.
+- Do not repeat the whole uploaded-file description unless the user asks for a full description.
+- Do not give one-word answers.
+- Do not answer only "Good", "Bad", "Yes", "No", "Maybe", or similar.
+- Give the reason for your answer.
+- Keep the answer concise but useful.
 - Use British English.
 - Do not use Yacht Documentation.
-- Do not search other documents.
-- Do not use the admin-upload fallback in this uploaded-file mode.
+- Do not search other files.
+- Do not use the fallback admin-upload answer in this mode.
+
+If the user asks whether something is "good":
+- Explain that "good" depends on the intended use if the user did not specify the use.
+- Give a cautious visible-evidence-based answer.
+- Mention visible strengths and visible limitations.
+- Do not pretend to know condition, price, build quality, engine condition, survey result, safety status, or suitability unless visible/readable in the uploaded context.
+
+If the user asks what type or kind something is:
+- Give the broad visible type/category.
+- Explain the visible evidence.
+- If exact make/model is not visible, say that clearly.
+- Do not invent make, model, brand, location, vessel name, or technical specs.
 
 Image rules:
 - Use the stored visual analysis as evidence.
-- You may classify a visible object type if the visual context supports it.
-- Use cautious wording when exact type/model is not visible.
-- Never invent make, model, brand, vessel name, location, logo, text, number, or financial value.
-- If the exact make/model cannot be determined, say that briefly.
-- If the user asks "what kind/type of boat is it", answer from visible vessel structure, for example broad type/category, not exact make/model unless visible.
+- Classify only from visible structure.
+- Never invent text, numbers, names, brands, logos, locations, or identities.
+- If the stored context is too weak to answer exactly, say what can be determined and what cannot.
 
 OCR/text rules:
-- OCR text is only reliable if it lists written text.
-- If OCR text describes the image instead of written text, ignore it.
+- OCR is reliable only if it lists written text.
+- If OCR describes the scene instead of written text, ignore it.
 - Never claim text is visible unless it appears in the uploaded context.
 
-Invoice/calculation rules:
-- If the uploaded file is an invoice, receipt, quote, statement, purchase order, or financial document, extract visible supplier, invoice number, date, line items, quantities, unit prices, subtotal, VAT/tax, total, and currency when present.
+Invoice and calculation rules:
+- If the uploaded file is an invoice, receipt, quote, statement, purchase order, or financial document, extract visible supplier, invoice number, dates, line items, quantities, unit prices, subtotal, VAT/tax, total, and currency when present.
 - If the user asks for a calculation, calculate only from numbers visible in the uploaded context.
 - Show the arithmetic briefly.
 - Do not invent missing invoice values.
@@ -4193,16 +4295,58 @@ Invoice/calculation rules:
 - Do not say you cannot calculate if all required numbers are visible in the uploaded context.
 
 User question:
-{query}
+{clean_query}
 
 Uploaded file context:
 {clean_context}
 
-Now answer the user's CURRENT QUESTION directly.
+Answer the CURRENT QUESTION directly.
 """.strip()
+
+    try:
+        answer = ask_llm(
+            query=clean_query,
+            context=prompt
         )
 
         answer = str(answer or "").strip()
+
+        if is_bad_uploaded_file_answer(answer, clean_query):
+            repair_prompt = f"""
+You previously gave a weak uploaded-file answer.
+
+Rewrite it.
+
+Rules:
+- Answer the user's CURRENT QUESTION directly.
+- Do not give a one-word answer.
+- Do not repeat the whole file description.
+- Give visible evidence from the uploaded context.
+- If the question is vague, explain the limitation and answer cautiously.
+- If the user asks whether something is good, explain good for what purpose and give visible pros/limits.
+- If exact details are not visible, say that clearly.
+- Use only the uploaded file context.
+- Use British English.
+- Plain text only.
+
+User question:
+{clean_query}
+
+Weak answer:
+{answer}
+
+Uploaded file context:
+{clean_context}
+
+Improved answer:
+""".strip()
+
+            answer = ask_llm(
+                query=clean_query,
+                context=repair_prompt
+            )
+
+            answer = str(answer or "").strip()
 
     except Exception as e:
         print("UPLOADED CHAT ASSET LLM ERROR:", type(e).__name__, str(e))
@@ -4210,7 +4354,7 @@ Now answer the user's CURRENT QUESTION directly.
 
     if not answer:
         answer = (
-            "I received the uploaded file, but I could not generate an analysis from it. "
+            "I can see the uploaded file context, but I could not generate a reliable answer from it. "
             "Please try again or check whether the file was processed successfully."
         )
 
