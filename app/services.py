@@ -24,9 +24,9 @@ from app.extractors import (
 from app.image_ai import (
     describe_image,
     extract_ocr_from_image,
+    extract_invoice_text_from_image,
     extract_ocr_from_pdf_pages
 )
-
 
 import time
 import uuid
@@ -3721,8 +3721,20 @@ def process_uploaded_asset(
             file.seek(0)
             ocr_text = extract_ocr_from_image(file, filename)
 
+            file.seek(0)
+            invoice_text = extract_invoice_text_from_image(file, filename)
+
             if ocr_text == "NO_READABLE_TEXT":
                 ocr_text = ""
+
+            if invoice_text == "NO_READABLE_TEXT":
+                invoice_text = ""
+
+            if invoice_text:
+                if ocr_text:
+                    ocr_text = f"{ocr_text}\n\nFinancial document extraction:\n{invoice_text}"
+                else:
+                    ocr_text = f"Financial document extraction:\n{invoice_text}"
 
             visual_description = clean_text_for_postgres(visual_description)
             ocr_text = clean_text_for_postgres(ocr_text)
@@ -4125,7 +4137,7 @@ def answer_from_uploaded_chat_asset(
     Special mode for files/photos/docs uploaded inside the chatbot.
 
     This is NOT Yacht Documentation search.
-    This answers only from the file the user just uploaded in the chat.
+    This answers only from the file the user uploaded in the chat.
     """
 
     clean_context = (context or "").strip()
@@ -4133,7 +4145,7 @@ def answer_from_uploaded_chat_asset(
     if not clean_context:
         return {
             "answer": (
-                "I received the uploaded file, but I could not read or analyze its contents yet. "
+                "I received the uploaded file, but I could not read or analyse its contents yet. "
                 "Please try uploading it again, or check the backend processing_error for this asset."
             ),
             "sources": []
@@ -4145,41 +4157,48 @@ def answer_from_uploaded_chat_asset(
             context=f"""
 You are BridgeOS.
 
-The user just uploaded a file/photo/document inside the chatbot and asked a question about it.
+The user uploaded a file/photo/document inside this chatbot and is asking about that uploaded file.
 
-You must answer using ONLY the uploaded file context below.
+Answer the user's CURRENT QUESTION directly using ONLY the uploaded file context.
 
-Important rules:
-- This is a chatbot upload, not Yacht Documentation.
-- Do NOT say "Please ask your admin to upload it" because the user already uploaded it.
-- Do NOT search other yacht documents.
-- Do NOT use general knowledge unless it is only to describe what is visible/readable in the uploaded file.
-- If it is a photo, use "Image visual description" and "OCR text" if available.
-- If it is a document, use "Extracted document text" if available.
-- If the uploaded file is an invoice, receipt, quote, statement, or purchase order, extract the visible financial fields.
-- If the user asks for calculations, calculate directly from the visible extracted values.
-- Show the arithmetic you used, for example: subtotal + tax = total.
-- If a number needed for the calculation is missing or unreadable, say exactly which value is missing.
-- Do not say you cannot calculate if the visible text contains the numbers needed.
-- If the user asks "what is this about?", summarise what the uploaded file/photo appears to contain.
-- If the user asks to analyse it, analyse only what is visible or written in the uploaded file.
-- If the uploaded context is weak, say exactly what you can see/read and say what is unclear.
-- Never use the fallback "Sorry, I don't have this data yet. Please ask your admin to upload it." in this uploaded-file mode.
-- Analyze images normally, but never invent objects, names, locations, text, logos, values, or numbers.
-- OCR text may be unreliable. If OCR text describes the image instead of listing visible written text, ignore that OCR text.
-- Never claim that text is visible unless it appears in the uploaded context.
-- Never claim that invoice values, totals, VAT, prices, or quantities exist unless they appear in the uploaded context.
-- If the uploaded file is an invoice, receipt, quote, statement, purchase order, or financial document, extract supplier, invoice number, dates, line items, quantities, unit prices, subtotal, VAT/tax, total, and currency when visible.
+Critical response rules:
+- Do not repeat the whole image description unless the user asks for a full description.
+- Do not start with "The uploaded file appears..." unless the user asks generally what it is.
+- If the user asks a specific question, answer that specific question first.
+- Keep the answer concise.
+- Use British English.
+- Do not use Yacht Documentation.
+- Do not search other documents.
+- Do not use the admin-upload fallback in this uploaded-file mode.
+
+Image rules:
+- Use the stored visual analysis as evidence.
+- You may classify a visible object type if the visual context supports it.
+- Use cautious wording when exact type/model is not visible.
+- Never invent make, model, brand, vessel name, location, logo, text, number, or financial value.
+- If the exact make/model cannot be determined, say that briefly.
+- If the user asks "what kind/type of boat is it", answer from visible vessel structure, for example broad type/category, not exact make/model unless visible.
+
+OCR/text rules:
+- OCR text is only reliable if it lists written text.
+- If OCR text describes the image instead of written text, ignore it.
+- Never claim text is visible unless it appears in the uploaded context.
+
+Invoice/calculation rules:
+- If the uploaded file is an invoice, receipt, quote, statement, purchase order, or financial document, extract visible supplier, invoice number, date, line items, quantities, unit prices, subtotal, VAT/tax, total, and currency when present.
 - If the user asks for a calculation, calculate only from numbers visible in the uploaded context.
 - Show the arithmetic briefly.
-- If the numbers needed for the calculation are missing, say exactly which numbers are missing.
-- If the upload is not a financial document and has no relevant numbers, say that no calculation can be performed from the visible content.
+- Do not invent missing invoice values.
+- If required numbers are missing or unreadable, say exactly which values are missing.
+- Do not say you cannot calculate if all required numbers are visible in the uploaded context.
 
 User question:
 {query}
 
 Uploaded file context:
 {clean_context}
+
+Now answer the user's CURRENT QUESTION directly.
 """.strip()
         )
 
@@ -4204,7 +4223,7 @@ Uploaded file context:
         "answer": answer,
         "sources": sources
     }
-
+    
 def get_asset_permissions(
     asset_id: str,
     admin_crew: dict
