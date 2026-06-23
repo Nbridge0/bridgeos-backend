@@ -24,7 +24,6 @@ from app.extractors import (
 from app.image_ai import (
     describe_image,
     extract_ocr_from_image,
-    extract_invoice_text_from_image,
     extract_ocr_from_pdf_pages
 )
 
