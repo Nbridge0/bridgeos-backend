@@ -9,23 +9,13 @@ FALLBACK_NO_DATA_ANSWER = (
 
 
 def ask_llm(query: str, context: str) -> str:
-    """
-    BridgeOS LLM adapter.
-
-    This keeps the existing BridgeOS logic in services.py.
-    services.chat() still handles retrieval, permissions, uploaded files,
-    sources, metadata logic, invoice logic, and JSON parsing.
-
-    This function only replaces the old OpenAI call with RunPod generation.
-    """
-
     if not RUNPOD_BASE_URL:
-        print("RUNPOD GENERATE ERROR: RUNPOD_BASE_URL missing")
-        return FALLBACK_NO_DATA_ANSWER
+        print("RUNPOD LLM ERROR: RUNPOD_BASE_URL missing")
+        return "RunPod config error: RUNPOD_BASE_URL missing"
 
     if not BRIDGEOS_API_KEY:
-        print("RUNPOD GENERATE ERROR: BRIDGEOS_API_KEY missing")
-        return FALLBACK_NO_DATA_ANSWER
+        print("RUNPOD LLM ERROR: BRIDGEOS_API_KEY missing")
+        return "RunPod config error: BRIDGEOS_API_KEY missing"
 
     url = f"{RUNPOD_BASE_URL.rstrip('/')}/api/bridgeos/generate"
 
@@ -51,10 +41,10 @@ Current user request:
 
         print("RUNPOD GENERATE DEBUG: url:", url)
         print("RUNPOD GENERATE DEBUG: status:", response.status_code)
-        print("RUNPOD GENERATE DEBUG: response:", response.text[:500])
+        print("RUNPOD GENERATE DEBUG: response:", response.text[:1000])
 
         if response.status_code >= 400:
-            return FALLBACK_NO_DATA_ANSWER
+            return f"RunPod generate error {response.status_code}: {response.text[:500]}"
 
         data = response.json()
 
@@ -68,10 +58,10 @@ Current user request:
         answer = str(answer or "").strip()
 
         if not answer:
-            return FALLBACK_NO_DATA_ANSWER
+            return "RunPod returned an empty response."
 
         return answer
 
     except Exception as e:
         print("RUNPOD GENERATE REQUEST ERROR:", type(e).__name__, str(e))
-        return FALLBACK_NO_DATA_ANSWER
+        return f"RunPod request error: {type(e).__name__}: {str(e)}"

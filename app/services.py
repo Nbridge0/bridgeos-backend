@@ -5680,7 +5680,7 @@ Strict rules:
 - If the document context contains the answer, answer only from that context.
 - If the user asks "what should I do in case of..." and the answer is in the SOP/context, extract the relevant procedure from the context and present it clearly.
 - If the user asks whether a document/procedure/report says something about a specific topic, object, operation, action, person, place, or requirement, only answer if that exact requested thing is explicitly present in the uploaded document context.
-- If the exact requested thing is not explicitly present in the uploaded document context, the answer must be exactly: "Sorry, I don't have this data yet. Please ask your admin to upload it."
+- If the requested thing is clearly not present in the uploaded document context, use the fallback answer. But if the context contains a relevant answer, answer from the context.
 - Do not answer by using a broader related section. Do not infer that a missing topic is covered by another topic.
 - If none of the requested information is explicitly found in the uploaded document context, or if the user asks about a specific topic that is not explicitly named or clearly described in the context, the answer must be exactly: "Sorry, I don't have this data yet. Please ask your admin to upload it."
 - When using that fallback answer, set "document_used": false, "used_source_numbers": [], and "used_source_titles": [].
@@ -5800,9 +5800,32 @@ Uploaded document context:
         else:
             sources = []
 
-    else:
-        answer = FALLBACK_NO_DATA_ANSWER
-        sources = []
+        else:
+            raw_answer = ask_llm(
+                query=query,
+                context=f"""
+You are BridgeOS, a helpful yacht assistant.
+
+Always respond in British English.
+
+There was no matching uploaded yacht document context for this message.
+
+Rules:
+- If the user is greeting you, reply normally and briefly.
+- If the user asks a general non-document question, answer helpfully.
+- If the user asks specifically about private yacht documents, files, procedures, manuals, invoices, uploaded data, guest preferences, owner information, crew data, or yacht-specific records, say exactly:
+{FALLBACK_NO_DATA_ANSWER}
+- Do not invent yacht-specific private data.
+- Do not claim you used a document.
+- Return plain text only.
+
+    User question:
+    {query}
+    """.strip()
+            )
+
+            answer = str(raw_answer or "").strip() or FALLBACK_NO_DATA_ANSWER
+            sources = []
 
     supabase.table("messages").insert({
         "chat_id": chat_id,
