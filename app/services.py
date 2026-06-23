@@ -5800,10 +5800,10 @@ Uploaded document context:
         else:
             sources = []
 
-        else:
-            raw_answer = ask_llm(
-                query=query,
-                context=f"""
+    else:
+        raw_answer = ask_llm(
+            query=query,
+            context=f"""
 You are BridgeOS, a helpful yacht assistant.
 
 Always respond in British English.
@@ -5819,13 +5819,13 @@ Rules:
 - Do not claim you used a document.
 - Return plain text only.
 
-    User question:
-    {query}
-    """.strip()
-            )
+User question:
+{query}
+""".strip()
+        )
 
-            answer = str(raw_answer or "").strip() or FALLBACK_NO_DATA_ANSWER
-            sources = []
+        answer = str(raw_answer or "").strip() or FALLBACK_NO_DATA_ANSWER
+        sources = []
 
     supabase.table("messages").insert({
         "chat_id": chat_id,
