@@ -5825,6 +5825,33 @@ def verified_source_rows_from_llm_result(parsed, matched_rows):
 
     return verified_rows
 
+def build_numbered_context_from_asset_results(rows):
+    parts = []
+
+    for index, row in enumerate(rows or [], start=1):
+        file_name = (
+            row.get("original_file_name")
+            or row.get("file_name")
+            or row.get("title")
+            or "Unknown source"
+        )
+
+        content = row.get("content") or row.get("text") or ""
+
+        if not str(content).strip():
+            continue
+
+        parts.append(
+            f"""
+[SOURCE {index}]
+File: {file_name}
+Content:
+{str(content).strip()}
+""".strip()
+        )
+
+    return "\n\n---\n\n".join(parts)
+
 def chat(
     query: str,
     crew_id: str,
@@ -5837,11 +5864,16 @@ def chat(
     Secure BridgeOS chat.
 
     Sources are shown ONLY when:
-    - the LLM says it used document context
-    - it provides an exact evidence quote
-    - the backend verifies that quote exists inside the exact matched source row
+    - the final answer is taken from document context
+    - the LLM sets document_used=true
+    - the LLM gives exact source numbers from the numbered context
 
-    This prevents random retrieved documents from appearing as sources.
+    Sources are NOT shown for:
+    - greetings
+    - general questions
+    - small talk
+    - answers not based on uploaded yacht documents
+    - fallback answers
     """
 
     chat_row = verify_chat_access(
@@ -6019,12 +6051,7 @@ You MUST return ONLY valid JSON in this exact shape:
 {{
   "answer": "clear user-facing answer with a brief explanation when useful",
   "document_used": true,
-  "used_sources": [
-    {{
-      "source_number": 1,
-      "evidence_quote": "exact short quote copied from that source which supports the answer"
-    }}
-  ]
+  "used_source_numbers": [1]
 }}
 
 or:
@@ -6032,21 +6059,21 @@ or:
 {{
   "answer": "clear user-facing answer with a brief explanation when useful",
   "document_used": false,
-  "used_sources": []
+  "used_source_numbers": []
 }}
 
 Strict rules:
 - The answer should be natural and helpful, not just a number.
 - If the user asks "how much", include the amount and a short explanation of what it refers to.
-- Use a source ONLY if that exact source contains the information used in the answer.
-- The evidence_quote MUST be copied exactly from the SOURCE content.
-- Do not use a source just because it was retrieved.
+- Set "document_used": true ONLY if the final answer is taken from the uploaded document context.
+- Set "document_used": false for greetings, general questions, maths, small talk, or anything not based on the uploaded document context.
+- Use "used_source_numbers" ONLY for the source numbers that directly support the answer.
+- Do not include a source number just because the file was retrieved.
 - Do not guess source numbers.
-- If the source does not directly support the answer, set "document_used": false.
-- If the answer is a normal greeting, general question, maths, explanation, or not based on the uploaded context, set "document_used": false.
+- If no source directly supports the answer, set "document_used": false and "used_source_numbers": [].
 - If the user asks about yacht-specific private information and the context does not clearly contain the answer, answer exactly:
 {FALLBACK_NO_DATA_ANSWER}
-- If the answer is the fallback answer, set "document_used": false and "used_sources": [].
+- If the answer is the fallback answer, set "document_used": false and "used_source_numbers": [].
 - Do not invent yacht-specific private data.
 - Do not include document names or references inside the answer. The frontend will show sources separately.
 - Return JSON only. Do not wrap it in markdown.
@@ -6056,7 +6083,7 @@ Financial rules:
 - If calculating, show the arithmetic briefly.
 - Do not invent missing values.
 - If required numbers are missing, say exactly which numbers are missing.
-- The evidence_quote must include the relevant item/value text from the source.
+- If the amount comes from a document, set "document_used": true and include the exact source number.
 
 User question:
 {query}
@@ -6073,20 +6100,41 @@ Uploaded document context:
 
         if parsed and isinstance(parsed, dict):
             answer = str(parsed.get("answer") or "").strip()
+            document_used = bool(parsed.get("document_used"))
 
-            verified_source_rows = verified_source_rows_from_llm_result(
-                parsed=parsed,
-                matched_rows=matched_rows
-            )
+            raw_used_source_numbers = parsed.get("used_source_numbers") or []
+            used_source_numbers = []
 
-            document_used = bool(parsed.get("document_used")) and len(verified_source_rows) > 0
+            if isinstance(raw_used_source_numbers, list):
+                for number in raw_used_source_numbers:
+                    try:
+                        number = int(number)
+
+                        if number > 0:
+                            used_source_numbers.append(number)
+
+                    except Exception:
+                        pass
+
+            if not answer:
+                answer = FALLBACK_NO_DATA_ANSWER
+                document_used = False
+                used_source_numbers = []
 
             if answer.strip() == FALLBACK_NO_DATA_ANSWER:
                 document_used = False
-                verified_source_rows = []
+                used_source_numbers = []
 
-            if document_used:
-                sources = build_sources_from_asset_results(verified_source_rows)
+            if document_used and used_source_numbers:
+                source_rows = []
+
+                for source_number in used_source_numbers:
+                    index = source_number - 1
+
+                    if 0 <= index < len(matched_rows):
+                        source_rows.append(matched_rows[index])
+
+                sources = build_sources_from_asset_results(source_rows)
             else:
                 sources = []
 
