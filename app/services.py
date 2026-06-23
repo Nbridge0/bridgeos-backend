@@ -3721,6 +3721,9 @@ def process_uploaded_asset(
             file.seek(0)
             ocr_text = extract_ocr_from_image(file, filename)
 
+            if ocr_text == "NO_READABLE_TEXT":
+                ocr_text = ""
+
             visual_description = clean_text_for_postgres(visual_description)
             ocr_text = clean_text_for_postgres(ocr_text)
 
@@ -4162,6 +4165,15 @@ Important rules:
 - If the user asks to analyse it, analyse only what is visible or written in the uploaded file.
 - If the uploaded context is weak, say exactly what you can see/read and say what is unclear.
 - Never use the fallback "Sorry, I don't have this data yet. Please ask your admin to upload it." in this uploaded-file mode.
+- Analyze images normally, but never invent objects, names, locations, text, logos, values, or numbers.
+- OCR text may be unreliable. If OCR text describes the image instead of listing visible written text, ignore that OCR text.
+- Never claim that text is visible unless it appears in the uploaded context.
+- Never claim that invoice values, totals, VAT, prices, or quantities exist unless they appear in the uploaded context.
+- If the uploaded file is an invoice, receipt, quote, statement, purchase order, or financial document, extract supplier, invoice number, dates, line items, quantities, unit prices, subtotal, VAT/tax, total, and currency when visible.
+- If the user asks for a calculation, calculate only from numbers visible in the uploaded context.
+- Show the arithmetic briefly.
+- If the numbers needed for the calculation are missing, say exactly which numbers are missing.
+- If the upload is not a financial document and has no relevant numbers, say that no calculation can be performed from the visible content.
 
 User question:
 {query}
@@ -5672,6 +5684,11 @@ Use the uploaded yacht document context below when it is relevant.
 
 Rules:
 - If the context answers the user's question, answer from the context.
+- If the context contains invoice, receipt, quote, statement, purchase order, or financial values, you may calculate from the visible context values.
+- Show arithmetic briefly when calculating.
+- Do not invent missing invoice values.
+- If required numbers are missing, say exactly which numbers are missing.
+- Do not claim a document contains totals, VAT, prices, or quantities unless they appear in the context.
 - If the user asks a normal general question or greeting, answer normally.
 - If the user asks for yacht-specific private information that is not in the context, say:
 {FALLBACK_NO_DATA_ANSWER}
