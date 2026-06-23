@@ -6068,6 +6068,7 @@ Strict rules:
 - Set "document_used": true ONLY if the final answer is taken from the uploaded document context.
 - Set "document_used": false for greetings, general questions, maths, small talk, or anything not based on the uploaded document context.
 - Use "used_source_numbers" ONLY for the source numbers that directly support the answer.
+- If you set "document_used": true, you MUST include at least one number in "used_source_numbers".
 - Do not include a source number just because the file was retrieved.
 - Do not guess source numbers.
 - If no source directly supports the answer, set "document_used": false and "used_source_numbers": [].
@@ -6125,14 +6126,20 @@ Uploaded document context:
                 document_used = False
                 used_source_numbers = []
 
-            if document_used and used_source_numbers:
+            if document_used:
                 source_rows = []
 
-                for source_number in used_source_numbers:
-                    index = source_number - 1
+                if used_source_numbers:
+                    for source_number in used_source_numbers:
+                        index = source_number - 1
 
-                    if 0 <= index < len(matched_rows):
-                        source_rows.append(matched_rows[index])
+                        if 0 <= index < len(matched_rows):
+                            source_rows.append(matched_rows[index])
+
+                elif matched_rows:
+                    # LLM clearly used the document but forgot to return source numbers.
+                    # Use only the top matched row, not random top 3.
+                    source_rows = [matched_rows[0]]
 
                 sources = build_sources_from_asset_results(source_rows)
             else:
