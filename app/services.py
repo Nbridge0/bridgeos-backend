@@ -5696,7 +5696,33 @@ OCR text:
 
     return rows
  
+def parse_llm_json_response(raw_text: str) -> dict | None:
+    if not raw_text:
+        return None
 
+    text = str(raw_text).strip()
+
+    if text.startswith("```"):
+        text = text.strip("`").strip()
+
+        if text.lower().startswith("json"):
+            text = text[4:].strip()
+
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    start = text.find("{")
+    end = text.rfind("}")
+
+    if start == -1 or end == -1 or end <= start:
+        return None
+
+    try:
+        return json.loads(text[start:end + 1])
+    except Exception:
+        return None
 
 def chat(
     query: str,
@@ -5927,22 +5953,40 @@ You are BridgeOS, a helpful yacht assistant.
 
 Always respond in British English.
 
-Use the uploaded yacht document context below when it is relevant.
+You may use the uploaded yacht document context below, but ONLY when it directly answers the user's question.
+
+Return ONLY valid JSON in this exact shape:
+
+{{
+  "answer": "final user-facing answer here",
+  "document_used": true,
+  "used_source_numbers": [1]
+}}
+
+or:
+
+{{
+  "answer": "final user-facing answer here",
+  "document_used": false,
+  "used_source_numbers": []
+}}
 
 Rules:
-- If the context answers the user's question, answer from the context.
-- If the context contains invoice, receipt, quote, statement, purchase order, or financial values, you may calculate from the visible context values.
-- Show arithmetic briefly when calculating.
-- Do not invent missing invoice values.
-- If required numbers are missing, say exactly which numbers are missing.
-- Do not claim a document contains totals, VAT, prices, or quantities unless they appear in the context.
-- If the user asks a normal general question or greeting, answer normally.
-- If the user asks for yacht-specific private information that is not in the context, say:
+- If the context directly answers the user's question, answer from the context and set "document_used": true.
+- If the answer is a normal general answer, greeting, maths, explanation, or anything not based on the uploaded context, set "document_used": false.
+- If the user asks for yacht-specific private information that is not in the context, answer exactly:
 {FALLBACK_NO_DATA_ANSWER}
+- If the answer is the fallback answer, set "document_used": false and "used_source_numbers": [].
 - Do not invent yacht-specific private data.
-- Do not claim you used a document unless the answer is based on the context.
-- Do not add document references inside the answer. The frontend will show sources separately.
-- Return plain text only. Do not return JSON.
+- Do not claim you used a document unless the answer is directly based on the context.
+- Include in "used_source_numbers" ONLY the source numbers that directly support the answer.
+- Do not include retrieved files just because they were retrieved.
+- Do not include document references inside the answer. The frontend will show sources separately.
+- Return JSON only. Do not wrap it in markdown.
+
+Source numbering:
+The uploaded document context is built from matched_rows in order.
+Source number 1 means matched_rows[0], source number 2 means matched_rows[1], etc.
 
 User question:
 {query}
@@ -5950,15 +5994,54 @@ User question:
 Uploaded document context:
 {context}
 """.strip()
-        )
+    )
 
+    parsed = parse_llm_json_response(raw_answer)
+
+    document_used = False
+    used_source_numbers = []
+
+    if parsed and isinstance(parsed, dict):
+        answer = str(parsed.get("answer") or "").strip()
+        document_used = bool(parsed.get("document_used"))
+
+        raw_used_numbers = parsed.get("used_source_numbers") or []
+
+        if isinstance(raw_used_numbers, list):
+            for number in raw_used_numbers:
+                try:
+                    number = int(number)
+                    if number > 0:
+                        used_source_numbers.append(number)
+                except Exception:
+                    pass
+    else:
+        print("LOCAL CHAT JSON SOURCE PARSE FAILED:", str(raw_answer)[:500])
         answer = str(raw_answer or "").strip() or FALLBACK_NO_DATA_ANSWER
+        document_used = False
+        used_source_numbers = []
 
-        if answer.strip() == FALLBACK_NO_DATA_ANSWER:
-            sources = []
-        else:
-            sources = build_sources_from_asset_results(matched_rows[:3])
+    if not answer:
+        answer = FALLBACK_NO_DATA_ANSWER
+        document_used = False
+        used_source_numbers = []
 
+    if answer.strip() == FALLBACK_NO_DATA_ANSWER:
+        document_used = False
+        used_source_numbers = []
+
+    if document_used:
+        source_rows = []
+
+        for source_number in used_source_numbers:
+            index = source_number - 1
+
+            if 0 <= index < len(matched_rows):
+                source_rows.append(matched_rows[index])
+
+        sources = build_sources_from_asset_results(source_rows)
+    else:
+        sources = []
     else:
         raw_answer = ask_llm(
             query=query,
