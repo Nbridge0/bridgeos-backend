@@ -4220,16 +4220,110 @@ def is_bad_uploaded_file_answer(answer: str, query: str) -> bool:
 
     return False
 
+def is_weak_uploaded_answer(answer: str, query: str) -> bool:
+    """
+    Blocks lazy/caption-like answers for uploaded images/files.
+    """
+
+    clean_answer = (answer or "").strip()
+    clean_query = (query or "").strip().lower()
+
+    if not clean_answer:
+        return True
+
+    lower_answer = clean_answer.lower().strip()
+
+    if len(clean_answer.split()) < 12:
+        return True
+
+    bad_exact_answers = {
+        "good.",
+        "good",
+        "bad.",
+        "bad",
+        "yes.",
+        "yes",
+        "no.",
+        "no",
+        "maybe.",
+        "maybe",
+        "it depends.",
+        "it depends",
+    }
+
+    if lower_answer in bad_exact_answers:
+        return True
+
+    weak_starts = [
+        "the uploaded file is an image",
+        "the uploaded file appears",
+        "the image shows",
+        "the image appears",
+        "this image shows",
+        "based on the uploaded image, i can provide",
+        "based on the visual description",
+    ]
+
+    specific_question_markers = [
+        "is it good",
+        "is this good",
+        "good or no",
+        "recommend",
+        "buy",
+        "buying",
+        "what type",
+        "what kind",
+        "tell me more",
+        "why",
+        "calculate",
+        "total",
+        "how much",
+    ]
+
+    is_specific_question = any(marker in clean_query for marker in specific_question_markers)
+
+    if is_specific_question and any(lower_answer.startswith(start) for start in weak_starts):
+        return True
+
+    vague_phrases = [
+        "it is difficult to determine",
+        "cannot be determined",
+        "without more information",
+    ]
+
+    # This is only weak if it says limitation but gives no useful next step/evidence.
+    if is_specific_question:
+        has_vague = any(phrase in lower_answer for phrase in vague_phrases)
+        has_useful_next_step = any(
+            phrase in lower_answer
+            for phrase in [
+                "check",
+                "inspect",
+                "survey",
+                "engine",
+                "maintenance",
+                "price",
+                "condition",
+                "visible",
+                "evidence",
+                "before buying",
+            ]
+        )
+
+        if has_vague and not has_useful_next_step:
+            return True
+
+    return False
+
 def answer_from_uploaded_chat_asset(
     query: str,
     context: str,
     matched_rows: list[dict]
 ):
     """
-    Special mode for files/photos/docs uploaded inside the chatbot.
+    Answers questions about a file/photo/document uploaded inside the current chat.
 
-    This is NOT Yacht Documentation search.
-    This answers only from the file the user uploaded in the chat.
+    This function must behave like an assistant, not like an image-caption tool.
     """
 
     clean_context = (context or "").strip()
@@ -4244,55 +4338,51 @@ def answer_from_uploaded_chat_asset(
             "sources": []
         }
 
-    prompt = f"""
+    try:
+        answer = ask_llm(
+            query=clean_query,
+            context=f"""
 You are BridgeOS.
 
-The user uploaded a file, photo, image, PDF, invoice, receipt, quote, purchase order, or document inside this chatbot.
+The user is asking about a file/image/document they uploaded in this chat.
 
-You must answer the user's CURRENT QUESTION directly using ONLY the uploaded file context below.
+Your job:
+Answer the user's latest question directly, like a practical assistant.
 
-Core rules:
-- Answer the CURRENT QUESTION first.
-- Do not repeat the whole uploaded-file description unless the user asks for a full description.
-- Do not give one-word answers.
-- Do not answer only "Good", "Bad", "Yes", "No", "Maybe", or similar.
-- Give the reason for your answer.
-- Keep the answer concise but useful.
+Hard rules:
+- Do NOT behave like an image captioning model.
+- Do NOT start with "Based on the uploaded image" unless absolutely necessary.
+- Do NOT repeat the same visual description again and again.
+- Do NOT simply restate the uploaded context.
+- Do NOT give one-word answers.
+- Do NOT say only "good", "bad", "yes", or "no".
+- Do NOT invent facts.
+- Use only the uploaded file context.
 - Use British English.
-- Do not use Yacht Documentation.
-- Do not search other files.
-- Do not use the fallback admin-upload answer in this mode.
+- Plain text only.
 
-If the user asks whether something is "good":
-- Explain that "good" depends on the intended use if the user did not specify the use.
-- Give a cautious visible-evidence-based answer.
-- Mention visible strengths and visible limitations.
-- Do not pretend to know condition, price, build quality, engine condition, survey result, safety status, or suitability unless visible/readable in the uploaded context.
+For image questions:
+- Answer the actual question.
+- If the question asks what type/kind it is, give the broad visible category and evidence.
+- If the question asks whether it is good or recommended, explain that this cannot be confirmed from the image alone.
+- You may comment on visible design/use-case only.
+- You must NOT judge true condition, value, safety, seaworthiness, mechanical state, maintenance, survey status, or whether to buy unless those facts are visible/readable in the context.
+- If a buyer asks whether to buy it, say what the image suggests visually, then list what must be checked before buying.
 
-If the user asks what type or kind something is:
-- Give the broad visible type/category.
-- Explain the visible evidence.
-- If exact make/model is not visible, say that clearly.
-- Do not invent make, model, brand, location, vessel name, or technical specs.
-
-Image rules:
-- Use the stored visual analysis as evidence.
-- Classify only from visible structure.
-- Never invent text, numbers, names, brands, logos, locations, or identities.
-- If the stored context is too weak to answer exactly, say what can be determined and what cannot.
-
-OCR/text rules:
-- OCR is reliable only if it lists written text.
-- If OCR describes the scene instead of written text, ignore it.
-- Never claim text is visible unless it appears in the uploaded context.
-
-Invoice and calculation rules:
-- If the uploaded file is an invoice, receipt, quote, statement, purchase order, or financial document, extract visible supplier, invoice number, dates, line items, quantities, unit prices, subtotal, VAT/tax, total, and currency when present.
-- If the user asks for a calculation, calculate only from numbers visible in the uploaded context.
+For invoice/document questions:
+- Extract visible fields from the uploaded context.
+- If it is an invoice, receipt, quote, purchase order, statement, or bill, look for supplier, invoice number, date, line items, quantities, unit prices, subtotal, VAT/tax, total, and currency.
+- If the user asks for a calculation, calculate only from visible numbers.
 - Show the arithmetic briefly.
-- Do not invent missing invoice values.
-- If required numbers are missing or unreadable, say exactly which values are missing.
-- Do not say you cannot calculate if all required numbers are visible in the uploaded context.
+- If numbers are missing, say exactly which numbers are missing.
+- Do not invent missing values.
+
+Style:
+- Be direct.
+- Be useful.
+- Prefer 2 to 5 short paragraphs or bullets.
+- Do not over-explain.
+- Do not include source names inside the answer.
 
 User question:
 {clean_query}
@@ -4300,32 +4390,32 @@ User question:
 Uploaded file context:
 {clean_context}
 
-Answer the CURRENT QUESTION directly.
+Now answer the user's question directly.
 """.strip()
-
-    try:
-        answer = ask_llm(
-            query=clean_query,
-            context=prompt
         )
 
         answer = str(answer or "").strip()
 
-        if is_bad_uploaded_file_answer(answer, clean_query):
-            repair_prompt = f"""
-You previously gave a weak uploaded-file answer.
+    except Exception as e:
+        print("UPLOADED CHAT ASSET LLM ERROR:", type(e).__name__, str(e))
+        answer = ""
 
-Rewrite it.
+    if is_weak_uploaded_answer(answer, clean_query):
+        try:
+            answer = ask_llm(
+                query=clean_query,
+                context=f"""
+Rewrite the answer below because it is weak, repetitive, or caption-like.
+
+User wants a direct practical answer, not a generic image description.
 
 Rules:
-- Answer the user's CURRENT QUESTION directly.
-- Do not give a one-word answer.
-- Do not repeat the whole file description.
-- Give visible evidence from the uploaded context.
-- If the question is vague, explain the limitation and answer cautiously.
-- If the user asks whether something is good, explain good for what purpose and give visible pros/limits.
-- If exact details are not visible, say that clearly.
-- Use only the uploaded file context.
+- Do not start with "Based on the uploaded image".
+- Do not repeat the whole image description.
+- Answer the user's question directly.
+- If asked whether the boat is good/recommended, explain visible positives and what cannot be judged from the image.
+- If asked whether to buy, say you cannot recommend buying from an image alone and list checks needed.
+- Use only the uploaded context.
 - Use British English.
 - Plain text only.
 
@@ -4335,22 +4425,17 @@ User question:
 Weak answer:
 {answer}
 
-Uploaded file context:
+Uploaded context:
 {clean_context}
 
-Improved answer:
+Better answer:
 """.strip()
-
-            answer = ask_llm(
-                query=clean_query,
-                context=repair_prompt
             )
 
             answer = str(answer or "").strip()
 
-    except Exception as e:
-        print("UPLOADED CHAT ASSET LLM ERROR:", type(e).__name__, str(e))
-        answer = ""
+        except Exception as e:
+            print("UPLOADED CHAT ASSET REWRITE ERROR:", type(e).__name__, str(e))
 
     if not answer:
         answer = (

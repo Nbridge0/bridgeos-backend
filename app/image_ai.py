@@ -1,67 +1,44 @@
 import base64
+import io
+import json
 import mimetypes
-import os
-from typing import Any, Dict, Optional
+import re
+from typing import Any
 
 import requests
 
 from app.config import RUNPOD_BASE_URL, BRIDGEOS_API_KEY
 
 
-VISION_TIMEOUT_SECONDS = int(os.getenv("VISION_TIMEOUT_SECONDS", "180"))
-PDF_OCR_MAX_PAGES = int(os.getenv("PDF_OCR_MAX_PAGES", "12"))
-PDF_RENDER_ZOOM = float(os.getenv("PDF_RENDER_ZOOM", "2.0"))
+VISION_TIMEOUT_SECONDS = 180
 
 
 def _read_file_bytes(file) -> bytes:
-    """
-    Read bytes from an UploadFile/file-like object without permanently breaking the pointer.
-    """
-    if file is None:
-        return b""
-
-    try:
-        current_position = file.tell()
-    except Exception:
-        current_position = None
-
-    try:
-        file.seek(0)
-    except Exception:
-        pass
-
+    file.seek(0)
     data = file.read()
+    file.seek(0)
 
     if isinstance(data, str):
-        data = data.encode("utf-8", errors="ignore")
-
-    if current_position is not None:
-        try:
-            file.seek(current_position)
-        except Exception:
-            pass
-    else:
-        try:
-            file.seek(0)
-        except Exception:
-            pass
+        data = data.encode("utf-8")
 
     return data or b""
 
 
-def _bytes_to_base64(data: bytes) -> str:
-    return base64.b64encode(data or b"").decode("utf-8")
-
-
-def _guess_mime_type(filename: str, fallback: str = "application/octet-stream") -> str:
+def _guess_mime_type(filename: str | None, default: str = "application/octet-stream") -> str:
     mime_type, _ = mimetypes.guess_type(filename or "")
-    return mime_type or fallback
+    return mime_type or default
+
+
+def _file_to_base64(file) -> str:
+    data = _read_file_bytes(file)
+    return base64.b64encode(data).decode("utf-8")
 
 
 def _extract_response_text(data: Any) -> str:
     """
-    Extract text from different possible RunPod response shapes.
+    Supports different possible RunPod response shapes without hard-coding one.
     """
+
     if data is None:
         return ""
 
@@ -72,11 +49,11 @@ def _extract_response_text(data: Any) -> str:
         for key in [
             "response",
             "answer",
-            "message",
             "text",
+            "content",
+            "message",
             "output",
             "result",
-            "content",
         ]:
             value = data.get(key)
 
@@ -89,99 +66,104 @@ def _extract_response_text(data: Any) -> str:
                     return nested
 
             if isinstance(value, list):
-                nested = _extract_response_text(value)
-                if nested:
-                    return nested
+                parts = []
+
+                for item in value:
+                    nested = _extract_response_text(item)
+                    if nested:
+                        parts.append(nested)
+
+                if parts:
+                    return "\n".join(parts).strip()
 
         choices = data.get("choices")
-        if isinstance(choices, list) and choices:
-            first_choice = choices[0]
 
-            if isinstance(first_choice, dict):
-                message = first_choice.get("message")
+        if isinstance(choices, list):
+            parts = []
 
-                if isinstance(message, dict):
-                    content = message.get("content")
+            for choice in choices:
+                nested = _extract_response_text(choice)
+                if nested:
+                    parts.append(nested)
 
-                    if isinstance(content, str) and content.strip():
-                        return content.strip()
-
-                text = first_choice.get("text")
-
-                if isinstance(text, str) and text.strip():
-                    return text.strip()
-
-        nested_data = data.get("data")
-
-        if nested_data is not None:
-            nested_text = _extract_response_text(nested_data)
-
-            if nested_text:
-                return nested_text
+            if parts:
+                return "\n".join(parts).strip()
 
     if isinstance(data, list):
-        for item in data:
-            text = _extract_response_text(item)
+        parts = []
 
-            if text:
-                return text
+        for item in data:
+            nested = _extract_response_text(item)
+            if nested:
+                parts.append(nested)
+
+        return "\n".join(parts).strip()
 
     return ""
 
 
-def _call_vision_model(
+def _call_vision_chat(
     *,
-    image_bytes: bytes,
+    user_input: str,
+    file,
     filename: str,
-    prompt: str,
-    mime_type: Optional[str] = None,
-    timeout: int = VISION_TIMEOUT_SECONDS,
+    task: str,
+    mime_type: str | None = None
 ) -> str:
     """
-    Calls the existing RunPod BridgeOS chat endpoint with image data.
+    Sends image/PDF-page image to the RunPod vision endpoint.
 
-    Multiple image fields are sent for compatibility with different worker schemas.
-    This is not content hard-coding.
+    Important:
+    - Sends multiple common image fields for compatibility.
+    - Does not hard-code yacht/image answers.
+    - The anti-hallucination rules are generic.
     """
-    if not RUNPOD_BASE_URL or not BRIDGEOS_API_KEY:
-        print("VISION ERROR: RUNPOD_BASE_URL or BRIDGEOS_API_KEY is missing")
+
+    if not RUNPOD_BASE_URL:
         return ""
 
-    if not image_bytes:
-        print("VISION ERROR: empty image bytes")
+    if not BRIDGEOS_API_KEY:
         return ""
 
-    clean_filename = filename or "uploaded_image"
+    clean_filename = filename or "uploaded-image"
     clean_mime_type = mime_type or _guess_mime_type(clean_filename, "image/png")
-    image_base64 = _bytes_to_base64(image_bytes)
+    image_base64 = _file_to_base64(file)
+
+    if not image_base64:
+        return ""
+
+    data_url = f"data:{clean_mime_type};base64,{image_base64}"
 
     url = f"{RUNPOD_BASE_URL.rstrip('/')}/api/bridgeos/chat"
 
-    payload: Dict[str, Any] = {
-        "user_input": prompt,
+    payload = {
+        "user_input": user_input,
         "history": [],
-        "temperature": 0,
-        "max_tokens": 1800,
-
-        # Original field used by your backend
         "image": image_base64,
-
-        # Compatibility fields
         "image_base64": image_base64,
+        "image_data_url": data_url,
         "mime_type": clean_mime_type,
-        "image_mime_type": clean_mime_type,
         "images": [
             {
                 "filename": clean_filename,
                 "mime_type": clean_mime_type,
                 "data": image_base64,
+                "data_url": data_url,
             }
         ],
-
         "backend_context": {
             "filename": clean_filename,
             "mime_type": clean_mime_type,
-            "task": "careful_image_analysis",
+            "task": task,
+            "important_instruction": (
+                "Analyse only the actual uploaded visual content. "
+                "Do not invent names, brands, logos, vessel names, locations, text, numbers, prices, "
+                "invoice values, dates, or financial amounts. "
+                "If something is not visible or not readable, say it is not visible or not readable. "
+                "For boats, classify only the broad visible vessel type and explain the visible evidence. "
+                "Never pretend to know condition, build quality, price, maintenance history, engine status, "
+                "survey status, suitability for purchase, or exact make/model from an image alone."
+            ),
         },
     }
 
@@ -193,11 +175,11 @@ def _call_vision_model(
                 "Content-Type": "application/json",
                 "x-api-key": BRIDGEOS_API_KEY,
             },
-            timeout=timeout,
+            timeout=VISION_TIMEOUT_SECONDS,
         )
 
         print("VISION DEBUG status:", response.status_code)
-        print("VISION DEBUG body:", response.text[:1000])
+        print("VISION DEBUG response:", response.text[:800])
 
         if response.status_code >= 400:
             return ""
@@ -210,316 +192,262 @@ def _call_vision_model(
         return _extract_response_text(data)
 
     except Exception as e:
-        print("VISION ERROR:", type(e).__name__, str(e))
+        print("VISION REQUEST ERROR:", type(e).__name__, str(e))
         return ""
 
 
-def _normalize_no_readable_text(text: str) -> str:
+def _clean_visual_description(text: str) -> str:
     clean = str(text or "").strip()
 
     if not clean:
-        return "NO_READABLE_TEXT"
+        return ""
 
-    upper_clean = clean.upper().strip()
+    remove_prefixes = [
+        "image visual description:",
+        "visual description:",
+        "analysis:",
+        "answer:",
+    ]
 
-    if upper_clean in {
-        "NO_READABLE_TEXT",
-        "NO READABLE TEXT",
-        "NO_TEXT",
-        "NONE",
-        "N/A",
-        "NULL",
-    }:
-        return "NO_READABLE_TEXT"
+    lowered = clean.lower()
+
+    for prefix in remove_prefixes:
+        if lowered.startswith(prefix):
+            clean = clean[len(prefix):].strip()
+            lowered = clean.lower()
+
+    # Remove fake OCR/financial boilerplate if the model added it to image descriptions.
+    unwanted_lines = []
+
+    for line in clean.splitlines():
+        stripped = line.strip()
+        low = stripped.lower()
+
+        if not stripped:
+            unwanted_lines.append(line)
+            continue
+
+        if low.startswith("ocr text"):
+            continue
+
+        if "financial document extraction" in low:
+            continue
+
+        if "no relevant numbers or financial values" in low:
+            continue
+
+        unwanted_lines.append(line)
+
+    clean = "\n".join(unwanted_lines).strip()
 
     return clean
 
 
-def _looks_like_visual_description_not_ocr(text: str) -> bool:
+def _looks_like_scene_description_not_ocr(text: str) -> bool:
     """
-    OCR should be written text only.
-    If OCR returns a scene description, reject it.
+    OCR must be visible written text only.
+    If the model describes the scene, it is not OCR.
     """
-    clean = str(text or "").strip()
-    lower = clean.lower()
+
+    clean = str(text or "").strip().lower()
 
     if not clean:
-        return True
+        return False
 
-    descriptive_starts = [
+    scene_phrases = [
         "the image shows",
+        "the image depicts",
+        "the image appears",
         "this image shows",
-        "the photo shows",
-        "this photo shows",
-        "the picture shows",
-        "this picture shows",
-        "i can see",
-        "there is",
+        "this image depicts",
+        "there is a",
         "there are",
+        "it shows",
         "it appears",
-        "appears to be",
-        "the uploaded file appears",
+        "a white yacht",
+        "a sailboat",
+        "a boat",
+        "a marina",
+        "calm water",
+        "clear sky",
     ]
 
-    if any(lower.startswith(phrase) for phrase in descriptive_starts):
+    if any(phrase in clean for phrase in scene_phrases):
         return True
 
-    descriptive_phrases = [
-        "in the background",
-        "in the foreground",
-        "the scene",
-        "the setting",
-        "sunny day",
-        "clear sky",
-        "calm water",
-        "people are",
-        "people appear",
-        "floating on",
-        "docked at",
-    ]
-
-    sentence_count = clean.count(".") + clean.count("!") + clean.count("?")
-
-    if sentence_count >= 2 and any(phrase in lower for phrase in descriptive_phrases):
+    # OCR should usually contain short text fragments, not long paragraphs.
+    if len(clean.split()) > 35 and not re.search(r"[A-Z0-9]{2,}", text or ""):
         return True
 
     return False
 
 
+def _clean_ocr_text(text: str) -> str:
+    clean = str(text or "").strip()
+
+    if not clean:
+        return ""
+
+    lowered = clean.lower().strip()
+
+    no_text_markers = [
+        "no readable text",
+        "no clearly readable text",
+        "no text visible",
+        "no visible text",
+        "not applicable",
+        "none",
+        "n/a",
+    ]
+
+    if any(marker in lowered for marker in no_text_markers):
+        return ""
+
+    if _looks_like_scene_description_not_ocr(clean):
+        return ""
+
+    remove_prefixes = [
+        "ocr text:",
+        "extracted text:",
+        "visible text:",
+        "text:",
+    ]
+
+    for prefix in remove_prefixes:
+        if lowered.startswith(prefix):
+            clean = clean[len(prefix):].strip()
+            lowered = clean.lower().strip()
+
+    return clean.strip()
+
+
 def describe_image(file, filename: str) -> str:
     """
-    Visual analysis for normal images.
+    Creates a grounded visual description.
 
-    This stores enough structured visual context so follow-up questions like
-    "what kind of boat is it?" can be answered without re-reading the image.
+    The output should be useful for later chat answers, not a salesy caption.
     """
-    image_bytes = _read_file_bytes(file)
-    mime_type = _guess_mime_type(filename, "image/png")
 
     prompt = """
-You are a careful visual analyst.
+You are analysing one uploaded image.
 
-Analyze the uploaded image using only visible evidence.
-
-Your job is to create structured visual context for a later chatbot answer.
+Return a concise factual description of what is visibly present.
 
 Rules:
-- Do not invent brands, logos, vessel names, locations, people identities, text, numbers, prices, invoice values, or hidden details.
-- Do not guess unreadable text.
-- Do not say a marina, city, country, brand, system, or company name unless it is clearly visible.
-- You may classify visible object types when the visual evidence supports it.
-- For uncertain classifications, use cautious wording like "likely", "appears to be", or "cannot determine exactly".
-- If the image shows a boat, identify the broad vessel category from visible structure when possible, such as monohull sailboat, catamaran, motor yacht, tender, dinghy, RIB, centre-console, or other visible category.
-- If the exact make/model is not visible, say the exact make/model is not visible.
-- If the image shows a financial document, extract visible fields and numbers carefully.
-- If the image is not a financial document, do not say calculations are possible.
-- Do not mention OCR unless there is clearly readable written text.
+- Describe only visible objects and layout.
+- Do not invent brands, logos, names, locations, dates, numbers, or text.
+- Do not say text is visible unless it is clearly readable.
+- Do not guess exact make/model.
+- Do not judge whether something is good, bad, safe, seaworthy, damaged, expensive, or worth buying.
+- If the image contains a boat, identify only the broad visible type, such as motor yacht, sailing yacht, catamaran, tender, or unknown.
+- Explain the visible evidence for the broad type.
+- Mention visible limitations, such as exact model or condition not being visible.
+- Do not include OCR output.
+- Do not include financial-document comments unless the image is actually a financial document.
 
-Return exactly this structure:
-
-Primary subject:
-<main visible subject>
-
-Likely category/type:
-<best visual classification, with confidence wording>
-
-Visible evidence for category/type:
-<short evidence from visible features only>
-
-Visual description:
-<concise description of visible scene>
-
-Clearly readable text:
-<only text clearly readable in the image, or "No clearly readable text">
-
-Numbers / financial values:
-<only visible numbers or financial values, or "No relevant numbers visible">
-
-What cannot be determined:
-<make/model/location/unclear items that cannot be determined from the image>
+Write in plain text, 3 to 6 sentences maximum.
 """.strip()
 
-    result = _call_vision_model(
-        image_bytes=image_bytes,
+    raw = _call_vision_chat(
+        user_input=prompt,
+        file=file,
         filename=filename,
-        mime_type=mime_type,
-        prompt=prompt,
+        task="image_visual_description",
     )
 
-    return str(result or "").strip()
+    return _clean_visual_description(raw)
 
 
 def extract_ocr_from_image(file, filename: str) -> str:
     """
-    OCR-only extraction.
+    Extracts only actual visible written text.
+
+    If there is no readable text, returns NO_READABLE_TEXT.
     """
-    image_bytes = _read_file_bytes(file)
 
-    return extract_ocr_from_image_bytes(
-        image_bytes=image_bytes,
-        filename=filename,
-        mime_type=_guess_mime_type(filename, "image/png"),
-    )
-
-
-def extract_ocr_from_image_bytes(
-    *,
-    image_bytes: bytes,
-    filename: str,
-    mime_type: Optional[str] = None,
-) -> str:
     prompt = """
-You are an OCR engine.
+You are doing OCR on one uploaded image.
 
-Task:
-Extract only text visibly written in the image.
+Return ONLY the written text that is visibly readable in the image.
 
 Rules:
-- Return only visible written text.
-- Do not describe the image.
-- Do not analyse the scene.
-- Do not guess words, labels, logos, brands, vessel names, or numbers.
-- Do not infer missing text from context.
-- If text is blurry, cut off, hidden, or uncertain, write [unclear].
-- Preserve line breaks where possible.
-- Preserve numbers exactly as written.
-- Preserve currency symbols, decimals, VAT, tax, subtotal, total, dates, invoice numbers, quantities, and unit prices exactly as written.
-- If no readable written text is visible, return exactly: NO_READABLE_TEXT
+- Do not describe the scene.
+- Do not summarise the image.
+- Do not invent text.
+- Do not infer hidden or blurry text.
+- Preserve line breaks when useful.
+- For invoices/receipts, preserve supplier, invoice number, dates, line items, quantities, unit prices, subtotal, VAT/tax, total, and currency exactly as visible.
+- If no text is clearly readable, return exactly:
+NO_READABLE_TEXT
 
-Return only the OCR text.
+Return OCR text only.
 """.strip()
 
-    raw_text = _call_vision_model(
-        image_bytes=image_bytes,
+    raw = _call_vision_chat(
+        user_input=prompt,
+        file=file,
         filename=filename,
-        mime_type=mime_type or _guess_mime_type(filename, "image/png"),
-        prompt=prompt,
+        task="image_ocr_only",
     )
 
-    clean_text = _normalize_no_readable_text(raw_text)
+    clean = _clean_ocr_text(raw)
 
-    if _looks_like_visual_description_not_ocr(clean_text):
+    if not clean:
         return "NO_READABLE_TEXT"
 
-    return clean_text
+    return clean
 
 
-def extract_invoice_text_from_image(file, filename: str) -> str:
-    """
-    Special extraction for invoice/receipt/financial document images.
-    """
-    image_bytes = _read_file_bytes(file)
-    mime_type = _guess_mime_type(filename, "image/png")
-
-    return extract_invoice_text_from_image_bytes(
-        image_bytes=image_bytes,
-        filename=filename,
-        mime_type=mime_type,
-    )
-
-
-def extract_invoice_text_from_image_bytes(
-    *,
-    image_bytes: bytes,
-    filename: str,
-    mime_type: Optional[str] = None,
-) -> str:
-    prompt = """
-You are extracting data from a financial document image.
-
-The image may be an invoice, receipt, quote, purchase order, statement, payment document, or table of charges.
-
-Rules:
-- Extract only text and numbers that are visibly present.
-- Do not invent missing values.
-- Do not calculate values that are not supported by visible numbers.
-- Preserve invoice number, dates, supplier/vendor, customer, line items, descriptions, quantities, unit prices, tax/VAT, subtotal, total, currency, payment terms, and bank/payment details if visible.
-- Preserve line breaks and table-like structure as much as possible.
-- If a field is not visible, do not create it.
-- If a value is unclear, write [unclear].
-- If no financial document text is readable, return exactly: NO_READABLE_TEXT.
-
-Return only the extracted document text.
-""".strip()
-
-    raw_text = _call_vision_model(
-        image_bytes=image_bytes,
-        filename=filename,
-        mime_type=mime_type or _guess_mime_type(filename, "image/png"),
-        prompt=prompt,
-    )
-
-    clean_text = _normalize_no_readable_text(raw_text)
-
-    if _looks_like_visual_description_not_ocr(clean_text):
-        return "NO_READABLE_TEXT"
-
-    return clean_text
-
-
-def extract_ocr_from_pdf_pages(file, filename: str, max_pages: Optional[int] = None) -> str:
+def extract_ocr_from_pdf_pages(file, filename: str, max_pages: int = 12) -> str:
     """
     OCR fallback for scanned PDFs.
 
-    Normal digital PDFs are handled by pypdf in extractors.py.
-    Scanned invoice PDFs need pages rendered to images first.
+    Requires pymupdf:
+        pip install pymupdf
     """
+
     try:
         import fitz
     except Exception as e:
-        print("PDF OCR ERROR: PyMuPDF is not installed:", type(e).__name__, str(e))
+        print("PDF OCR ERROR: pymupdf not installed:", type(e).__name__, str(e))
         return ""
-
-    pdf_bytes = _read_file_bytes(file)
-
-    if not pdf_bytes:
-        return ""
-
-    page_limit = max_pages or PDF_OCR_MAX_PAGES
 
     try:
+        file.seek(0)
+        pdf_bytes = file.read()
+        file.seek(0)
+
+        if not pdf_bytes:
+            return ""
+
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    except Exception as e:
-        print("PDF OCR ERROR: could not open PDF:", type(e).__name__, str(e))
-        return ""
+        page_count = min(len(doc), max_pages)
 
-    extracted_pages = []
-
-    try:
-        page_count = min(len(doc), page_limit)
+        all_text = []
 
         for page_index in range(page_count):
-            try:
-                page = doc.load_page(page_index)
-                matrix = fitz.Matrix(PDF_RENDER_ZOOM, PDF_RENDER_ZOOM)
-                pix = page.get_pixmap(matrix=matrix, alpha=False)
-                png_bytes = pix.tobytes("png")
+            page = doc.load_page(page_index)
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+            image_bytes = pix.tobytes("png")
 
-                page_ocr_text = extract_invoice_text_from_image_bytes(
-                    image_bytes=png_bytes,
-                    filename=f"{filename} - page {page_index + 1}.png",
-                    mime_type="image/png",
+            image_file = io.BytesIO(image_bytes)
+
+            page_text = extract_ocr_from_image(
+                image_file,
+                f"{filename or 'document'}-page-{page_index + 1}.png"
+            )
+
+            page_text = _clean_ocr_text(page_text)
+
+            if page_text:
+                all_text.append(
+                    f"Page {page_index + 1} OCR:\n{page_text}"
                 )
 
-                page_ocr_text = _normalize_no_readable_text(page_ocr_text)
+        doc.close()
 
-                if page_ocr_text and page_ocr_text != "NO_READABLE_TEXT":
-                    extracted_pages.append(
-                        f"PDF page {page_index + 1} OCR text:\n{page_ocr_text}"
-                    )
+        return "\n\n".join(all_text).strip()
 
-            except Exception as page_error:
-                print(
-                    "PDF OCR PAGE ERROR:",
-                    page_index + 1,
-                    type(page_error).__name__,
-                    str(page_error),
-                )
-
-    finally:
-        try:
-            doc.close()
-        except Exception:
-            pass
-
-    return "\n\n".join(extracted_pages).strip()
+    except Exception as e:
+        print("PDF OCR ERROR:", type(e).__name__, str(e))
+        return ""
