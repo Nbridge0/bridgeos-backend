@@ -5724,6 +5724,107 @@ def parse_llm_json_response(raw_text: str) -> dict | None:
     except Exception:
         return None
 
+def build_numbered_context_from_asset_results(rows):
+    parts = []
+
+    for index, row in enumerate(rows or [], start=1):
+        file_name = (
+            row.get("original_file_name")
+            or row.get("file_name")
+            or row.get("title")
+            or "Unknown source"
+        )
+
+        content = row.get("content") or row.get("text") or ""
+
+        if not str(content).strip():
+            continue
+
+        parts.append(
+            f"""
+[SOURCE {index}]
+File: {file_name}
+Content:
+{str(content).strip()}
+""".strip()
+        )
+
+    return "\n\n---\n\n".join(parts)
+
+
+def normalise_for_source_check(value):
+    return " ".join(str(value or "").lower().split())
+
+
+def source_quote_exists_in_row(row, quote):
+    if not row or not quote:
+        return False
+
+    quote_text = normalise_for_source_check(quote)
+
+    if not quote_text:
+        return False
+
+    row_text = normalise_for_source_check(
+        row.get("content")
+        or row.get("text")
+        or ""
+    )
+
+    if not row_text:
+        return False
+
+    return quote_text in row_text
+
+
+def verified_source_rows_from_llm_result(parsed, matched_rows):
+    if not parsed or not isinstance(parsed, dict):
+        return []
+
+    if not bool(parsed.get("document_used")):
+        return []
+
+    used_sources = parsed.get("used_sources") or []
+
+    if not isinstance(used_sources, list):
+        return []
+
+    verified_rows = []
+
+    for used_source in used_sources:
+        if not isinstance(used_source, dict):
+            continue
+
+        try:
+            source_number = int(used_source.get("source_number"))
+        except Exception:
+            continue
+
+        quote = str(used_source.get("evidence_quote") or "").strip()
+
+        if source_number <= 0:
+            continue
+
+        index = source_number - 1
+
+        if index < 0 or index >= len(matched_rows):
+            continue
+
+        row = matched_rows[index]
+
+        if source_quote_exists_in_row(row, quote):
+            verified_rows.append(row)
+        else:
+            print(
+                "SOURCE VERIFICATION FAILED:",
+                {
+                    "source_number": source_number,
+                    "quote": quote[:200]
+                }
+            )
+
+    return verified_rows
+
 def chat(
     query: str,
     crew_id: str,
@@ -5735,13 +5836,12 @@ def chat(
     """
     Secure BridgeOS chat.
 
-    Behavior:
-    - Searches accessible uploaded yacht assets.
-    - Supports uploaded chat files.
-    - Uses semantic retrieval plus keyword/file-name fallback.
-    - Shows sources ONLY when the final answer actually used document context.
-    - Allows normal greetings/general questions without showing sources.
-    - Does not invent yacht-specific private data.
+    Sources are shown ONLY when:
+    - the LLM says it used document context
+    - it provides an exact evidence quote
+    - the backend verifies that quote exists inside the exact matched source row
+
+    This prevents random retrieved documents from appearing as sources.
     """
 
     chat_row = verify_chat_access(
@@ -5794,7 +5894,7 @@ def chat(
             )
 
             if matched_rows:
-                context = build_context_from_asset_results(matched_rows)
+                context = build_numbered_context_from_asset_results(matched_rows)
 
         else:
             accessible_asset_ids = get_accessible_asset_ids(
@@ -5897,24 +5997,14 @@ def chat(
                     print("LOCAL CHAT DEBUG: matched chunks:", len(matched_rows))
 
                     if matched_rows:
-                        context = build_context_from_asset_results(matched_rows)
+                        context = build_numbered_context_from_asset_results(matched_rows)
 
     except Exception as e:
         print("LOCAL CHAT DOCUMENT SEARCH ERROR:", type(e).__name__, str(e))
         matched_rows = []
         context = ""
 
-    if resolved_uploaded_asset_id:
-        uploaded_result = answer_from_uploaded_chat_asset(
-            query=query,
-            context=context,
-            matched_rows=matched_rows
-        )
-
-        answer = uploaded_result["answer"]
-        sources = uploaded_result["sources"]
-
-    elif context:
+    if context:
         raw_answer = ask_llm(
             query=query,
             context=f"""
@@ -5924,45 +6014,49 @@ Always respond in British English.
 
 You may use the uploaded yacht document context below, but ONLY when it directly answers the user's question.
 
-Return ONLY valid JSON in this exact shape:
+You MUST return ONLY valid JSON in this exact shape:
 
 {{
-  "answer": "final user-facing answer here",
+  "answer": "clear user-facing answer with a brief explanation when useful",
   "document_used": true,
-  "used_source_numbers": [1]
+  "used_sources": [
+    {{
+      "source_number": 1,
+      "evidence_quote": "exact short quote copied from that source which supports the answer"
+    }}
+  ]
 }}
 
 or:
 
 {{
-  "answer": "final user-facing answer here",
+  "answer": "clear user-facing answer with a brief explanation when useful",
   "document_used": false,
-  "used_source_numbers": []
+  "used_sources": []
 }}
 
-Rules:
-- If the context directly answers the user's question, answer from the context and set "document_used": true.
-- If the context contains invoice, receipt, quote, statement, purchase order, or financial values, you may calculate from the visible context values.
-- If calculating, show arithmetic briefly in the answer.
-- Do not invent missing invoice values.
-- If required numbers are missing, say exactly which numbers are missing.
-- If the answer is a normal general answer, greeting, maths, explanation, or anything not based on the uploaded context, set "document_used": false.
-- If the user asks for yacht-specific private information that is not in the context, answer exactly:
+Strict rules:
+- The answer should be natural and helpful, not just a number.
+- If the user asks "how much", include the amount and a short explanation of what it refers to.
+- Use a source ONLY if that exact source contains the information used in the answer.
+- The evidence_quote MUST be copied exactly from the SOURCE content.
+- Do not use a source just because it was retrieved.
+- Do not guess source numbers.
+- If the source does not directly support the answer, set "document_used": false.
+- If the answer is a normal greeting, general question, maths, explanation, or not based on the uploaded context, set "document_used": false.
+- If the user asks about yacht-specific private information and the context does not clearly contain the answer, answer exactly:
 {FALLBACK_NO_DATA_ANSWER}
-- If the answer is the fallback answer, set "document_used": false and "used_source_numbers": [].
+- If the answer is the fallback answer, set "document_used": false and "used_sources": [].
 - Do not invent yacht-specific private data.
-- Do not claim you used a document unless the answer is directly based on the context.
-- Include in "used_source_numbers" ONLY the source numbers that directly support the answer.
-- Do not include retrieved files just because they were retrieved.
-- Do not include document references inside the answer. The frontend will show sources separately.
+- Do not include document names or references inside the answer. The frontend will show sources separately.
 - Return JSON only. Do not wrap it in markdown.
 
-Source numbering:
-The uploaded document context is built from matched_rows in order.
-Source number 1 means matched_rows[0].
-Source number 2 means matched_rows[1].
-Source number 3 means matched_rows[2].
-Continue the same pattern for later sources.
+Financial rules:
+- If the context contains invoice, receipt, quote, statement, purchase order, or financial values, you may calculate from visible context values.
+- If calculating, show the arithmetic briefly.
+- Do not invent missing values.
+- If required numbers are missing, say exactly which numbers are missing.
+- The evidence_quote must include the relevant item/value text from the source.
 
 User question:
 {query}
@@ -5974,52 +6068,38 @@ Uploaded document context:
 
         parsed = parse_llm_json_response(raw_answer)
 
-        document_used = False
-        used_source_numbers = []
+        answer = ""
+        sources = []
 
         if parsed and isinstance(parsed, dict):
             answer = str(parsed.get("answer") or "").strip()
-            document_used = bool(parsed.get("document_used"))
 
-            raw_used_numbers = parsed.get("used_source_numbers") or []
+            verified_source_rows = verified_source_rows_from_llm_result(
+                parsed=parsed,
+                matched_rows=matched_rows
+            )
 
-            if isinstance(raw_used_numbers, list):
-                for number in raw_used_numbers:
-                    try:
-                        number = int(number)
+            document_used = bool(parsed.get("document_used")) and len(verified_source_rows) > 0
 
-                        if number > 0:
-                            used_source_numbers.append(number)
+            if answer.strip() == FALLBACK_NO_DATA_ANSWER:
+                document_used = False
+                verified_source_rows = []
 
-                    except Exception:
-                        pass
+            if document_used:
+                sources = build_sources_from_asset_results(verified_source_rows)
+            else:
+                sources = []
 
         else:
             print("LOCAL CHAT JSON SOURCE PARSE FAILED:", str(raw_answer)[:500])
             answer = str(raw_answer or "").strip() or FALLBACK_NO_DATA_ANSWER
-            document_used = False
-            used_source_numbers = []
+            sources = []
 
         if not answer:
             answer = FALLBACK_NO_DATA_ANSWER
-            document_used = False
-            used_source_numbers = []
+            sources = []
 
         if answer.strip() == FALLBACK_NO_DATA_ANSWER:
-            document_used = False
-            used_source_numbers = []
-
-        if document_used:
-            source_rows = []
-
-            for source_number in used_source_numbers:
-                index = source_number - 1
-
-                if 0 <= index < len(matched_rows):
-                    source_rows.append(matched_rows[index])
-
-            sources = build_sources_from_asset_results(source_rows)
-        else:
             sources = []
 
     else:
