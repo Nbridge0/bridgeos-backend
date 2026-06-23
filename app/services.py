@@ -5416,17 +5416,16 @@ def chat(
     uploaded_asset_id: str | None = None
 ):
     """
-    Secure document-grounded chat.
+    Secure BridgeOS chat.
 
     Behavior:
     - Searches accessible uploaded yacht assets.
-    - Supports multi-part questions.
-    - Uses semantic retrieval plus generic keyword/file-name fallback.
-    - Uses current chat memory for recently uploaded chat files.
-    - Answers ONLY from uploaded document context.
-    - If no supported answer exists, returns FALLBACK_NO_DATA_ANSWER.
-    - Sources are returned and saved with the assistant message.
-    - No hallucinations.
+    - Supports uploaded chat files.
+    - Uses semantic retrieval plus keyword/file-name fallback.
+    - Keeps sources when document context is used.
+    - Calls RunPod through ask_llm().
+    - Allows normal greetings/general questions when no document context exists.
+    - Does not invent yacht-specific private data.
     """
 
     chat_row = verify_chat_access(
@@ -5456,9 +5455,6 @@ def chat(
     context = ""
     retrieval_query_input = query
 
-    # Generic chat memory:
-    # If frontend does not send uploaded_asset_id, recover the latest file
-    # attached to this exact chat_id.
     resolved_uploaded_asset_id = uploaded_asset_id or get_latest_chat_asset_id(
         chat_id=chat_id,
         crew_id=crew_id,
@@ -5517,6 +5513,7 @@ def chat(
 
                     retrieval_queries = build_retrieval_queries(retrieval_query_input)
                     matched_rows_by_key = {}
+
                     if is_file_listing_query(query):
                         listing_rows = get_asset_metadata_rows_for_listing(
                             query=query,
@@ -5635,83 +5632,23 @@ def chat(
         raw_answer = ask_llm(
             query=query,
             context=f"""
-You are BridgeOS, a secure yacht documentation assistant.
+You are BridgeOS, a helpful yacht assistant.
 
 Always respond in British English.
-Use British English for wording, spelling, grammar, and tone.
-Do not rewrite file names, document titles, API names, table names, field names, or quoted source text.
 
-You must answer using ONLY the uploaded document context below.
+Use the uploaded yacht document context below when it is relevant.
 
-If uploaded_asset_id was provided or resolved from this chat's uploaded file memory, the uploaded document context is the file/photo/document the user uploaded in this chat. In that case, answer directly from that uploaded file context, including image visual description and OCR text when available.
+Rules:
+- If the context answers the user's question, answer from the context.
+- If the user asks a normal general question or greeting, answer normally.
+- If the user asks for yacht-specific private information that is not in the context, say:
+{FALLBACK_NO_DATA_ANSWER}
+- Do not invent yacht-specific private data.
+- Do not claim you used a document unless the answer is based on the context.
+- Do not add document references inside the answer. The frontend will show sources separately.
+- Return plain text only. Do not return JSON.
 
-The uploaded context is divided into numbered blocks like SOURCE 1, SOURCE 2, SOURCE 3.
-Each source block includes a file name and content.
-
-Return ONLY valid JSON in this exact shape:
-
-{{
-  "answer": "final user-facing answer here",
-  "document_used": true,
-  "used_source_numbers": [1],
-  "used_source_titles": ["exact file name used for the answer"]
-}}
-
-or:
-
-{{
-  "answer": "Sorry, I don't have this data yet. Please ask your admin to upload it.",
-  "document_used": false,
-  "used_source_numbers": [],
-  "used_source_titles": []
-}}
-
-Special rule for chatbot-uploaded files:
-- If uploaded_asset_id was provided or resolved from this chat's uploaded file memory, the user is asking about the file/photo/document uploaded in this chat.
-- In that case, answer from the uploaded file context.
-- For photos, use the Image visual description and OCR text.
-- Do not require the user to name a yacht document or procedure when uploaded_asset_id was provided or resolved.
-
-Strict rules:
-- Do not hallucinate.
-- Do not add general maritime knowledge.
-- Do not add advice that is not explicitly supported by the uploaded document context.
-- Do not invent steps, warnings, locations, equipment, names, dates, or procedures.
-- If the document context contains the answer, answer only from that context.
-- If the user asks "what should I do in case of..." and the answer is in the SOP/context, extract the relevant procedure from the context and present it clearly.
-- If the user asks whether a document/procedure/report says something about a specific topic, object, operation, action, person, place, or requirement, only answer if that exact requested thing is explicitly present in the uploaded document context.
-- If the requested thing is clearly not present in the uploaded document context, use the fallback answer. But if the context contains a relevant answer, answer from the context.
-- Do not answer by using a broader related section. Do not infer that a missing topic is covered by another topic.
-- If none of the requested information is explicitly found in the uploaded document context, or if the user asks about a specific topic that is not explicitly named or clearly described in the context, the answer must be exactly: "Sorry, I don't have this data yet. Please ask your admin to upload it."
-- When using that fallback answer, set "document_used": false, "used_source_numbers": [], and "used_source_titles": [].
-- Set "document_used": true only when the final answer is directly supported by the uploaded document context.
-- If the user asks multiple things in one message, answer each requested part separately.
-- Use every uploaded source block that directly supports any part of the final answer.
-- Include in "used_source_numbers" ONLY the SOURCE numbers whose content directly supports the final answer.
-- Include in "used_source_titles" ONLY the exact file names whose content directly supports the final answer.
-- If the final answer uses one document, include only that one document.
-- If the final answer combines information from two or more documents, include all and only those documents.
-- If one requested part is found and another requested part is not found, answer the found part and clearly say only that the missing part is not available in the uploaded documents.
-- Do not turn a partially supported multi-part question into the full fallback answer unless none of the requested parts are supported.
-- Do not include retrieved files that were not used in the final answer.
-- Do not include a source just because it was retrieved. Include it only if its content appears in or directly supports the answer.
-- If the user identifies a specific document, form, report, procedure, code, reference, or title using words from the query, prefer source blocks whose file name or content matches those words, unless another source is explicitly needed.
-- Do not include document references inside the answer. The frontend will show sources separately.
-- Return JSON only. Do not wrap it in markdown.
-- Use the memory-aware retrieval query only to understand follow-up context. The factual answer must still come only from the uploaded document context.
-- Never say "the document does not provide additional details" for a topic that is not explicitly in the document. Use the fallback answer instead.
-Invoice rule:
-- If the user asks what invoices exist, list invoice files found in the uploaded context.
-- If the user asks for spend, totals, line items, beef, meat, fish, vegetables, provisions, subtotal, tax, or total due, calculate only from explicit readable values in the uploaded context.
-- PDF form fields are valid extracted document evidence.
-- Never invent missing amounts.
-- If an invoice exists but readable line items/totals are missing, say the invoice was found but the needed values were not extracted.
-- Do not use the generic fallback when invoice files are present.
-
-Memory-aware retrieval query:
-{retrieval_query_input}
-
-Original user question:
+User question:
 {query}
 
 Uploaded document context:
@@ -5719,86 +5656,12 @@ Uploaded document context:
 """.strip()
         )
 
-        parsed = parse_llm_json_response(raw_answer)
-
-        document_used = False
-        used_source_numbers = []
-        used_source_titles = []
-
-        if parsed and isinstance(parsed, dict):
-            answer = str(parsed.get("answer") or "").strip()
-            document_used = bool(parsed.get("document_used"))
-
-            raw_used_numbers = parsed.get("used_source_numbers") or []
-            raw_used_titles = parsed.get("used_source_titles") or []
-
-            if isinstance(raw_used_numbers, list):
-                for number in raw_used_numbers:
-                    try:
-                        number = int(number)
-                        if number > 0:
-                            used_source_numbers.append(number)
-                    except Exception:
-                        pass
-
-            if isinstance(raw_used_titles, list):
-                used_source_titles = [
-                    str(title).strip()
-                    for title in raw_used_titles
-                    if str(title).strip()
-                ]
-
-        else:
-            print("LOCAL CHAT JSON ROUTING PARSE FAILED:", str(raw_answer)[:500])
-            answer = FALLBACK_NO_DATA_ANSWER
-            document_used = False
-            used_source_numbers = []
-            used_source_titles = []
-
-        if not answer:
-            answer = FALLBACK_NO_DATA_ANSWER
-            document_used = False
-            used_source_numbers = []
-            used_source_titles = []
+        answer = str(raw_answer or "").strip() or FALLBACK_NO_DATA_ANSWER
 
         if answer.strip() == FALLBACK_NO_DATA_ANSWER:
-            document_used = False
-            used_source_numbers = []
-            used_source_titles = []
-
-        if document_used and answer.strip() != FALLBACK_NO_DATA_ANSWER:
-            source_rows = []
-
-            if used_source_numbers:
-                for source_number in used_source_numbers:
-                    index = source_number - 1
-
-                    if 0 <= index < len(matched_rows):
-                        source_rows.append(matched_rows[index])
-
-            if not source_rows and used_source_titles:
-                normalized_used_titles = {
-                    title.lower().strip()
-                    for title in used_source_titles
-                }
-
-                for row in matched_rows:
-                    row_file_name = str(row.get("file_name") or "").lower().strip()
-                    row_original_name = str(row.get("original_file_name") or "").lower().strip()
-
-                    if (
-                        row_file_name in normalized_used_titles
-                        or row_original_name in normalized_used_titles
-                    ):
-                        source_rows.append(row)
-
-            if not source_rows:
-                sources = []
-            else:
-                sources = build_sources_from_asset_results(source_rows)
-
-        else:
             sources = []
+        else:
+            sources = build_sources_from_asset_results(matched_rows[:3])
 
     else:
         raw_answer = ask_llm(
