@@ -23,7 +23,8 @@ from app.extractors import (
 )
 from app.image_ai import (
     describe_image,
-    extract_ocr_from_image
+    extract_ocr_from_image,
+    extract_ocr_from_pdf_pages
 )
 
 
@@ -3688,6 +3689,31 @@ def process_uploaded_asset(
 
             extracted_text = clean_text_for_postgres(extracted_text)
 
+        if file_type == "pdf":
+            should_run_pdf_ocr = False
+
+            # Scanned invoices often return almost no text from pypdf.
+            if not extracted_text or len(extracted_text.strip()) < 80:
+                should_run_pdf_ocr = True
+
+            # Also run OCR if the text looks weak for invoice calculations.
+            digit_count = sum(char.isdigit() for char in extracted_text or "")
+            if digit_count < 5:
+                should_run_pdf_ocr = True
+
+            if should_run_pdf_ocr:
+                file.seek(0)
+                pdf_ocr_text = extract_ocr_from_pdf_pages(
+                    file=file,
+                    filename=filename,
+                    max_pages=8
+                )
+
+                pdf_ocr_text = clean_text_for_postgres(pdf_ocr_text)
+
+                if pdf_ocr_text:
+                    ocr_text = pdf_ocr_text
+
         if file_type == "image":
             file.seek(0)
             visual_description = describe_image(file, filename)
@@ -3722,7 +3748,7 @@ def process_uploaded_asset(
         detected_event = detect_event(combined_text)
         tags = generate_basic_tags(combined_text)
 
-        summary = combined_text[:1500] if combined_text else None
+        summary = combined_text[:1500]
 
         supabase.table("assets").update({
             "extracted_text": extracted_text or None,
@@ -3730,13 +3756,14 @@ def process_uploaded_asset(
             "ocr_text": ocr_text or None,
             "detected_date": detected_date.isoformat() if detected_date else None,
             "detected_year": detected_year,
-            "detected_month": detected_month,
-            "detected_day": detected_day,
+            "detected_month": detected_date.month if detected_date else None,
+            "detected_day": detected_date.day if detected_date else None,
             "date_source": date_source,
             "detected_event": detected_event,
             "tags": tags,
             "summary": summary,
-            "processing_status": "processed"
+            "processing_status": "processed",
+            "processing_error": None
         }).eq("id", asset_id).execute()
 
         create_asset_chunks(
@@ -4126,8 +4153,13 @@ Important rules:
 - Do NOT use general knowledge unless it is only to describe what is visible/readable in the uploaded file.
 - If it is a photo, use "Image visual description" and "OCR text" if available.
 - If it is a document, use "Extracted document text" if available.
-- If the user asks "what is this about?", summarize what the uploaded file/photo appears to contain.
-- If the user asks to analyze it, analyze only what is visible or written in the uploaded file.
+- If the uploaded file is an invoice, receipt, quote, statement, or purchase order, extract the visible financial fields.
+- If the user asks for calculations, calculate directly from the visible extracted values.
+- Show the arithmetic you used, for example: subtotal + tax = total.
+- If a number needed for the calculation is missing or unreadable, say exactly which value is missing.
+- Do not say you cannot calculate if the visible text contains the numbers needed.
+- If the user asks "what is this about?", summarise what the uploaded file/photo appears to contain.
+- If the user asks to analyse it, analyse only what is visible or written in the uploaded file.
 - If the uploaded context is weak, say exactly what you can see/read and say what is unclear.
 - Never use the fallback "Sorry, I don't have this data yet. Please ask your admin to upload it." in this uploaded-file mode.
 
