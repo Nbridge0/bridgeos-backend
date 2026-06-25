@@ -30,7 +30,11 @@ Current user request:
         response = requests.post(
             url,
             json={
-                "prompt": prompt
+                "prompt": prompt,
+                "max_tokens": 2500,
+                "max_new_tokens": 2500,
+                "max_output_tokens": 2500,
+                "temperature": 0.1
             },
             headers={
                 "Content-Type": "application/json",
