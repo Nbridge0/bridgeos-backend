@@ -5994,7 +5994,85 @@ Source text:
         print("SOURCE SUPPORT VALIDATION ERROR:", type(e).__name__, str(e))
 
     return False
+def filter_rows_that_directly_answer_query(query: str, rows: list[dict]) -> list[dict]:
+    """
+    Keeps only rows that directly answer the user's exact question.
 
+    No hardcoded topics, brands, products, files, or question examples.
+    """
+
+    clean_query = str(query or "").strip()
+
+    if not clean_query or not rows:
+        return []
+
+    context = build_context_from_asset_results(rows[:20])
+
+    if not context.strip():
+        return []
+
+    try:
+        raw = ask_llm(
+            query=clean_query,
+            context=f"""
+You are checking whether retrieved document sources contain data that directly answers a user's question.
+
+Return ONLY valid JSON:
+
+{{
+  "direct_source_numbers": [1, 2]
+}}
+
+or:
+
+{{
+  "direct_source_numbers": []
+}}
+
+Rules:
+- Select a source ONLY if it directly contains the information needed to answer the user's exact question.
+- Do NOT select a source just because it is generally about yacht operations, safety, security, handovers, equipment, invoices, forms, procedures, or similar topics.
+- Do NOT select a source if it is only loosely related.
+- Do NOT select a source if the answer would require general knowledge or guessing.
+- Do NOT select a source if it does not contain the actual answer.
+- If no source directly answers the question, return an empty list.
+- Do not explain.
+- Return JSON only.
+
+User question:
+{clean_query}
+
+Retrieved sources:
+{context}
+""".strip()
+        )
+
+        parsed = parse_llm_json_response(raw)
+
+        if not parsed or not isinstance(parsed, dict):
+            return []
+
+        numbers = parsed.get("direct_source_numbers") or []
+
+        if not isinstance(numbers, list):
+            return []
+
+        direct_rows = []
+
+        for number in numbers:
+            try:
+                index = int(number) - 1
+            except Exception:
+                continue
+
+            if 0 <= index < len(rows[:20]):
+                direct_rows.append(rows[index])
+
+        return direct_rows
+
+    except Exception as e:
+        print("DIRECT SOURCE FILTER ERROR:", type(e).__name__, str(e))
+        return []
 
 def chat(
     query: str,
