@@ -6473,10 +6473,12 @@ Always respond in British English.
 
 You may answer ONLY if the document context directly answers the user's exact question.
 
+Your answer should be helpful and slightly detailed, but every detail must come from the document context.
+
 You MUST return ONLY valid JSON in this exact shape:
 
 {{
-  "answer": "clear user-facing answer",
+  "answer": "clear user-facing answer with useful detail",
   "document_used": true,
   "used_sources": [
     {{
@@ -6499,9 +6501,22 @@ Rules:
 - Do not use general knowledge.
 - Do not fill gaps.
 - Do not infer facts that are not in the context.
+- Do not add assumptions, recommendations, causes, reasons, risks, dates, values, names, or steps unless they are directly present in the context.
 - Do not answer from loosely related context.
 - If the exact answer is not directly present in the context, answer exactly:
 {FALLBACK_NO_DATA_ANSWER}
+
+Detail rules:
+- Give a fuller answer when the document contains enough information.
+- You may rephrase the document in a clearer, more useful way.
+- You may organise the answer into short paragraphs or bullets.
+- You may explain what the documented item means only using wording and facts present in the context.
+- You may include surrounding relevant details from the same source if they directly support the answer.
+- Do not add anything that is not supported by the selected source.
+- If the document only contains a short fact, keep the answer short.
+- If the document contains multiple relevant details, include them.
+
+Source rules:
 - Set "document_used": true only if the final answer is directly taken from the context.
 - If "document_used" is true, include at least one item in "used_sources".
 - Each used source must include a valid "source_number".
@@ -6512,12 +6527,12 @@ Rules:
 - Return JSON only.
 
 User question:
-{query}
+{retrieval_query_input}
 
 Document context:
 {context}
 """.strip()
-        )
+)
 
         parsed = parse_llm_json_response(raw_answer)
 
