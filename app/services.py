@@ -3783,20 +3783,8 @@ def process_uploaded_asset(
             file.seek(0)
             ocr_text = extract_ocr_from_image(file, filename)
 
-            file.seek(0)
-            invoice_text = extract_invoice_text_from_image(file, filename)
-
             if ocr_text == "NO_READABLE_TEXT":
                 ocr_text = ""
-
-            if invoice_text == "NO_READABLE_TEXT":
-                invoice_text = ""
-
-            if invoice_text:
-                if ocr_text:
-                    ocr_text = f"{ocr_text}\n\nFinancial document extraction:\n{invoice_text}"
-                else:
-                    ocr_text = f"Financial document extraction:\n{invoice_text}"
 
             visual_description = clean_text_for_postgres(visual_description)
             ocr_text = clean_text_for_postgres(ocr_text)
