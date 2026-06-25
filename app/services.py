@@ -6331,15 +6331,7 @@ Rules:
 
                     matched_rows = list(matched_rows_by_key.values())[:30]
 
-                    print("LOCAL CHAT DEBUG: matched chunks before direct filter:", len(matched_rows))
-
-                    if matched_rows and not is_file_listing_query(query):
-                        matched_rows = filter_rows_that_directly_answer_query(
-                            query=query,
-                            rows=matched_rows
-                        )
-
-                    print("LOCAL CHAT DEBUG: matched chunks after direct filter:", len(matched_rows))
+                    print("LOCAL CHAT DEBUG: matched chunks:", len(matched_rows))
 
                     if matched_rows:
                         context = build_context_from_asset_results(matched_rows)
@@ -6373,14 +6365,19 @@ You are BridgeOS, a private document-based assistant.
 
 Always respond in British English.
 
-You may answer ONLY if the uploaded document context directly answers the user's exact question.
+You may answer ONLY if the document context directly answers the user's exact question.
 
 You MUST return ONLY valid JSON in this exact shape:
 
 {{
   "answer": "clear user-facing answer",
   "document_used": true,
-  "used_source_numbers": [1]
+  "used_sources": [
+    {{
+      "source_number": 1,
+      "evidence_quote": "exact short quote copied from the source that proves the answer"
+    }}
+  ]
 }}
 
 or:
@@ -6388,7 +6385,7 @@ or:
 {{
   "answer": "{FALLBACK_NO_DATA_ANSWER}",
   "document_used": false,
-  "used_source_numbers": []
+  "used_sources": []
 }}
 
 Rules:
@@ -6400,9 +6397,11 @@ Rules:
 - If the exact answer is not directly present in the context, answer exactly:
 {FALLBACK_NO_DATA_ANSWER}
 - Set "document_used": true only if the final answer is directly taken from the context.
-- If "document_used" is true, include at least one source number in "used_source_numbers".
-- Use only source numbers that directly support the answer.
-- If no source directly supports the answer, use the fallback answer.
+- If "document_used" is true, include at least one item in "used_sources".
+- Each "evidence_quote" must be copied exactly from the selected source.
+- Do not invent evidence quotes.
+- Do not include a source just because it was retrieved.
+- If no exact quote proves the answer, use the fallback answer.
 - Do not include document names inside the answer.
 - Return JSON only.
 
@@ -6412,7 +6411,7 @@ User question:
 Document context:
 {context}
 """.strip()
-        )
+)
 
         parsed = parse_llm_json_response(raw_answer)
 
