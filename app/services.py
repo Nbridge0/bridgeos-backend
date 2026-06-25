@@ -1120,9 +1120,13 @@ def update_chat_title(chat_id: str, crew_id: str, yacht_id: str, title: str):
 def delete_chat(chat_id: str, crew_id: str, yacht_id: str):
     """
     Deletes a chat only if it belongs to this exact crew member.
-    Also removes its messages first.
 
-    Chat-linked assets are kept, but detached from the deleted chat.
+    Also deletes files uploaded inside that chat.
+
+    Important:
+    - Do NOT detach chat assets by setting chat_id = None.
+    - Detaching can violate the global asset hash uniqueness constraint.
+    - Chat-uploaded assets belong to that chat, so deleting the chat should delete those chat assets.
     """
 
     verify_chat_access(
@@ -1132,6 +1136,57 @@ def delete_chat(chat_id: str, crew_id: str, yacht_id: str):
     )
 
     try:
+        # Find assets uploaded inside this chat.
+        chat_assets_res = supabase.table("assets") \
+            .select("id, storage_path, file_name, original_file_name") \
+            .eq("chat_id", chat_id) \
+            .eq("yacht_id", yacht_id) \
+            .execute()
+
+        chat_assets = chat_assets_res.data or []
+        chat_asset_ids = [
+            asset["id"]
+            for asset in chat_assets
+            if asset.get("id")
+        ]
+
+        # Delete chunks and access rows for chat assets.
+        if chat_asset_ids:
+            supabase.table("asset_chunks") \
+                .delete() \
+                .in_("asset_id", chat_asset_ids) \
+                .eq("yacht_id", yacht_id) \
+                .execute()
+
+            try:
+                supabase.table("asset_access") \
+                    .delete() \
+                    .in_("asset_id", chat_asset_ids) \
+                    .execute()
+            except Exception as e:
+                print("CHAT ASSET ACCESS DELETE WARNING:", type(e).__name__, str(e))
+
+            # Delete physical files from storage.
+            storage_paths = [
+                asset.get("storage_path")
+                for asset in chat_assets
+                if asset.get("storage_path")
+            ]
+
+            if storage_paths:
+                try:
+                    storage_admin.storage.from_(BUCKET_NAME).remove(storage_paths)
+                except Exception as e:
+                    print("CHAT ASSET STORAGE DELETE WARNING:", type(e).__name__, str(e))
+
+            # Delete asset rows.
+            supabase.table("assets") \
+                .delete() \
+                .in_("id", chat_asset_ids) \
+                .eq("yacht_id", yacht_id) \
+                .execute()
+
+        # Delete chat messages.
         supabase.table("messages") \
             .delete() \
             .eq("chat_id", chat_id) \
@@ -1139,14 +1194,7 @@ def delete_chat(chat_id: str, crew_id: str, yacht_id: str):
             .eq("yacht_id", yacht_id) \
             .execute()
 
-        supabase.table("assets") \
-            .update({
-                "chat_id": None
-            }) \
-            .eq("chat_id", chat_id) \
-            .eq("yacht_id", yacht_id) \
-            .execute()
-
+        # Delete the chat itself.
         res = supabase.table("chats") \
             .delete() \
             .eq("id", chat_id) \
@@ -1165,9 +1213,9 @@ def delete_chat(chat_id: str, crew_id: str, yacht_id: str):
 
     return {
         "message": "Chat deleted successfully",
-        "deleted_chat_id": chat_id
+        "deleted_chat_id": chat_id,
+        "deleted_chat_assets": len(chat_asset_ids)
     }
-
 
 def get_chat_messages(chat_id: str, crew_id: str, yacht_id: str):
     """
