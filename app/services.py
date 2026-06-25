@@ -685,6 +685,39 @@ def chat_with_runpod_bridgeos(
         crew_id=crew["id"],
         yacht_id=crew["yacht_id"]
     )
+    query_scope = classify_bridgeos_query_scope(query)
+
+    if query_scope == "factual" and not uploaded_asset_id:
+        answer = FALLBACK_NO_DATA_ANSWER
+
+        supabase.table("messages").insert({
+            "chat_id": chat_id,
+            "yacht_id": crew["yacht_id"],
+            "crew_id": crew["id"],
+            "role": "user",
+            "content": query,
+            "sources": []
+        }).execute()
+
+        supabase.table("messages").insert({
+            "chat_id": chat_id,
+            "yacht_id": crew["yacht_id"],
+            "crew_id": crew["id"],
+            "role": "assistant",
+            "content": answer,
+            "sources": []
+        }).execute()
+
+        supabase.table("chats").update({
+            "updated_at": "now()"
+        }).eq("id", chat_id).eq("crew_id", crew["id"]).eq("yacht_id", crew["yacht_id"]).execute()
+
+        return {
+            "answer": answer,
+            "sources": [],
+            "provider": "runpod_bridgeos",
+            "error": False
+        }
 
     uploaded_asset = None
 
@@ -5854,72 +5887,76 @@ Content:
 
 def classify_bridgeos_query_scope(query: str) -> str:
     """
-    Generic gate:
-    - conversational = safe to answer without documents
-    - factual = must be answered from document context only
+    Conservative gate.
 
-    No hardcoded product names, brands, invoice names, or question examples.
+    conversational = allowed without documents
+    factual = must come from documents, otherwise fallback
+
+    No product names, brands, vendors, equipment names, or specific questions are hardcoded.
     """
 
-    clean_query = (query or "").strip()
+    clean = " ".join(str(query or "").lower().strip().split())
 
-    if not clean_query:
+    if not clean:
         return "conversational"
 
-    try:
-        raw = ask_llm(
-            query=clean_query,
-            context=f"""
-Classify this user message for a private yacht-document assistant.
+    stripped = clean.strip(" .,!?\n\t")
 
-Return ONLY one word:
+    conversational_exact = {
+        "hi",
+        "hello",
+        "hey",
+        "hiya",
+        "good morning",
+        "good afternoon",
+        "good evening",
+        "thanks",
+        "thank you",
+        "thank you very much",
+        "ok",
+        "okay",
+        "cool",
+        "great",
+        "nice",
+        "bye",
+        "goodbye",
+    }
 
-conversational
+    if stripped in conversational_exact:
+        return "conversational"
 
-or
+    conversational_starts = [
+        "hi ",
+        "hello ",
+        "hey ",
+        "thanks ",
+        "thank you ",
+    ]
 
-factual
-
-Definitions:
-
-conversational:
-- greetings
-- thanks
-- small talk
-- asking what the assistant can do
-- asking how to use the app
-- asking how to upload, search, or find documents
-- asking for help phrasing a document search
-
-factual:
-- asks for real-world facts
-- asks for technical, product, equipment, operational, legal, financial, or procedural information
-- asks what should be used, chosen, bought, installed, paid, done, required, responsible, scheduled, or recommended
-- asks about prices, dates, people, procedures, policies, manuals, invoices, reports, operations, yacht data, owner data, guest data, crew data, or calculations from stored information
-- requires knowledge outside normal conversation
-
-Rules:
-- If unsure, return factual.
-- Do not answer the user.
-- Do not explain.
-- Return only conversational or factual.
-
-User message:
-{clean_query}
-""".strip()
-        )
-
-        scope = str(raw or "").strip().lower()
-
-        if "conversational" in scope and "factual" not in scope:
+    if any(stripped.startswith(item) for item in conversational_starts):
+        if len(stripped.split()) <= 8:
             return "conversational"
 
-        return "factual"
+    app_help_phrases = [
+        "what can you do",
+        "how can you help",
+        "how do i use bridgeos",
+        "how do i upload",
+        "how can i upload",
+        "how do i search",
+        "how can i search",
+        "help me search",
+        "help me find a document",
+        "help me find documents",
+        "help me find a file",
+        "help me find files",
+        "what can i ask",
+    ]
 
-    except Exception as e:
-        print("QUERY SCOPE CLASSIFIER ERROR:", type(e).__name__, str(e))
-        return "factual"
+    if any(phrase in stripped for phrase in app_help_phrases):
+        return "conversational"
 
+    return "factual"
 def validate_answer_supported_by_source(query: str, answer: str, source_row: dict) -> bool:
     """
     Checks whether one selected source directly supports the answer
