@@ -5428,15 +5428,9 @@ def get_previous_user_query(chat_id: str, current_query: str) -> str:
 
 def build_memory_aware_retrieval_input(query: str, chat_id: str) -> str:
     """
-    Turns short follow-up questions into standalone retrieval queries.
+    Rewrites follow-up questions into standalone document-search questions.
 
-    Examples of behaviour without hardcoding topics:
-    - Previous: "How much did we pay for X?"
-      Current: "and Y?"
-      Output: "How much did we pay for Y?"
-
-    Uses recent chat only to resolve the user's intent.
-    The answer must still come from uploaded document chunks.
+    No hardcoded topics, products, vendors, food names, years, or document names.
     """
 
     clean_query = str(query or "").strip()
@@ -5444,48 +5438,49 @@ def build_memory_aware_retrieval_input(query: str, chat_id: str) -> str:
     if not clean_query:
         return ""
 
-    recent_chat_context = get_recent_chat_context(
+    recent_user_context = get_recent_user_context(
         chat_id=chat_id,
-        limit=8
+        current_query=clean_query,
+        limit=6
     )
 
-    if not recent_chat_context.strip():
+    if not recent_user_context.strip():
         return clean_query
 
     try:
         rewritten = ask_llm(
             query=clean_query,
             context=f"""
-You rewrite the user's latest message into a complete standalone search query for document retrieval.
+You rewrite the latest user message into a complete standalone search query for document retrieval.
 
-Use the recent conversation ONLY to understand what the user is referring to.
+Use only the previous user messages to understand the user's intent.
 
 Rules:
 - Do not answer the question.
 - Do not add facts.
-- Do not invent document names.
 - Do not invent values.
-- Do not use general knowledge.
-- Preserve the user's latest requested item/entity.
-- If the latest message is a follow-up, rewrite it as a full standalone question.
+- Do not invent document names.
+- Do not use assistant replies.
+- Preserve the latest user-requested item, date, person, object, category, or subject.
+- If the latest message is a follow-up, rewrite it as a full standalone question using the previous user message pattern.
 - If the latest message is already standalone, return it unchanged.
 - Return plain text only.
 - No explanations.
 
-Recent conversation:
-{recent_chat_context}
+Previous user messages:
+{recent_user_context}
 
 Latest user message:
 {clean_query}
 
-Standalone retrieval query:
+Standalone search query:
 """.strip()
         )
 
         rewritten = str(rewritten or "").strip()
 
         if rewritten:
-            print("LOCAL CHAT DEBUG: rewritten follow-up query:", rewritten)
+            print("LOCAL CHAT DEBUG: rewritten retrieval query:", rewritten)
             return rewritten
 
     except Exception as e:
@@ -6004,70 +5999,105 @@ Source text:
         print("SOURCE SUPPORT VALIDATION ERROR:", type(e).__name__, str(e))
 
     return False
+
 def classify_bridgeos_query_scope(query: str) -> str:
     """
-    Generic classifier.
+    Conservative deterministic gate.
 
-    conversational = can be answered without documents
-    factual = must be answered from uploaded/retrieved documents only
+    conversational = safe to answer without documents
+    factual = must be answered from documents only
 
-    No hardcoded topics, products, brands, vendors, yacht terms, or specific questions.
+    No hardcoded products, vendors, file names, document topics, or question examples.
     """
 
-    clean_query = str(query or "").strip()
+    clean = " ".join(str(query or "").strip().lower().split())
 
-    if not clean_query:
+    if not clean:
         return "conversational"
 
+    stripped = clean.strip(" .,!?\n\t")
+
+    conversational_exact = {
+        "hi",
+        "hello",
+        "hey",
+        "hiya",
+        "good morning",
+        "good afternoon",
+        "good evening",
+        "thanks",
+        "thank you",
+        "thank you very much",
+        "ok",
+        "okay",
+        "cool",
+        "great",
+        "nice",
+        "bye",
+        "goodbye",
+    }
+
+    if stripped in conversational_exact:
+        return "conversational"
+
+    app_help_phrases = [
+        "what can you do",
+        "how can you help",
+        "how do i use",
+        "how do i upload",
+        "how can i upload",
+        "how do i search",
+        "how can i search",
+        "help me search",
+        "help me find",
+        "what can i ask",
+    ]
+
+    if any(phrase in stripped for phrase in app_help_phrases):
+        return "conversational"
+
+    # Anything else needs document proof.
+    return "factual"
+
+def get_recent_user_context(chat_id: str, current_query: str, limit: int = 6) -> str:
+    """
+    Gets recent user messages only.
+
+    This is used to resolve follow-ups.
+    Assistant replies are intentionally excluded so fallback/sorry answers do not pollute the rewrite.
+    """
+
     try:
-        raw = ask_llm(
-            query=clean_query,
-            context=f"""
-You are classifying a user message for a private document-based assistant.
+        res = supabase.table("messages") \
+            .select("role, content, created_at") \
+            .eq("chat_id", chat_id) \
+            .eq("role", "user") \
+            .order("created_at", desc=True) \
+            .limit(limit) \
+            .execute()
 
-Return ONLY one word:
+        rows = list(reversed(res.data or []))
 
-conversational
+        current_clean = str(current_query or "").strip()
+        parts = []
 
-or
+        for row in rows:
+            content = str(row.get("content") or "").strip()
 
-factual
+            if not content:
+                continue
 
-Definitions:
+            # Skip the current message because chat() already inserted it.
+            if content == current_clean:
+                continue
 
-conversational:
-- The user is greeting, thanking, saying goodbye, acknowledging, or making brief small talk.
-- The user is asking how to use the assistant or how to search/upload/find documents.
-- The user is not asking for factual information about the world, operations, products, people, procedures, values, dates, recommendations, explanations, or stored records.
+            parts.append(content)
 
-factual:
-- The user asks for any information, explanation, recommendation, instruction, fact, value, date, person, responsibility, procedure, comparison, calculation, product detail, operational detail, or document-based answer.
-- The user asks "what", "which", "who", "when", "where", "why", "how", "how much", "should", "can", "does", "is", or asks for a definition/explanation that is not just app usage.
-- The answer would require knowledge or data, whether from documents or general knowledge.
-
-Rules:
-- If the message could require factual knowledge, return factual.
-- If unsure, return factual.
-- Do not answer the user.
-- Do not explain.
-- Return only conversational or factual.
-
-User message:
-{clean_query}
-""".strip()
-        )
-
-        value = str(raw or "").strip().lower()
-
-        if value == "conversational":
-            return "conversational"
-
-        return "factual"
+        return "\n".join(parts)
 
     except Exception as e:
-        print("QUERY SCOPE CLASSIFIER ERROR:", type(e).__name__, str(e))
-        return "factual"
-
+        print("RECENT USER CONTEXT ERROR:", type(e).__name__, str(e))
+        return ""
 
 def filter_rows_that_directly_answer_query(query: str, rows: list[dict]) -> list[dict]:
     """
