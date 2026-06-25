@@ -5920,6 +5920,81 @@ User message:
         print("QUERY SCOPE CLASSIFIER ERROR:", type(e).__name__, str(e))
         return "factual"
 
+def validate_answer_supported_by_source(query: str, answer: str, source_row: dict) -> bool:
+    """
+    Checks whether one selected source directly supports the answer
+    to the user's exact question.
+
+    This prevents:
+    - hallucinated answers
+    - loosely related documents being used as sources
+    - random retrieved chunks being shown as source cards
+    """
+
+    clean_query = str(query or "").strip()
+    clean_answer = str(answer or "").strip()
+
+    if not clean_query or not clean_answer:
+        return False
+
+    if clean_answer == FALLBACK_NO_DATA_ANSWER:
+        return False
+
+    source_content = str(source_row.get("content") or "").strip()
+
+    if not source_content:
+        return False
+
+    try:
+        raw = ask_llm(
+            query=clean_query,
+            context=f"""
+You are validating whether a document source directly supports an answer.
+
+Return ONLY valid JSON:
+
+{{
+  "supported": true
+}}
+
+or:
+
+{{
+  "supported": false
+}}
+
+Rules:
+- supported=true ONLY if the source text directly answers the user's exact question.
+- supported=true ONLY if the answer is clearly grounded in this source text.
+- supported=false if the source is only loosely related.
+- supported=false if the source is about a similar topic but does not answer the exact question.
+- supported=false if the answer uses outside knowledge.
+- supported=false if the answer adds facts not present in the source.
+- supported=false if the source would not be enough for a human to verify the answer.
+- Do not explain.
+- Return JSON only.
+
+User question:
+{clean_query}
+
+Answer:
+{clean_answer}
+
+Source text:
+{source_content}
+""".strip()
+        )
+
+        parsed = parse_llm_json_response(raw)
+
+        if parsed and isinstance(parsed, dict):
+            return bool(parsed.get("supported"))
+
+    except Exception as e:
+        print("SOURCE SUPPORT VALIDATION ERROR:", type(e).__name__, str(e))
+
+    return False
+
 
 def chat(
     query: str,
@@ -6141,6 +6216,13 @@ Strict rules:
 - The answer should be natural and helpful, not just a number.
 - If the user asks "how much", include the amount and a short explanation of what it refers to.
 - Set "document_used": false only for greetings, thanks, small talk, app-help, or conversational replies that do not need document context.
+- The selected source must directly answer the user's exact question.
+- Do not use a source that is only loosely related to the question.
+- Do not use a source just because it mentions a similar topic.
+- If the context contains related documents but none directly answer the exact question, answer exactly:
+{FALLBACK_NO_DATA_ANSWER}
+- If you cannot identify a directly supporting source number, answer exactly:
+{FALLBACK_NO_DATA_ANSWER}
 - If the user asks a factual, technical, product, operational, legal, financial, yacht-specific, or external-knowledge question, answer ONLY if the uploaded document context directly contains the answer.
 - If the uploaded document context does not directly contain the answer, answer exactly:
 {FALLBACK_NO_DATA_ANSWER}
@@ -6211,12 +6293,29 @@ Uploaded document context:
                         index = source_number - 1
 
                         if 0 <= index < len(matched_rows):
-                            source_rows.append(matched_rows[index])
+                            candidate_row = matched_rows[index]
 
-                if not source_rows and matched_rows:
-                    source_rows = [matched_rows[0]]
+                            if validate_answer_supported_by_source(
+                                query=query,
+                                answer=answer,
+                                source_row=candidate_row
+                            ):
+                                source_rows.append(candidate_row)
+                            else:
+                                print(
+                                    "SOURCE REJECTED AS NOT DIRECTLY SUPPORTING ANSWER:",
+                                    {
+                                        "source_number": source_number,
+                                        "asset_id": candidate_row.get("asset_id"),
+                                        "file_name": candidate_row.get("file_name") or candidate_row.get("original_file_name")
+                                    }
+                                )
 
-                sources = build_sources_from_asset_results(source_rows)
+                if source_rows:
+                    sources = build_sources_from_asset_results(source_rows)
+                else:
+                    answer = FALLBACK_NO_DATA_ANSWER
+                    sources = []
             else:
                 sources = []
 
