@@ -6510,6 +6510,12 @@ Detail rules:
 - If the document contains a list of responsibilities, duties, steps, checks, requirements, or items, include the full relevant list.
 - Do not summarise a long relevant list into one short sentence.
 - Do not omit relevant items from the selected source just to be brief.
+- Do not cut the answer mid-section.
+- Do not stop after only part of a numbered section if the remaining lines are still relevant.
+- If the context includes a numbered section, include the full relevant numbered section.
+- If the context includes bullet points under a relevant heading, include all relevant bullets under that heading.
+- If the answer is long, continue until the relevant section is complete.
+- Do not end with an unfinished sentence, unfinished bullet, or unfinished list.
 - If the document gives several responsibilities or requirements, present them as bullets.
 - If the document gives only one short fact, keep the answer short.
 - If multiple retrieved sources directly support the answer, combine them, but only include details that answer the user's question.
@@ -6517,7 +6523,6 @@ Detail rules:
 - You may rephrase for readability, but you must preserve the meaning exactly.
 - Do not change, add, delete, soften, strengthen, or reinterpret the document content.
 - Do not include unrelated sections just because they appear nearby.
-
 Source rules:
 - Set "document_used": true only if the final answer is directly taken from the context.
 - If "document_used" is true, include at least one item in "used_sources".
