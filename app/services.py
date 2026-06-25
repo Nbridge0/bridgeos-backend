@@ -6215,6 +6215,116 @@ Retrieved sources:
         print("DIRECT SOURCE FILTER ERROR:", type(e).__name__, str(e))
         return []
 
+def get_previous_assistant_source_asset_ids(
+    chat_id: str,
+    crew_id: str,
+    yacht_id: str,
+    limit: int = 6
+) -> list[str]:
+    """
+    Gets source asset ids from the most recent assistant answer that had sources.
+
+    Used for follow-up questions so BridgeOS expands from the same document
+    instead of searching unrelated documents.
+    """
+
+    try:
+        res = supabase.table("messages") \
+            .select("role, sources, created_at") \
+            .eq("chat_id", chat_id) \
+            .eq("crew_id", crew_id) \
+            .eq("yacht_id", yacht_id) \
+            .eq("role", "assistant") \
+            .order("created_at", desc=True) \
+            .limit(limit) \
+            .execute()
+
+        for row in res.data or []:
+            row_sources = row.get("sources") or []
+
+            if not isinstance(row_sources, list):
+                continue
+
+            asset_ids = []
+
+            for source in row_sources:
+                if not isinstance(source, dict):
+                    continue
+
+                asset_id = source.get("asset_id")
+
+                if asset_id and asset_id not in asset_ids:
+                    asset_ids.append(asset_id)
+
+            if asset_ids:
+                return asset_ids
+
+    except Exception as e:
+        print("PREVIOUS ASSISTANT SOURCES ERROR:", type(e).__name__, str(e))
+
+    return []
+
+def is_contextual_followup_query(query: str, chat_id: str) -> bool:
+    """
+    Detects whether the latest user message depends on earlier chat context.
+
+    No hardcoded topics, products, vendors, or document names.
+    """
+
+    clean_query = str(query or "").strip()
+
+    if not clean_query:
+        return False
+
+    recent_user_context = get_recent_user_context(
+        chat_id=chat_id,
+        current_query=clean_query,
+        limit=6
+    )
+
+    if not recent_user_context.strip():
+        return False
+
+    try:
+        raw = ask_llm(
+            query=clean_query,
+            context=f"""
+Classify whether the latest user message depends on previous user messages.
+
+Return ONLY one word:
+
+followup
+
+or
+
+standalone
+
+Definitions:
+- followup = the latest message is incomplete without previous context, asks to continue, asks for more detail, asks "what about..." another item, or refers back to the previous topic.
+- standalone = the latest message is complete by itself.
+
+Rules:
+- Do not answer the user.
+- Do not explain.
+- Return only followup or standalone.
+
+Previous user messages:
+{recent_user_context}
+
+Latest user message:
+{clean_query}
+""".strip()
+        )
+
+        value = str(raw or "").strip().lower()
+
+        return value == "followup"
+
+    except Exception as e:
+        print("FOLLOWUP CLASSIFIER ERROR:", type(e).__name__, str(e))
+        return False
+
+    
 
 def chat(
     query: str,
@@ -6264,8 +6374,22 @@ def chat(
 
     query_scope = classify_bridgeos_query_scope(query)
 
-    # Only use an uploaded chat asset if the frontend explicitly sends it
-    # for this exact message. Do not reuse the previous uploaded file.
+    is_followup_query = is_contextual_followup_query(
+        query=query,
+        chat_id=chat_id
+    )
+
+    previous_source_asset_ids = []
+
+    if is_followup_query:
+        previous_source_asset_ids = get_previous_assistant_source_asset_ids(
+            chat_id=chat_id,
+            crew_id=crew_id,
+            yacht_id=yacht_id
+        )
+
+    print("LOCAL CHAT DEBUG: is_followup_query:", is_followup_query)
+    print("LOCAL CHAT DEBUG: previous_source_asset_ids:", previous_source_asset_ids)
     resolved_uploaded_asset_id = uploaded_asset_id
 
     # Conversational/app-help messages are allowed without documents.
@@ -6356,6 +6480,15 @@ Rules:
                     for asset in (assets_res.data or [])
                     if asset.get("id")
                 ]
+
+                if previous_source_asset_ids:
+                    allowed_asset_ids = [
+                        asset_id
+                        for asset_id in allowed_asset_ids
+                        if asset_id in previous_source_asset_ids
+                    ]
+
+                    print("LOCAL CHAT DEBUG: restricted follow-up allowed_asset_ids:", allowed_asset_ids)
 
                 print("LOCAL CHAT DEBUG: allowed_asset_ids:", allowed_asset_ids)
 
