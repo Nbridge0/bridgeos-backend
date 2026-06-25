@@ -6043,12 +6043,7 @@ def chat(
     retrieval_query_input = query
     query_scope = classify_bridgeos_query_scope(query)
 
-    resolved_uploaded_asset_id = uploaded_asset_id or get_latest_chat_asset_id(
-        chat_id=chat_id,
-        crew_id=crew_id,
-        yacht_id=yacht_id,
-        security_level=security_level
-    )
+    resolved_uploaded_asset_id = uploaded_asset_id
 
     try:
         if resolved_uploaded_asset_id:
@@ -6285,31 +6280,14 @@ Uploaded document context:
                 document_used = False
                 used_source_numbers = []
 
-            if document_used:
+            if document_used and used_source_numbers:
                 source_rows = []
 
-                if used_source_numbers:
-                    for source_number in used_source_numbers:
-                        index = source_number - 1
+                for source_number in used_source_numbers:
+                    index = source_number - 1
 
-                        if 0 <= index < len(matched_rows):
-                            candidate_row = matched_rows[index]
-
-                            if validate_answer_supported_by_source(
-                                query=query,
-                                answer=answer,
-                                source_row=candidate_row
-                            ):
-                                source_rows.append(candidate_row)
-                            else:
-                                print(
-                                    "SOURCE REJECTED AS NOT DIRECTLY SUPPORTING ANSWER:",
-                                    {
-                                        "source_number": source_number,
-                                        "asset_id": candidate_row.get("asset_id"),
-                                        "file_name": candidate_row.get("file_name") or candidate_row.get("original_file_name")
-                                    }
-                                )
+                    if 0 <= index < len(matched_rows):
+                        source_rows.append(matched_rows[index])
 
                 if source_rows:
                     sources = build_sources_from_asset_results(source_rows)
