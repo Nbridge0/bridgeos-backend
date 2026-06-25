@@ -6120,9 +6120,9 @@ def chat(
 
     Behaviour:
     - Conversational/app-use messages can be answered without documents.
-    - Any factual question must be answered only from directly relevant document context.
-    - If no direct document data exists, return FALLBACK_NO_DATA_ANSWER.
-    - Sources show only when the answer is directly taken from selected document rows.
+    - Any factual question must be answered only from document context.
+    - If no document context directly answers the question, return FALLBACK_NO_DATA_ANSWER.
+    - Sources show only when the answer is taken from selected document rows.
     - No hardcoded topics, brands, vendors, product names, or question examples.
     """
 
@@ -6155,12 +6155,11 @@ def chat(
 
     query_scope = classify_bridgeos_query_scope(query)
 
-    # Only use an uploaded chat asset if the current request explicitly sends one.
-    # Do not reuse the latest uploaded asset automatically.
+    # Only use an uploaded chat asset if the frontend explicitly sends it
+    # for this exact message. Do not reuse the previous uploaded file.
     resolved_uploaded_asset_id = uploaded_asset_id
 
     # Conversational/app-help messages are allowed without documents.
-    # Everything else must go through document search.
     if query_scope == "conversational" and not resolved_uploaded_asset_id:
         try:
             raw_answer = ask_llm(
@@ -6182,6 +6181,7 @@ Rules:
             )
 
             answer = str(raw_answer or "").strip() or "Hello. How can I help?"
+
         except Exception as e:
             print("CONVERSATIONAL CHAT ERROR:", type(e).__name__, str(e))
             answer = "Hello. How can I help?"
@@ -6221,12 +6221,6 @@ Rules:
                 security_level=security_level,
                 chat_id=chat_id
             )
-
-            if matched_rows:
-                matched_rows = filter_rows_that_directly_answer_query(
-                    query=query,
-                    rows=matched_rows
-                )
 
             if matched_rows:
                 context = build_context_from_asset_results(matched_rows)
@@ -6343,7 +6337,7 @@ Rules:
         matched_rows = []
         context = ""
 
-    # Factual question with no direct document context = sorry answer.
+    # Factual question with no retrieved document context = sorry answer.
     if not context:
         answer = FALLBACK_NO_DATA_ANSWER
         sources = []
@@ -6356,6 +6350,9 @@ Rules:
 
         answer = listing_result.get("answer") or FALLBACK_NO_DATA_ANSWER
         sources = listing_result.get("sources") or []
+
+        if answer.strip() == FALLBACK_NO_DATA_ANSWER:
+            sources = []
 
     else:
         raw_answer = ask_llm(
@@ -6375,7 +6372,7 @@ You MUST return ONLY valid JSON in this exact shape:
   "used_sources": [
     {{
       "source_number": 1,
-      "evidence_quote": "exact short quote copied from the source that proves the answer"
+      "evidence_quote": "short exact quote copied from the selected source"
     }}
   ]
 }}
@@ -6398,10 +6395,10 @@ Rules:
 {FALLBACK_NO_DATA_ANSWER}
 - Set "document_used": true only if the final answer is directly taken from the context.
 - If "document_used" is true, include at least one item in "used_sources".
-- Each "evidence_quote" must be copied exactly from the selected source.
-- Do not invent evidence quotes.
+- Each used source must include a valid "source_number".
+- Each "evidence_quote" should be copied from the selected source.
 - Do not include a source just because it was retrieved.
-- If no exact quote proves the answer, use the fallback answer.
+- If no source directly supports the answer, use the fallback answer.
 - Do not include document names inside the answer.
 - Return JSON only.
 
@@ -6411,26 +6408,46 @@ User question:
 Document context:
 {context}
 """.strip()
-)
+        )
 
         parsed = parse_llm_json_response(raw_answer)
+
+        answer = ""
+        sources = []
 
         if parsed and isinstance(parsed, dict):
             answer = str(parsed.get("answer") or "").strip()
             document_used = bool(parsed.get("document_used"))
-            raw_used_source_numbers = parsed.get("used_source_numbers") or []
 
             used_source_numbers = []
 
-            if isinstance(raw_used_source_numbers, list):
-                for number in raw_used_source_numbers:
-                    try:
-                        number = int(number)
+            # Preferred shape: used_sources = [{"source_number": 1, ...}]
+            raw_used_sources = parsed.get("used_sources") or []
 
-                        if number > 0:
-                            used_source_numbers.append(number)
-                    except Exception:
-                        pass
+            if isinstance(raw_used_sources, list):
+                for item in raw_used_sources:
+                    if isinstance(item, dict):
+                        try:
+                            source_number = int(item.get("source_number"))
+
+                            if source_number > 0:
+                                used_source_numbers.append(source_number)
+                        except Exception:
+                            pass
+
+            # Backwards compatibility if model returns used_source_numbers.
+            if not used_source_numbers:
+                raw_used_source_numbers = parsed.get("used_source_numbers") or []
+
+                if isinstance(raw_used_source_numbers, list):
+                    for number in raw_used_source_numbers:
+                        try:
+                            number = int(number)
+
+                            if number > 0:
+                                used_source_numbers.append(number)
+                        except Exception:
+                            pass
 
             if not answer:
                 answer = FALLBACK_NO_DATA_ANSWER
@@ -6441,7 +6458,7 @@ Document context:
                 document_used = False
                 used_source_numbers = []
 
-            if document_used and used_source_numbers:
+            if document_used:
                 source_rows = []
 
                 for source_number in used_source_numbers:
@@ -6453,6 +6470,7 @@ Document context:
                 if source_rows:
                     sources = build_sources_from_asset_results(source_rows)
                 else:
+                    # Never keep a document answer without a valid source.
                     answer = FALLBACK_NO_DATA_ANSWER
                     sources = []
             else:
