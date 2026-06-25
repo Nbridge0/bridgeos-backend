@@ -5428,27 +5428,70 @@ def get_previous_user_query(chat_id: str, current_query: str) -> str:
 
 def build_memory_aware_retrieval_input(query: str, chat_id: str) -> str:
     """
-    Builds a retrieval query using the previous user message as chat memory.
+    Turns short follow-up questions into standalone retrieval queries.
 
-    The previous message is used only to resolve context.
+    Examples of behaviour without hardcoding topics:
+    - Previous: "How much did we pay for X?"
+      Current: "and Y?"
+      Output: "How much did we pay for Y?"
+
+    Uses recent chat only to resolve the user's intent.
     The answer must still come from uploaded document chunks.
     """
 
-    previous_query = get_previous_user_query(
+    clean_query = str(query or "").strip()
+
+    if not clean_query:
+        return ""
+
+    recent_chat_context = get_recent_chat_context(
         chat_id=chat_id,
-        current_query=query
+        limit=8
     )
 
-    if not previous_query:
-        return query
+    if not recent_chat_context.strip():
+        return clean_query
 
-    return f"""
-Previous user request in this chat:
-{previous_query}
+    try:
+        rewritten = ask_llm(
+            query=clean_query,
+            context=f"""
+You rewrite the user's latest message into a complete standalone search query for document retrieval.
 
-Current user request:
-{query}
+Use the recent conversation ONLY to understand what the user is referring to.
+
+Rules:
+- Do not answer the question.
+- Do not add facts.
+- Do not invent document names.
+- Do not invent values.
+- Do not use general knowledge.
+- Preserve the user's latest requested item/entity.
+- If the latest message is a follow-up, rewrite it as a full standalone question.
+- If the latest message is already standalone, return it unchanged.
+- Return plain text only.
+- No explanations.
+
+Recent conversation:
+{recent_chat_context}
+
+Latest user message:
+{clean_query}
+
+Standalone retrieval query:
 """.strip()
+        )
+
+        rewritten = str(rewritten or "").strip()
+
+        if rewritten:
+            print("LOCAL CHAT DEBUG: rewritten follow-up query:", rewritten)
+            return rewritten
+
+    except Exception as e:
+        print("MEMORY AWARE QUERY REWRITE ERROR:", type(e).__name__, str(e))
+
+    return clean_query
 
 def get_latest_chat_asset_id(
     chat_id: str,
