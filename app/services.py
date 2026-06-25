@@ -5885,78 +5885,8 @@ Content:
 
     return "\n\n---\n\n".join(parts)
 
-def classify_bridgeos_query_scope(query: str) -> str:
-    """
-    Conservative gate.
 
-    conversational = allowed without documents
-    factual = must come from documents, otherwise fallback
-
-    No product names, brands, vendors, equipment names, or specific questions are hardcoded.
-    """
-
-    clean = " ".join(str(query or "").lower().strip().split())
-
-    if not clean:
-        return "conversational"
-
-    stripped = clean.strip(" .,!?\n\t")
-
-    conversational_exact = {
-        "hi",
-        "hello",
-        "hey",
-        "hiya",
-        "good morning",
-        "good afternoon",
-        "good evening",
-        "thanks",
-        "thank you",
-        "thank you very much",
-        "ok",
-        "okay",
-        "cool",
-        "great",
-        "nice",
-        "bye",
-        "goodbye",
-    }
-
-    if stripped in conversational_exact:
-        return "conversational"
-
-    conversational_starts = [
-        "hi ",
-        "hello ",
-        "hey ",
-        "thanks ",
-        "thank you ",
-    ]
-
-    if any(stripped.startswith(item) for item in conversational_starts):
-        if len(stripped.split()) <= 8:
-            return "conversational"
-
-    app_help_phrases = [
-        "what can you do",
-        "how can you help",
-        "how do i use bridgeos",
-        "how do i upload",
-        "how can i upload",
-        "how do i search",
-        "how can i search",
-        "help me search",
-        "help me find a document",
-        "help me find documents",
-        "help me find a file",
-        "help me find files",
-        "what can i ask",
-    ]
-
-    if any(phrase in stripped for phrase in app_help_phrases):
-        return "conversational"
-
-    return "factual"
+    
 def validate_answer_supported_by_source(query: str, answer: str, source_row: dict) -> bool:
     """
     Checks whether one selected source directly supports the answer
@@ -6031,11 +5961,76 @@ Source text:
         print("SOURCE SUPPORT VALIDATION ERROR:", type(e).__name__, str(e))
 
     return False
+def classify_bridgeos_query_scope(query: str) -> str:
+    """
+    Generic classifier.
+
+    conversational = can be answered without documents
+    factual = must be answered from uploaded/retrieved documents only
+
+    No hardcoded topics, products, brands, vendors, yacht terms, or specific questions.
+    """
+
+    clean_query = str(query or "").strip()
+
+    if not clean_query:
+        return "conversational"
+
+    try:
+        raw = ask_llm(
+            query=clean_query,
+            context=f"""
+You are classifying a user message for a private document-based assistant.
+
+Return ONLY one word:
+
+conversational
+
+or
+
+factual
+
+Definitions:
+
+conversational:
+- The user is greeting, thanking, saying goodbye, acknowledging, or making brief small talk.
+- The user is asking how to use the assistant or how to search/upload/find documents.
+- The user is not asking for factual information about the world, operations, products, people, procedures, values, dates, recommendations, explanations, or stored records.
+
+factual:
+- The user asks for any information, explanation, recommendation, instruction, fact, value, date, person, responsibility, procedure, comparison, calculation, product detail, operational detail, or document-based answer.
+- The user asks "what", "which", "who", "when", "where", "why", "how", "how much", "should", "can", "does", "is", or asks for a definition/explanation that is not just app usage.
+- The answer would require knowledge or data, whether from documents or general knowledge.
+
+Rules:
+- If the message could require factual knowledge, return factual.
+- If unsure, return factual.
+- Do not answer the user.
+- Do not explain.
+- Return only conversational or factual.
+
+User message:
+{clean_query}
+""".strip()
+        )
+
+        value = str(raw or "").strip().lower()
+
+        if value == "conversational":
+            return "conversational"
+
+        return "factual"
+
+    except Exception as e:
+        print("QUERY SCOPE CLASSIFIER ERROR:", type(e).__name__, str(e))
+        return "factual"
+
+
 def filter_rows_that_directly_answer_query(query: str, rows: list[dict]) -> list[dict]:
     """
-    Keeps only rows that directly answer the user's exact question.
+    Keeps only rows that directly contain the answer to the user's exact question.
 
-    No hardcoded topics, brands, products, files, or question examples.
+    No hardcoded topics, products, brands, vendors, yacht terms, files, or specific questions.
     """
 
     clean_query = str(query or "").strip()
@@ -6052,12 +6047,12 @@ def filter_rows_that_directly_answer_query(query: str, rows: list[dict]) -> list
         raw = ask_llm(
             query=clean_query,
             context=f"""
-You are checking whether retrieved document sources contain data that directly answers a user's question.
+You are checking retrieved document chunks for a document-based assistant.
 
 Return ONLY valid JSON:
 
 {{
-  "direct_source_numbers": [1, 2]
+  "direct_source_numbers": [1]
 }}
 
 or:
@@ -6068,11 +6063,11 @@ or:
 
 Rules:
 - Select a source ONLY if it directly contains the information needed to answer the user's exact question.
-- Do NOT select a source just because it is generally about yacht operations, safety, security, handovers, equipment, invoices, forms, procedures, or similar topics.
-- Do NOT select a source if it is only loosely related.
-- Do NOT select a source if the answer would require general knowledge or guessing.
-- Do NOT select a source if it does not contain the actual answer.
-- If no source directly answers the question, return an empty list.
+- Do not select a source because it is generally related.
+- Do not select a source because it mentions a similar topic.
+- Do not select a source if the answer would require outside knowledge.
+- Do not select a source if it does not contain the actual answer.
+- If none of the sources directly answer the exact question, return an empty list.
 - Do not explain.
 - Return JSON only.
 
@@ -6111,6 +6106,7 @@ Retrieved sources:
         print("DIRECT SOURCE FILTER ERROR:", type(e).__name__, str(e))
         return []
 
+
 def chat(
     query: str,
     crew_id: str,
@@ -6123,11 +6119,11 @@ def chat(
     Secure BridgeOS chat.
 
     Behaviour:
-    - Allows normal conversational replies.
-    - Does NOT answer factual/general-world/product/technical questions unless the answer is in document context.
-    - Shows sources only when the final answer is taken from a document.
-    - If the answer comes from a document but the LLM forgets source numbers, falls back to matched_rows[0].
-    - Never blindly shows matched_rows[:3].
+    - Conversational/app-use messages can be answered without documents.
+    - Any factual question must be answered only from directly relevant document context.
+    - If no direct document data exists, return FALLBACK_NO_DATA_ANSWER.
+    - Sources show only when the answer is directly taken from selected document rows.
+    - No hardcoded topics, brands, vendors, product names, or question examples.
     """
 
     chat_row = verify_chat_access(
@@ -6156,14 +6152,65 @@ def chat(
     matched_rows = []
     context = ""
     retrieval_query_input = query
+
     query_scope = classify_bridgeos_query_scope(query)
 
+    # Only use an uploaded chat asset if the current request explicitly sends one.
+    # Do not reuse the latest uploaded asset automatically.
     resolved_uploaded_asset_id = uploaded_asset_id
+
+    # Conversational/app-help messages are allowed without documents.
+    # Everything else must go through document search.
+    if query_scope == "conversational" and not resolved_uploaded_asset_id:
+        try:
+            raw_answer = ask_llm(
+                query=query,
+                context="""
+You are BridgeOS, a helpful private document assistant.
+
+The user message is conversational or about using the assistant.
+
+Rules:
+- Reply briefly and naturally.
+- You may explain that you can help search uploaded documents.
+- Do not answer factual, technical, operational, product, financial, legal, medical, recommendation, or external-knowledge questions.
+- Do not invent document data.
+- Do not claim you used a document.
+- Use British English.
+- Return plain text only.
+""".strip()
+            )
+
+            answer = str(raw_answer or "").strip() or "Hello. How can I help?"
+        except Exception as e:
+            print("CONVERSATIONAL CHAT ERROR:", type(e).__name__, str(e))
+            answer = "Hello. How can I help?"
+
+        sources = []
+
+        supabase.table("messages").insert({
+            "chat_id": chat_id,
+            "yacht_id": yacht_id,
+            "crew_id": crew_id,
+            "role": "assistant",
+            "content": answer,
+            "sources": sources
+        }).execute()
+
+        supabase.table("chats").update({
+            "updated_at": "now()"
+        }).eq("id", chat_id).eq("crew_id", crew_id).eq("yacht_id", yacht_id).execute()
+
+        return {
+            "answer": answer,
+            "sources": sources,
+            "uploaded_asset_id": None
+        }
 
     try:
         if resolved_uploaded_asset_id:
             print(
-                "LOCAL CHAT DEBUG: using chat-memory asset:",
+                "LOCAL CHAT DEBUG: using explicit uploaded asset:",
                 resolved_uploaded_asset_id
             )
 
@@ -6176,7 +6223,15 @@ def chat(
             )
 
             if matched_rows:
+                matched_rows = filter_rows_that_directly_answer_query(
+                    query=query,
+                    rows=matched_rows
+                )
+
+            if matched_rows:
                 context = build_context_from_asset_results(matched_rows)
+            else:
+                context = ""
 
         else:
             accessible_asset_ids = get_accessible_asset_ids(
@@ -6276,40 +6331,54 @@ def chat(
 
                     matched_rows = list(matched_rows_by_key.values())[:30]
 
-                    print("LOCAL CHAT DEBUG: matched chunks:", len(matched_rows))
+                    print("LOCAL CHAT DEBUG: matched chunks before direct filter:", len(matched_rows))
+
+                    if matched_rows and not is_file_listing_query(query):
+                        matched_rows = filter_rows_that_directly_answer_query(
+                            query=query,
+                            rows=matched_rows
+                        )
+
+                    print("LOCAL CHAT DEBUG: matched chunks after direct filter:", len(matched_rows))
 
                     if matched_rows:
                         context = build_context_from_asset_results(matched_rows)
+                    else:
+                        context = ""
 
     except Exception as e:
         print("LOCAL CHAT DOCUMENT SEARCH ERROR:", type(e).__name__, str(e))
         matched_rows = []
         context = ""
 
-    if resolved_uploaded_asset_id:
-        uploaded_result = answer_from_uploaded_chat_asset(
+    # Factual question with no direct document context = sorry answer.
+    if not context:
+        answer = FALLBACK_NO_DATA_ANSWER
+        sources = []
+
+    elif is_file_listing_query(query):
+        listing_result = answer_file_listing_directly(
             query=query,
-            context=context,
-            matched_rows=matched_rows
+            rows=matched_rows
         )
 
-        answer = uploaded_result["answer"]
-        sources = uploaded_result["sources"]
+        answer = listing_result.get("answer") or FALLBACK_NO_DATA_ANSWER
+        sources = listing_result.get("sources") or []
 
-    elif context:
+    else:
         raw_answer = ask_llm(
             query=query,
             context=f"""
-You are BridgeOS, a helpful yacht assistant.
+You are BridgeOS, a private document-based assistant.
 
 Always respond in British English.
 
-You may use the uploaded yacht document context below, but ONLY when it directly answers the user's question.
+You may answer ONLY if the uploaded document context directly answers the user's exact question.
 
 You MUST return ONLY valid JSON in this exact shape:
 
 {{
-  "answer": "clear user-facing answer with a brief explanation when useful",
+  "answer": "clear user-facing answer",
   "document_used": true,
   "used_source_numbers": [1]
 }}
@@ -6317,62 +6386,41 @@ You MUST return ONLY valid JSON in this exact shape:
 or:
 
 {{
-  "answer": "clear user-facing answer with a brief explanation when useful",
+  "answer": "{FALLBACK_NO_DATA_ANSWER}",
   "document_used": false,
   "used_source_numbers": []
 }}
 
-Strict rules:
-- The answer should be natural and helpful, not just a number.
-- If the user asks "how much", include the amount and a short explanation of what it refers to.
-- Set "document_used": false only for greetings, thanks, small talk, app-help, or conversational replies that do not need document context.
-- The selected source must directly answer the user's exact question.
-- Do not use a source that is only loosely related to the question.
-- Do not use a source just because it mentions a similar topic.
-- If the context contains related documents but none directly answer the exact question, answer exactly:
+Rules:
+- Answer only from the document context below.
+- Do not use general knowledge.
+- Do not fill gaps.
+- Do not infer facts that are not in the context.
+- Do not answer from loosely related context.
+- If the exact answer is not directly present in the context, answer exactly:
 {FALLBACK_NO_DATA_ANSWER}
-- If you cannot identify a directly supporting source number, answer exactly:
-{FALLBACK_NO_DATA_ANSWER}
-- If the user asks a factual, technical, product, operational, legal, financial, yacht-specific, or external-knowledge question, answer ONLY if the uploaded document context directly contains the answer.
-- If the uploaded document context does not directly contain the answer, answer exactly:
-{FALLBACK_NO_DATA_ANSWER}
-- Do not answer factual questions from general world knowledge.
-- Set "document_used": true ONLY if the final answer is taken from the uploaded document context.
-- Use "used_source_numbers" ONLY for the source numbers that directly support the answer.
-- If you set "document_used": true, you MUST include at least one number in "used_source_numbers".
-- Do not include a source number just because the file was retrieved.
-- Do not guess source numbers.
-- If no source directly supports the answer, set "document_used": false and "used_source_numbers": [].
-- If the answer is the fallback answer, set "document_used": false and "used_source_numbers": [].
-- Do not invent yacht-specific private data.
-- Do not include document names or references inside the answer. The frontend will show sources separately.
-- Return JSON only. Do not wrap it in markdown.
-
-Financial rules:
-- If the context contains invoice, receipt, quote, statement, purchase order, or financial values, you may calculate from visible context values.
-- If calculating, show the arithmetic briefly.
-- Do not invent missing values.
-- If required numbers are missing, say exactly which numbers are missing.
-- If the amount comes from a document, set "document_used": true and include the exact source number.
+- Set "document_used": true only if the final answer is directly taken from the context.
+- If "document_used" is true, include at least one source number in "used_source_numbers".
+- Use only source numbers that directly support the answer.
+- If no source directly supports the answer, use the fallback answer.
+- Do not include document names inside the answer.
+- Return JSON only.
 
 User question:
 {query}
 
-Uploaded document context:
+Document context:
 {context}
 """.strip()
         )
 
         parsed = parse_llm_json_response(raw_answer)
 
-        answer = ""
-        sources = []
-
         if parsed and isinstance(parsed, dict):
             answer = str(parsed.get("answer") or "").strip()
             document_used = bool(parsed.get("document_used"))
-
             raw_used_source_numbers = parsed.get("used_source_numbers") or []
+
             used_source_numbers = []
 
             if isinstance(raw_used_source_numbers, list):
@@ -6382,7 +6430,6 @@ Uploaded document context:
 
                         if number > 0:
                             used_source_numbers.append(number)
-
                     except Exception:
                         pass
 
@@ -6414,7 +6461,7 @@ Uploaded document context:
 
         else:
             print("LOCAL CHAT JSON SOURCE PARSE FAILED:", str(raw_answer)[:500])
-            answer = str(raw_answer or "").strip() or FALLBACK_NO_DATA_ANSWER
+            answer = FALLBACK_NO_DATA_ANSWER
             sources = []
 
         if not answer:
@@ -6422,37 +6469,6 @@ Uploaded document context:
             sources = []
 
         if answer.strip() == FALLBACK_NO_DATA_ANSWER:
-            sources = []
-
-    else:
-        if query_scope == "factual":
-            answer = FALLBACK_NO_DATA_ANSWER
-            sources = []
-        else:
-            raw_answer = ask_llm(
-                query=query,
-                context=f"""
-You are BridgeOS, a helpful yacht assistant.
-
-Always respond in British English.
-
-There was no matching uploaded yacht document context for this message.
-
-Rules:
-- The user message has been classified as conversational.
-- You may reply only to greetings, thanks, small talk, app-help, or questions about how to use BridgeOS.
-- Do not answer factual, technical, product, operational, legal, financial, yacht-specific, or external-knowledge questions.
-- Do not invent information.
-- Do not answer from general world knowledge.
-- Do not claim you used a document.
-- Return plain text only.
-
-User question:
-{query}
-""".strip()
-            )
-
-            answer = str(raw_answer or "").strip() or FALLBACK_NO_DATA_ANSWER
             sources = []
 
     supabase.table("messages").insert({
