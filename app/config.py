@@ -22,6 +22,8 @@ SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
 SMTP_FROM_EMAIL = os.environ.get("SMTP_FROM_EMAIL")
 SMTP_FROM_NAME = os.environ.get("SMTP_FROM_NAME", "BridgeOS")
 
+
+GMAIL_SYNC_MAX_RESULTS = int(os.environ.get("GMAIL_SYNC_MAX_RESULTS", "25"))
 BREVO_API_KEY = os.environ.get("BREVO_API_KEY")
 BREVO_FROM_EMAIL = os.environ.get("BREVO_FROM_EMAIL")
 BREVO_FROM_NAME = os.environ.get("BREVO_FROM_NAME", "BridgeOS")

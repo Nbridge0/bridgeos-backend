@@ -7,7 +7,13 @@ import smtplib
 from email.message import EmailMessage
 from app.database import supabase
 from app.embeddings import embed
-from app.config import BUCKET_NAME, RUNPOD_BASE_URL, BRIDGEOS_API_KEY, API_SYNC_TIMEOUT_SECONDS
+from app.config import (
+    BUCKET_NAME,
+    RUNPOD_BASE_URL,
+    BRIDGEOS_API_KEY,
+    API_SYNC_TIMEOUT_SECONDS,
+    GMAIL_SYNC_MAX_RESULTS
+)
 from app.llm import ask_llm, FALLBACK_NO_DATA_ANSWER
 from app.file_utils import detect_file_type, calculate_file_hash, safe_filename
 from app.metadata_utils import (
@@ -26,6 +32,9 @@ from app.image_ai import (
     extract_ocr_from_image,
     extract_ocr_from_pdf_pages
 )
+
+import base64
+from email.utils import parsedate_to_datetime
 
 import time
 import uuid
@@ -2219,6 +2228,373 @@ Web link: {drive_file.get("webViewLink") or ""}
             "reason": f"Could not save asset: {type(e).__name__}: {str(e)}"
         }
 
+def _gmail_b64url_decode(value: str | None) -> str:
+    """
+    Gmail message bodies are base64url encoded.
+    """
+
+    if not value:
+        return ""
+
+    try:
+        clean = value.replace("-", "+").replace("_", "/")
+        padding = len(clean) % 4
+
+        if padding:
+            clean += "=" * (4 - padding)
+
+        raw = base64.b64decode(clean.encode("utf-8"))
+
+        return raw.decode("utf-8", errors="ignore")
+
+    except Exception as e:
+        print("GMAIL BODY DECODE ERROR:", type(e).__name__, str(e))
+        return ""
+
+
+def _gmail_header(headers: list[dict], name: str) -> str:
+    if not headers:
+        return ""
+
+    for header in headers:
+        if str(header.get("name") or "").lower() == name.lower():
+            return str(header.get("value") or "").strip()
+
+    return ""
+
+
+def _extract_gmail_body_from_payload(payload: dict | None) -> str:
+    """
+    Extracts readable plain text from a Gmail message payload.
+    Prefers text/plain, falls back to text/html stripped roughly.
+    """
+
+    if not payload:
+        return ""
+
+    mime_type = payload.get("mimeType") or ""
+
+    body = payload.get("body") or {}
+    data = body.get("data")
+
+    if data and mime_type == "text/plain":
+        return _gmail_b64url_decode(data).strip()
+
+    parts = payload.get("parts") or []
+
+    plain_parts = []
+    html_parts = []
+
+    for part in parts:
+        part_mime = part.get("mimeType") or ""
+
+        if part_mime.startswith("multipart/"):
+            nested = _extract_gmail_body_from_payload(part)
+            if nested:
+                plain_parts.append(nested)
+            continue
+
+        part_body = part.get("body") or {}
+        part_data = part_body.get("data")
+
+        if not part_data:
+            continue
+
+        decoded = _gmail_b64url_decode(part_data).strip()
+
+        if not decoded:
+            continue
+
+        if part_mime == "text/plain":
+            plain_parts.append(decoded)
+        elif part_mime == "text/html":
+            html_parts.append(decoded)
+
+    if plain_parts:
+        return "\n\n".join(plain_parts).strip()
+
+    if html_parts:
+        html_text = "\n\n".join(html_parts)
+
+        # Basic HTML cleanup without adding another dependency.
+        import re
+
+        html_text = re.sub(r"<br\s*/?>", "\n", html_text, flags=re.I)
+        html_text = re.sub(r"</p\s*>", "\n", html_text, flags=re.I)
+        html_text = re.sub(r"<[^>]+>", " ", html_text)
+        html_text = re.sub(r"\s+", " ", html_text)
+
+        return html_text.strip()
+
+    if data:
+        return _gmail_b64url_decode(data).strip()
+
+    return ""
+
+
+def sync_one_gmail_message(
+    gmail_message: dict,
+    connection: dict,
+    admin_crew: dict,
+    security_level: int
+) -> dict:
+    """
+    Fetches one Gmail message, converts it into searchable text,
+    and saves it through the existing asset/chunk pipeline.
+    """
+
+    message_id = gmail_message.get("id")
+
+    if not message_id:
+        return {
+            "status": "skipped",
+            "reason": "Missing Gmail message id"
+        }
+
+    base_url = "https://gmail.googleapis.com/gmail/v1/users/me/messages"
+    url = f"{base_url}/{message_id}?format=full"
+
+    headers = {
+        "Accept": "application/json"
+    }
+
+    extra_headers = connection.get("extra_headers") or {}
+
+    if isinstance(extra_headers, dict):
+        headers.update(extra_headers)
+
+    auth_type = (connection.get("auth_type") or "none").lower()
+    api_key = connection.get("api_key")
+
+    if auth_type == "bearer" and api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    if auth_type == "x-api-key" and api_key:
+        headers["x-api-key"] = api_key
+
+    try:
+        response = requests.get(
+            url,
+            headers=headers,
+            timeout=API_SYNC_TIMEOUT_SECONDS
+        )
+    except Exception as e:
+        return {
+            "message_id": message_id,
+            "status": "failed",
+            "reason": f"{type(e).__name__}: {str(e)}"
+        }
+
+    if response.status_code >= 400:
+        return {
+            "message_id": message_id,
+            "status": "failed",
+            "reason": f"Gmail returned {response.status_code}: {response.text[:500]}"
+        }
+
+    try:
+        message = response.json()
+    except Exception as e:
+        return {
+            "message_id": message_id,
+            "status": "failed",
+            "reason": f"Could not parse Gmail JSON: {type(e).__name__}: {str(e)}"
+        }
+
+    payload = message.get("payload") or {}
+    headers_list = payload.get("headers") or []
+
+    subject = _gmail_header(headers_list, "Subject") or "(no subject)"
+    sender = _gmail_header(headers_list, "From")
+    to = _gmail_header(headers_list, "To")
+    cc = _gmail_header(headers_list, "Cc")
+    date_header = _gmail_header(headers_list, "Date")
+    snippet = message.get("snippet") or ""
+
+    body_text = _extract_gmail_body_from_payload(payload)
+
+    if not body_text and snippet:
+        body_text = snippet
+
+    if not body_text.strip():
+        return {
+            "message_id": message_id,
+            "subject": subject,
+            "status": "skipped",
+            "reason": "No readable email body"
+        }
+
+    internal_date = message.get("internalDate")
+    email_date = ""
+
+    if date_header:
+        email_date = date_header
+    elif internal_date:
+        try:
+            email_date = datetime.fromtimestamp(
+                int(internal_date) / 1000,
+                tz=timezone.utc
+            ).isoformat()
+        except Exception:
+            email_date = ""
+
+    final_content = f"""
+Gmail email source metadata:
+Gmail message id: {message_id}
+Thread id: {message.get("threadId") or ""}
+Subject: {subject}
+From: {sender}
+To: {to}
+Cc: {cc}
+Date: {email_date}
+Snippet: {snippet}
+
+---
+
+Email body:
+{body_text}
+""".strip()
+
+    safe_subject = safe_filename(subject)[:80] or "email"
+    final_file_name = f"gmail-{message_id}-{safe_subject}.txt"
+
+    try:
+        seeded = seed_text_asset(
+            file_name=final_file_name,
+            content=final_content,
+            yacht_id=admin_crew["yacht_id"],
+            uploaded_by=admin_crew["id"],
+            security_level=security_level
+        )
+
+        return {
+            "message_id": message_id,
+            "subject": subject,
+            "from": sender,
+            "date": email_date,
+            "status": "synced",
+            "asset_id": seeded.get("asset", {}).get("id"),
+            "duplicate": seeded.get("duplicate", False)
+        }
+
+    except Exception as e:
+        return {
+            "message_id": message_id,
+            "subject": subject,
+            "status": "failed",
+            "reason": f"Could not save Gmail email: {type(e).__name__}: {str(e)}"
+        }
+
+
+def sync_gmail_messages_from_connection(
+    connection: dict,
+    admin_crew: dict,
+    security_level: int,
+    endpoint_path: str | None = None,
+    max_results: int | None = None
+) -> dict:
+    """
+    Lists Gmail messages and syncs each one into the existing searchable asset system.
+
+    Expected connection:
+    - base_url: https://gmail.googleapis.com/gmail/v1/users/me/messages
+    - auth_type: bearer
+    - api_key: Google OAuth access token with Gmail readonly scope
+    """
+
+    limit = int(max_results or GMAIL_SYNC_MAX_RESULTS)
+
+    if limit < 1:
+        limit = 1
+
+    if limit > 100:
+        limit = 100
+
+    base_url = connection["base_url"].rstrip("/")
+    clean_path = (endpoint_path or "").strip()
+
+    if clean_path:
+        url = f"{base_url}/{clean_path.lstrip('/')}"
+    else:
+        url = base_url
+
+    headers = {
+        "Accept": "application/json"
+    }
+
+    extra_headers = connection.get("extra_headers") or {}
+
+    if isinstance(extra_headers, dict):
+        headers.update(extra_headers)
+
+    auth_type = (connection.get("auth_type") or "none").lower()
+    api_key = connection.get("api_key")
+
+    if auth_type == "bearer" and api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    if auth_type == "x-api-key" and api_key:
+        headers["x-api-key"] = api_key
+
+    params = {
+        "maxResults": limit,
+        "q": "in:anywhere -in:chats"
+    }
+
+    try:
+        response = requests.get(
+            url,
+            headers=headers,
+            params=params,
+            timeout=API_SYNC_TIMEOUT_SECONDS
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Gmail request failed: {type(e).__name__}: {str(e)}"
+        )
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Gmail returned {response.status_code}: {response.text[:1000]}"
+        )
+
+    try:
+        data = response.json()
+    except Exception:
+        raise HTTPException(
+            status_code=502,
+            detail="Gmail returned invalid JSON"
+        )
+
+    messages = data.get("messages") or []
+
+    results = []
+
+    for gmail_message in messages:
+        result = sync_one_gmail_message(
+            gmail_message=gmail_message,
+            connection=connection,
+            admin_crew=admin_crew,
+            security_level=security_level
+        )
+        results.append(result)
+
+    synced_count = len([r for r in results if r.get("status") == "synced"])
+    skipped_count = len([r for r in results if r.get("status") == "skipped"])
+    failed_count = len([r for r in results if r.get("status") == "failed"])
+
+    return {
+        "message": "Gmail sync completed",
+        "provider": "gmail",
+        "synced_count": synced_count,
+        "skipped_count": skipped_count,
+        "failed_count": failed_count,
+        "results": results
+    }
+    
+
 
 def sync_api_connection(
     connection_id: str,
@@ -2321,6 +2697,52 @@ def sync_api_connection(
         )
 
     content_type = response.headers.get("content-type", "")
+
+    # ------------------------
+    # GMAIL MESSAGE SYNC
+    # ------------------------
+    is_gmail_url = "gmail.googleapis.com/gmail/v1/users/me/messages" in url
+
+    if is_gmail_url:
+        try:
+            gmail_result = sync_gmail_messages_from_connection(
+                connection=connection,
+                admin_crew=admin_crew,
+                security_level=security_level,
+                endpoint_path=endpoint_path,
+                max_results=GMAIL_SYNC_MAX_RESULTS
+            )
+
+            supabase.table("api_connections").update({
+                "last_synced_at": datetime.now(timezone.utc).isoformat(),
+                "last_sync_status": "success" if gmail_result.get("synced_count", 0) > 0 else "failed",
+                "last_sync_error": None if gmail_result.get("synced_count", 0) > 0 else "No Gmail messages were synced"
+            }).eq("id", connection_id).eq("yacht_id", admin_crew["yacht_id"]).execute()
+
+            return {
+                "message": "Gmail email sync completed",
+                "connection_id": connection_id,
+                "url": url,
+                **gmail_result
+            }
+
+        except HTTPException:
+            raise
+
+        except Exception as e:
+            error_text = f"{type(e).__name__}: {str(e)}"
+
+            supabase.table("api_connections").update({
+                "last_synced_at": datetime.now(timezone.utc).isoformat(),
+                "last_sync_status": "failed",
+                "last_sync_error": error_text
+            }).eq("id", connection_id).eq("yacht_id", admin_crew["yacht_id"]).execute()
+
+            raise HTTPException(
+                status_code=502,
+                detail=f"Gmail sync failed: {error_text}"
+            )
+
     # ------------------------
     # GOOGLE DRIVE FOLDER / FILE CONTENT SYNC
     # ------------------------
