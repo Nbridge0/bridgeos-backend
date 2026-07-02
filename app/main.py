@@ -1447,7 +1447,7 @@ async def chat_api(
     print("CHAT DEBUG: using local Supabase asset search")
     print("CHAT DEBUG: chat_id:", body.chat_id)
     print("CHAT DEBUG: crew_id:", crew["id"])
-    print("CHAT DEBUG: yacht_id:", crew["yacht_id"])
+    print("CHAT DEBUG: yacht_id:", crew["yachcht_id"])
     print("CHAT DEBUG: security_level:", crew["security_level"])
     print("CHAT DEBUG: query:", query)
 

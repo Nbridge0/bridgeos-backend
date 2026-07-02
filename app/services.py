@@ -2456,8 +2456,8 @@ Email body:
 """.strip()
 
     safe_subject = safe_filename(subject)[:80] or "email"
-    final_file_name = f"gmail-{message_id}-{safe_subject}.txt"
-
+    final_file_name = f"email-{safe_subject}-{message_id}.txt"
+    
     try:
         seeded = seed_text_asset(
             file_name=final_file_name,
