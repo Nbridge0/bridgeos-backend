@@ -6779,6 +6779,7 @@ def chat(
         "crew_id": crew_id,
         "role": "user",
         "content": query,
+        "uploaded_asset_id": uploaded_asset_id,
         "sources": []
     }).execute()
 
@@ -6813,6 +6814,21 @@ def chat(
     print("LOCAL CHAT DEBUG: is_followup_query:", is_followup_query)
     print("LOCAL CHAT DEBUG: previous_source_asset_ids:", previous_source_asset_ids)
     resolved_uploaded_asset_id = uploaded_asset_id
+
+
+    if not resolved_uploaded_asset_id and query_scope != "conversational":
+        resolved_uploaded_asset_id = get_latest_chat_asset_id(
+            chat_id=chat_id,
+            crew_id=crew_id,
+            yacht_id=yacht_id,
+            security_level=security_level
+        )
+
+        if resolved_uploaded_asset_id:
+            print(
+                "LOCAL CHAT DEBUG: resolved latest chat uploaded asset:",
+                resolved_uploaded_asset_id
+            )
 
     # Conversational/app-help messages are allowed without documents.
     if query_scope == "conversational" and not resolved_uploaded_asset_id:
@@ -7000,6 +7016,36 @@ Rules:
         print("LOCAL CHAT DOCUMENT SEARCH ERROR:", type(e).__name__, str(e))
         matched_rows = []
         context = ""
+
+    if resolved_uploaded_asset_id:
+        uploaded_result = answer_from_uploaded_chat_asset(
+            query=query,
+            context=context,
+            matched_rows=matched_rows
+        )
+
+        answer = uploaded_result.get("answer") or FALLBACK_NO_DATA_ANSWER
+        sources = uploaded_result.get("sources") or []
+
+        supabase.table("messages").insert({
+            "chat_id": chat_id,
+            "yacht_id": yacht_id,
+            "crew_id": crew_id,
+            "role": "assistant",
+            "content": answer,
+            "sources": sources
+        }).execute()
+
+        supabase.table("chats").update({
+            "updated_at": "now()"
+        }).eq("id", chat_id).eq("crew_id", crew_id).eq("yacht_id", yacht_id).execute()
+
+        return {
+            "answer": answer,
+            "sources": sources,
+            "uploaded_asset_id": resolved_uploaded_asset_id,
+            "mode": "uploaded_chat_asset"
+        }
 
     # Factual question with no retrieved document context = sorry answer.
     if not context:
