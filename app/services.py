@@ -7087,33 +7087,73 @@ def verified_source_rows_from_llm_result(parsed, matched_rows):
 
     return verified_rows
 
-def build_numbered_context_from_asset_results(rows):
-    parts = []
+def build_sources_from_asset_results(results: list[dict]) -> list[dict]:
+    seen = set()
+    sources = []
 
-    for index, row in enumerate(rows or [], start=1):
+    missing_name_asset_ids = []
+
+    for row in results or []:
+        asset_id = row.get("asset_id")
+
+        if not asset_id or asset_id in seen:
+            continue
+
         file_name = (
             row.get("original_file_name")
             or row.get("file_name")
             or row.get("title")
-            or "Unknown source"
         )
 
-        content = row.get("content") or row.get("text") or ""
+        if not file_name:
+            missing_name_asset_ids.append(asset_id)
 
-        if not str(content).strip():
+        seen.add(asset_id)
+
+    asset_name_lookup = {}
+
+    if missing_name_asset_ids:
+        try:
+            asset_res = supabase.table("assets") \
+                .select("id, file_name, original_file_name, file_type") \
+                .in_("id", missing_name_asset_ids) \
+                .execute()
+
+            for asset in asset_res.data or []:
+                asset_name_lookup[asset.get("id")] = (
+                    asset.get("original_file_name")
+                    or asset.get("file_name")
+                    or "Untitled document"
+                )
+
+        except Exception as e:
+            print("SOURCE NAME LOOKUP ERROR:", type(e).__name__, str(e))
+
+    seen = set()
+
+    for row in results or []:
+        asset_id = row.get("asset_id")
+
+        if not asset_id or asset_id in seen:
             continue
 
-        parts.append(
-            f"""
-[SOURCE {index}]
-File: {file_name}
-Content:
-{str(content).strip()}
-""".strip()
+        seen.add(asset_id)
+
+        file_name = (
+            row.get("original_file_name")
+            or row.get("file_name")
+            or row.get("title")
+            or asset_name_lookup.get(asset_id)
+            or "Untitled document"
         )
 
-    return "\n\n---\n\n".join(parts)
+        sources.append({
+            "asset_id": asset_id,
+            "title": file_name,
+            "file_name": file_name
+        })
 
+    return sources
 
     
 def validate_answer_supported_by_source(query: str, answer: str, source_row: dict) -> bool:
@@ -7659,7 +7699,10 @@ def get_full_asset_rows_for_context(
 ) -> list[dict]:
     """
     Loads the full chunk set for one document, ordered by chunk_index.
-    This fixes multi-page PDFs/tables where the first retrieved chunks are only partial.
+
+    Important:
+    - Joins assets so source cards can show the real document name.
+    - Without this, expanded rows only contain asset_chunks fields and the UI shows "Untitled document".
     """
 
     if not asset_id:
@@ -7667,7 +7710,25 @@ def get_full_asset_rows_for_context(
 
     try:
         res = supabase.table("asset_chunks") \
-            .select("*") \
+            .select("""
+                asset_id,
+                yacht_id,
+                chat_id,
+                security_level,
+                content,
+                content_type,
+                chunk_index,
+                detected_date,
+                detected_year,
+                tags,
+                assets!inner (
+                    id,
+                    file_name,
+                    original_file_name,
+                    file_type,
+                    mime_type
+                )
+            """) \
             .eq("yacht_id", yacht_id) \
             .eq("asset_id", asset_id) \
             .lte("security_level", security_level) \
@@ -7675,7 +7736,29 @@ def get_full_asset_rows_for_context(
             .limit(max_rows) \
             .execute()
 
-        return res.data or []
+        rows = []
+
+        for row in res.data or []:
+            asset_data = row.get("assets") or {}
+
+            rows.append({
+                "asset_id": row.get("asset_id"),
+                "yacht_id": row.get("yacht_id"),
+                "chat_id": row.get("chat_id"),
+                "security_level": row.get("security_level"),
+                "content": row.get("content"),
+                "content_type": row.get("content_type"),
+                "chunk_index": row.get("chunk_index"),
+                "detected_date": row.get("detected_date"),
+                "detected_year": row.get("detected_year"),
+                "tags": row.get("tags"),
+                "file_name": asset_data.get("file_name"),
+                "original_file_name": asset_data.get("original_file_name"),
+                "file_type": asset_data.get("file_type"),
+                "mime_type": asset_data.get("mime_type")
+            })
+
+        return rows
 
     except Exception as e:
         print("FULL ASSET CONTEXT LOAD ERROR:", type(e).__name__, str(e), asset_id)
