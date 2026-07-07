@@ -6997,12 +6997,7 @@ def normalise_for_source_check(value):
 
 
 def source_quote_exists_in_row(row, quote):
-    if not row or not quote:
-        return False
-
-    quote_text = normalise_for_source_check(quote)
-
-    if not quote_text:
+    if not row:
         return False
 
     row_text = normalise_for_source_check(
@@ -7014,8 +7009,35 @@ def source_quote_exists_in_row(row, quote):
     if not row_text:
         return False
 
-    return quote_text in row_text
+    quote_text = normalise_for_source_check(quote)
 
+    if not quote_text:
+        # If the source number is valid but the quote is empty, do not approve blindly.
+        return False
+
+    # Exact normalised quote match.
+    if quote_text in row_text:
+        return True
+
+    # Soft fallback:
+    # Sometimes the LLM copies evidence with punctuation, line breaks, or small spacing differences.
+    # Accept it only if most meaningful words from the quote appear in the selected source.
+    quote_words = [
+        word
+        for word in quote_text.split()
+        if len(word) >= 4
+    ]
+
+    if len(quote_words) < 4:
+        return False
+
+    matched_words = [
+        word
+        for word in quote_words
+        if word in row_text
+    ]
+
+    return len(matched_words) / max(len(quote_words), 1) >= 0.75
 
 def verified_source_rows_from_llm_result(parsed, matched_rows):
     if not parsed or not isinstance(parsed, dict):
@@ -7470,12 +7492,13 @@ def chat(
     """
     Secure BridgeOS chat.
 
-    Behaviour:
-    - Conversational/app-use messages can be answered without documents.
-    - Any factual question must be answered only from document context.
-    - If no document context directly answers the question, return FALLBACK_NO_DATA_ANSWER.
-    - Sources show only when the answer is taken from selected document rows.
-    - No hardcoded topics, brands, vendors, product names, or question examples.
+    Fixed behaviour:
+    - Uploaded chat files/images are answered from that exact uploaded asset.
+    - Standalone questions search using the exact user question.
+    - Follow-up questions use memory-aware rewriting only when needed.
+    - Document retrieval is no longer blocked by an over-strict direct filter.
+    - The answer is always based on document context.
+    - Source verification is balanced: strict enough to avoid hallucination, soft enough to extract real document fields.
     """
 
     chat_row = verify_chat_access(
@@ -7484,15 +7507,29 @@ def chat(
         yacht_id=yacht_id
     )
 
-    supabase.table("messages").insert({
-        "chat_id": chat_id,
-        "yacht_id": yacht_id,
-        "crew_id": crew_id,
-        "role": "user",
-        "content": query,
-        "uploaded_asset_id": uploaded_asset_id,
-        "sources": []
-    }).execute()
+    # Save the user message.
+    # If your messages table does not yet have uploaded_asset_id, this falls back safely.
+    try:
+        supabase.table("messages").insert({
+            "chat_id": chat_id,
+            "yacht_id": yacht_id,
+            "crew_id": crew_id,
+            "role": "user",
+            "content": query,
+            "uploaded_asset_id": uploaded_asset_id,
+            "sources": []
+        }).execute()
+    except Exception as e:
+        print("USER MESSAGE INSERT WITH UPLOADED ASSET FAILED:", type(e).__name__, str(e))
+
+        supabase.table("messages").insert({
+            "chat_id": chat_id,
+            "yacht_id": yacht_id,
+            "crew_id": crew_id,
+            "role": "user",
+            "content": query,
+            "sources": []
+        }).execute()
 
     if chat_row.get("title") == "New Chat":
         supabase.table("chats").update({
@@ -7522,11 +7559,10 @@ def chat(
             yacht_id=yacht_id
         )
 
-    print("LOCAL CHAT DEBUG: is_followup_query:", is_followup_query)
-    print("LOCAL CHAT DEBUG: previous_source_asset_ids:", previous_source_asset_ids)
-
     resolved_uploaded_asset_id = uploaded_asset_id
 
+    # If the frontend somehow fails to send uploaded_asset_id, still try the latest uploaded file in this chat.
+    # Do not do this for pure conversational messages.
     if not resolved_uploaded_asset_id and query_scope != "conversational":
         resolved_uploaded_asset_id = get_latest_chat_asset_id(
             chat_id=chat_id,
@@ -7537,7 +7573,7 @@ def chat(
 
         if resolved_uploaded_asset_id:
             print(
-                "LOCAL CHAT DEBUG: resolved latest chat uploaded asset:",
+                "LOCAL CHAT DEBUG: resolved latest uploaded chat asset:",
                 resolved_uploaded_asset_id
             )
 
@@ -7586,7 +7622,8 @@ Rules:
         return {
             "answer": answer,
             "sources": sources,
-            "uploaded_asset_id": None
+            "uploaded_asset_id": None,
+            "mode": "conversational"
         }
 
     try:
@@ -7645,6 +7682,9 @@ Rules:
                 print("LOCAL CHAT DEBUG: allowed_asset_ids:", allowed_asset_ids)
 
                 if allowed_asset_ids:
+                    # IMPORTANT FIX:
+                    # Only rewrite the search query if this is truly a follow-up.
+                    # Standalone questions must search with the exact user wording.
                     if is_followup_query:
                         retrieval_query_input = build_memory_aware_retrieval_input(
                             query=query,
@@ -7724,11 +7764,21 @@ Rules:
 
                     print("LOCAL CHAT DEBUG: matched chunks:", len(matched_rows))
 
-                    if matched_rows and not resolved_uploaded_asset_id and not is_file_listing_query(query):
-                        direct_rows = filter_rows_that_directly_answer_query(
-                            query=query,
-                            rows=matched_rows
-                        )
+                    # IMPORTANT FIX:
+                    # The direct answer filter is now soft.
+                    # If it finds strong rows, use them.
+                    # If it finds nothing, do NOT delete the retrieved context.
+                    if matched_rows and not is_file_listing_query(query):
+                        original_matched_rows = matched_rows
+
+                        try:
+                            direct_rows = filter_rows_that_directly_answer_query(
+                                query=query,
+                                rows=matched_rows
+                            )
+                        except Exception as e:
+                            print("DIRECT ROW FILTER ERROR:", type(e).__name__, str(e))
+                            direct_rows = []
 
                         print("LOCAL CHAT DEBUG: directly answering chunks:", len(direct_rows))
 
@@ -7736,34 +7786,43 @@ Rules:
                             matched_rows = direct_rows[:12]
                             context = build_context_from_asset_results(matched_rows)
                         else:
-                            matched_rows = []
-                            context = ""
+                            matched_rows = original_matched_rows[:20]
+                            context = build_context_from_asset_results(matched_rows)
 
                     elif matched_rows:
                         context = build_context_from_asset_results(matched_rows)
                     else:
                         context = ""
-                else:
-                    matched_rows = []
-                    context = ""
-            else:
-                matched_rows = []
-                context = ""
 
     except Exception as e:
         print("LOCAL CHAT DOCUMENT SEARCH ERROR:", type(e).__name__, str(e))
         matched_rows = []
         context = ""
 
-    if resolved_uploaded_asset_id:
-        uploaded_result = answer_from_uploaded_chat_asset(
-            query=query,
-            context=context,
-            matched_rows=matched_rows
-        )
+    print("LOCAL CHAT DEBUG FINAL matched_rows:", len(matched_rows or []))
+    print("LOCAL CHAT DEBUG FINAL context length:", len(context or ""))
+    print("LOCAL CHAT DEBUG FINAL resolved_uploaded_asset_id:", resolved_uploaded_asset_id)
 
-        answer = uploaded_result.get("answer") or FALLBACK_NO_DATA_ANSWER
-        sources = uploaded_result.get("sources") or []
+    # Uploaded chat files/images/docs use the uploaded-file answer path.
+    if resolved_uploaded_asset_id:
+        if not context:
+            answer = (
+                "I received the uploaded file, but I could not read or analyse its contents yet. "
+                "Please try uploading it again, or check the backend processing_error for this asset."
+            )
+            sources = []
+        else:
+            uploaded_result = answer_from_uploaded_chat_asset(
+                query=query,
+                context=context,
+                matched_rows=matched_rows
+            )
+
+            answer = uploaded_result.get("answer") or FALLBACK_NO_DATA_ANSWER
+            sources = uploaded_result.get("sources") or []
+
+            if answer.strip() == FALLBACK_NO_DATA_ANSWER:
+                sources = []
 
         supabase.table("messages").insert({
             "chat_id": chat_id,
@@ -7785,7 +7844,7 @@ Rules:
             "mode": "uploaded_chat_asset"
         }
 
-    # Factual question with no retrieved document context = sorry answer.
+    # Factual question with no retrieved document context = fallback.
     if not context:
         answer = FALLBACK_NO_DATA_ANSWER
         sources = []
@@ -7803,8 +7862,6 @@ Rules:
             sources = []
 
     else:
-        numbered_context = build_numbered_context_from_asset_results(matched_rows)
-
         raw_answer = ask_llm(
             query=query,
             context=f"""
@@ -7814,7 +7871,7 @@ Always respond in British English.
 
 You may answer ONLY if the document context directly answers the user's exact question.
 
-Your answer should be detailed enough to be useful, but every detail must come from the document context.
+Your answer should be useful and specific, but every factual detail must come from the document context.
 
 You MUST return ONLY valid JSON in this exact shape:
 
@@ -7824,7 +7881,7 @@ You MUST return ONLY valid JSON in this exact shape:
   "used_sources": [
     {{
       "source_number": 1,
-      "evidence_quote": "short exact quote copied from the selected source"
+      "evidence_quote": "quote copied from the selected source"
     }}
   ]
 }}
@@ -7837,31 +7894,30 @@ or:
   "used_sources": []
 }}
 
-Detail rules:
-- If the document contains a list of responsibilities, duties, steps, checks, requirements, or items, include the full relevant list.
-- Do not summarise a long relevant list into one short sentence.
-- Do not omit relevant items from the selected source just to be brief.
-- Do not cut the answer mid-section.
-- Do not stop after only part of a numbered section if the remaining lines are still relevant.
-- If the context includes a numbered section, include the full relevant numbered section.
-- If the context includes bullet points under a relevant heading, include all relevant bullets under that heading.
-- If the answer is long, continue until the relevant section is complete.
-- Do not end with an unfinished sentence, unfinished bullet, or unfinished list.
-- If the document gives several responsibilities or requirements, present them as bullets.
-- If the document gives only one short fact, keep the answer short.
-- If multiple retrieved sources directly support the answer, combine them, but only include details that answer the user's question.
-- Keep wording clear and practical.
-- You may rephrase for readability, but you must preserve the meaning exactly.
-- Do not change, add, delete, soften, strengthen, or reinterpret the document content.
-- Do not include unrelated sections just because they appear nearby.
+Core rules:
+- Answer only from the document context below.
+- Do not use general knowledge.
+- Do not fill gaps.
+- Do not invent facts.
+- Do not answer from loosely related context.
+- If the exact answer is not directly present in the context, answer exactly:
+{FALLBACK_NO_DATA_ANSWER}
+
+Extraction rules:
+- If the user asks for a field, value, date, total, price, supplier, name, code, serial number, email, phone number, item, quantity, task, decision, instruction, or status, extract it exactly from the context.
+- Short values are allowed.
+- For tables, invoices, receipts, forms, lists, WhatsApp chats, and OCR text, use the visible/extracted text exactly as written.
+- If multiple relevant values exist, list them clearly.
+- If a value is missing, say it is not found in the provided context.
+- Do not reject valid answers just because the evidence is short.
 
 Source rules:
 - Set "document_used": true only if the final answer is directly taken from the context.
 - If "document_used" is true, include at least one item in "used_sources".
 - Each used source must include a valid "source_number".
-- Each "evidence_quote" must be an exact quote copied from that selected source.
-- Each "evidence_quote" must be long enough to verify the answer, preferably 8 words or more.
-- Do not paraphrase the evidence_quote.
+- Each "evidence_quote" should be copied from the selected source.
+- For short fields such as names, dates, invoice numbers, totals, prices, serial numbers, labels, statuses, or codes, a short evidence_quote is allowed.
+- Do not invent the evidence_quote.
 - Do not include a source just because it was retrieved.
 - If no source directly supports the answer, use the fallback answer.
 - Do not include document names inside the answer.
@@ -7874,81 +7930,78 @@ Search query used for retrieval:
 {retrieval_query_input}
 
 Document context:
-{numbered_context}
+{context}
 """.strip()
         )
 
         parsed = parse_llm_json_response(raw_answer)
 
-        answer = ""
-        sources = []
-
-        if parsed and isinstance(parsed, dict):
+        if not parsed or not isinstance(parsed, dict):
+            answer = FALLBACK_NO_DATA_ANSWER
+            document_used = False
+            raw_used_sources = []
+        else:
             answer = str(parsed.get("answer") or "").strip()
             document_used = bool(parsed.get("document_used"))
-
-            used_source_numbers = []
-
             raw_used_sources = parsed.get("used_sources") or []
-
-            if isinstance(raw_used_sources, list):
-                for item in raw_used_sources:
-                    if isinstance(item, dict):
-                        try:
-                            source_number = int(item.get("source_number"))
-
-                            if source_number > 0:
-                                used_source_numbers.append(source_number)
-                        except Exception:
-                            pass
-
-            if not used_source_numbers:
-                raw_used_source_numbers = parsed.get("used_source_numbers") or []
-
-                if isinstance(raw_used_source_numbers, list):
-                    for number in raw_used_source_numbers:
-                        try:
-                            number = int(number)
-
-                            if number > 0:
-                                used_source_numbers.append(number)
-                        except Exception:
-                            pass
 
             if not answer:
                 answer = FALLBACK_NO_DATA_ANSWER
-                document_used = False
-                used_source_numbers = []
 
-            if answer.strip() == FALLBACK_NO_DATA_ANSWER:
-                document_used = False
-                used_source_numbers = []
+        if answer.strip() == FALLBACK_NO_DATA_ANSWER:
+            document_used = False
+            sources = []
 
-            if document_used:
+        elif document_used:
+            # First try strict quote/source verification.
+            try:
                 verified_rows = verified_source_rows_from_llm_result(
                     parsed=parsed,
                     matched_rows=matched_rows
                 )
+            except Exception as e:
+                print("SOURCE VERIFICATION HELPER ERROR:", type(e).__name__, str(e))
+                verified_rows = []
 
-                if verified_rows:
-                    sources = build_sources_from_asset_results(verified_rows)
-                else:
-                    print("LOCAL CHAT SOURCE VERIFICATION FAILED")
-                    answer = FALLBACK_NO_DATA_ANSWER
-                    sources = []
+            # If strict quote checking fails because of OCR spacing/punctuation,
+            # run the softer answer-support validator against the selected source rows.
+            if not verified_rows:
+                selected_rows = []
+
+                for used_source in raw_used_sources:
+                    try:
+                        source_number = int(used_source.get("source_number"))
+                    except Exception:
+                        continue
+
+                    index = source_number - 1
+
+                    if 0 <= index < len(matched_rows):
+                        selected_rows.append(matched_rows[index])
+
+                supported_rows = []
+
+                for row in selected_rows:
+                    try:
+                        if validate_answer_supported_by_source(
+                            query=query,
+                            answer=answer,
+                            source_row=row
+                        ):
+                            supported_rows.append(row)
+                    except Exception as e:
+                        print("SOURCE SUPPORT VALIDATION CALL ERROR:", type(e).__name__, str(e))
+
+                verified_rows = supported_rows
+
+            if verified_rows:
+                sources = build_sources_from_asset_results(verified_rows)
             else:
+                print("LOCAL CHAT SOURCE VERIFICATION FAILED")
+                answer = FALLBACK_NO_DATA_ANSWER
                 sources = []
 
         else:
-            print("LOCAL CHAT JSON SOURCE PARSE FAILED:", str(raw_answer)[:500])
-            answer = FALLBACK_NO_DATA_ANSWER
-            sources = []
-
-        if not answer:
-            answer = FALLBACK_NO_DATA_ANSWER
-            sources = []
-
-        if answer.strip() == FALLBACK_NO_DATA_ANSWER:
             sources = []
 
     supabase.table("messages").insert({
@@ -7967,7 +8020,8 @@ Document context:
     return {
         "answer": answer,
         "sources": sources,
-        "uploaded_asset_id": resolved_uploaded_asset_id
+        "uploaded_asset_id": resolved_uploaded_asset_id,
+        "mode": "document_qa"
     }
 # ------------------------
 # TEMP DEMO LOGIN FOR TESTING ONLY
