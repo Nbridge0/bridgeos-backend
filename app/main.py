@@ -1445,8 +1445,14 @@ async def receive_whatsapp_webhook(request: Request):
 @app.post("/whatsapp/connect")
 async def connect_whatsapp_api(
     request: Request,
-    user=Depends(get_current_user)
+    token: HTTPAuthorizationCredentials = Depends(security)
 ):
+    auth_user = get_user(request)
+    crew = services.get_crew(auth_user["sub"])
+
+    if not crew:
+        raise HTTPException(status_code=403, detail="No access")
+
     body = await request.json()
 
     code = body.get("code")
@@ -1458,8 +1464,8 @@ async def connect_whatsapp_api(
     if not phone_number_id:
         raise HTTPException(status_code=400, detail="phone_number_id is required")
 
-    crew_id = user["id"]
-    yacht_id = user.get("yacht_id")
+    crew_id = crew["id"]
+    yacht_id = crew.get("yacht_id")
 
     if not yacht_id:
         raise HTTPException(status_code=400, detail="No yacht_id found for user")
