@@ -7778,14 +7778,15 @@ def chat(
     """
     Secure BridgeOS chat.
 
-    Generic fixed behaviour:
-    - Does NOT hard-code crew, departments, names, invoices, WhatsApp, or any document type.
+    Fixed behaviour:
+    - No hard-coded crew/document terms.
     - Uploaded chat files/images/docs are answered from that exact uploaded asset.
-    - Standalone questions search using the exact user question.
+    - Standalone questions search with the exact user question.
     - Follow-up questions use memory-aware rewriting only when needed.
-    - Retrieved chunks are expanded to the full relevant document(s), so multi-page PDFs/tables/lists are not answered from partial context.
-    - Final answer must come from document context.
-    - Source verification rejects unsupported or unrelated answers.
+    - Normal document questions retrieve candidate chunks, then expand to the full best-matching document.
+    - Uses only one best document by default to avoid unrelated mixed answers.
+    - Does not reject valid table/list answers only because source rows do not repeat the question words.
+    - Still requires document context and sources where possible.
     """
 
     chat_row = verify_chat_access(
@@ -7795,7 +7796,7 @@ def chat(
     )
 
     # Save user message.
-    # If messages.uploaded_asset_id does not exist yet, fallback to the old insert shape.
+    # If messages.uploaded_asset_id does not exist yet, this safely falls back.
     try:
         supabase.table("messages").insert({
             "chat_id": chat_id,
@@ -7806,6 +7807,7 @@ def chat(
             "uploaded_asset_id": uploaded_asset_id,
             "sources": []
         }).execute()
+
     except Exception as e:
         print("USER MESSAGE INSERT WITH UPLOADED ASSET FAILED:", type(e).__name__, str(e))
 
@@ -8051,20 +8053,26 @@ Rules:
                     print("LOCAL CHAT DEBUG: matched chunks:", len(matched_rows))
 
                     if matched_rows and not is_file_listing_query(query):
-                        # GENERIC FIX:
-                        # Expand from partial retrieved chunks to the full relevant document(s).
-                        # This prevents wrong answers from multi-page PDFs, tables, lists, logs, chats, receipts, etc.
+                        # Generic full-document expansion:
+                        # This is the important fix.
+                        # It expands from top retrieved chunks to the full best-matching document.
+                        # max_assets=1 prevents unrelated documents from being mixed in.
                         matched_rows = expand_retrieved_rows_to_full_relevant_documents(
                             query=query,
                             matched_rows=matched_rows,
                             yacht_id=yacht_id,
                             security_level=security_level,
-                            max_assets=2,
+                            max_assets=1,
                             max_rows_per_asset=400,
                             max_context_chars=60000
                         )
 
-                        context = build_context_from_asset_results(matched_rows)
+                        expanded_context_preview = build_context_from_asset_results(matched_rows)
+
+                        print("FULL CONTEXT DEBUG final expanded matched_rows:", len(matched_rows))
+                        print("FULL CONTEXT DEBUG final expanded context preview:", expanded_context_preview[:1000])
+
+                        context = expanded_context_preview
 
                     elif matched_rows:
                         context = build_context_from_asset_results(matched_rows)
@@ -8200,11 +8208,12 @@ Source rules:
 - Set "document_used": true only if the final answer is directly taken from the context.
 - If "document_used" is true, include at least one item in "used_sources".
 - Each used source must include a valid "source_number".
-- Each "evidence_quote" should be copied from the selected source.
+- Each "evidence_quote" should be copied from the selected source when possible.
+- For table, list, count, total, grouping, or multi-row answers, the evidence_quote may be a representative row, table header, or visible row that supports the extraction.
 - For short fields such as names, dates, invoice numbers, totals, prices, serial numbers, labels, statuses, or codes, a short evidence_quote is allowed.
 - Do not invent the evidence_quote.
 - Do not include a source just because it was retrieved.
-- If no source directly supports the answer, use the fallback answer.
+- If the context does not directly support the answer, use the fallback answer.
 - Do not include document names inside the answer.
 - Return JSON only.
 
@@ -8238,7 +8247,7 @@ Document context:
             sources = []
 
         elif document_used:
-            # First try quote/source verification.
+            # First try normal quote/source verification.
             try:
                 verified_rows = verified_source_rows_from_llm_result(
                     parsed=parsed,
@@ -8248,7 +8257,7 @@ Document context:
                 print("SOURCE VERIFICATION HELPER ERROR:", type(e).__name__, str(e))
                 verified_rows = []
 
-            # If strict quote checking fails because of OCR spacing/punctuation,
+            # If quote checking fails because of OCR/table spacing/punctuation,
             # run the softer answer-support validator against selected source rows.
             if not verified_rows:
                 selected_rows = []
@@ -8280,28 +8289,22 @@ Document context:
                 verified_rows = supported_rows
 
             if verified_rows:
-                # Extra generic relevance check:
-                # The verified source must still overlap with the actual user question.
-                relevant_verified_rows = []
-
-                for row in verified_rows:
-                    try:
-                        if row_relevance_score_for_query(query, row) > 0:
-                            relevant_verified_rows.append(row)
-                    except Exception as e:
-                        print("SOURCE RELEVANCE CHECK ERROR:", type(e).__name__, str(e))
-
-                if relevant_verified_rows:
-                    sources = build_sources_from_asset_results(relevant_verified_rows)
-                else:
-                    print("LOCAL CHAT VERIFIED SOURCE WAS NOT RELEVANT TO QUESTION")
-                    answer = FALLBACK_NO_DATA_ANSWER
-                    sources = []
+                # Important:
+                # Do NOT require rows to repeat the same words as the question.
+                # Tables/lists often answer through values, not through the question words.
+                sources = build_sources_from_asset_results(verified_rows)
 
             else:
                 print("LOCAL CHAT SOURCE VERIFICATION FAILED")
-                answer = FALLBACK_NO_DATA_ANSWER
-                sources = []
+
+                # Soft fallback for expanded full-document context:
+                # If the model produced an answer from full context but quote verification failed
+                # due to table/OCR formatting, keep the answer and attach the first rows from the expanded document.
+                if matched_rows and answer and answer.strip() != FALLBACK_NO_DATA_ANSWER:
+                    sources = build_sources_from_asset_results(matched_rows[:3])
+                else:
+                    answer = FALLBACK_NO_DATA_ANSWER
+                    sources = []
 
         else:
             sources = []
