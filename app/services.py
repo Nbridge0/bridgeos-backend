@@ -40,6 +40,8 @@ import time
 import uuid
 import jwt as pyjwt
 import io
+import re
+import zipfile
 from urllib.parse import quote
 from datetime import datetime, timezone, timedelta
 
@@ -56,8 +58,13 @@ from app.config import (
     BREVO_API_KEY,
     BREVO_FROM_EMAIL,
     BREVO_FROM_NAME,
-    BREVO_API_URL
+    BREVO_API_URL,
+    WHATSAPP_WEBHOOK_VERIFY_TOKEN,
+    META_APP_ID,
+    META_APP_SECRET,
+    META_GRAPH_VERSION
 )
+
 from supabase import create_client
 
 auth_admin = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
@@ -66,6 +73,655 @@ storage_admin = create_client(
     SUPABASE_URL,
     SUPABASE_SERVICE_KEY
 )
+
+# ------------------------
+# WHATSAPP EXPORT UPLOADS
+# ------------------------
+
+WHATSAPP_EXPORT_LINE_PATTERNS = [
+    re.compile(
+        r"^(?P<date>\d{1,2}/\d{1,2}/\d{2,4}),?\s+"
+        r"(?P<time>\d{1,2}:\d{2}(?::\d{2})?(?:\s?[AP]M)?)\s+-\s+"
+        r"(?P<sender>[^:]{1,120}):\s*(?P<message>.*)$"
+    ),
+    re.compile(
+        r"^\[(?P<date>\d{1,2}/\d{1,2}/\d{2,4}),?\s+"
+        r"(?P<time>\d{1,2}:\d{2}(?::\d{2})?(?:\s?[AP]M)?)\]\s+"
+        r"(?P<sender>[^:]{1,120}):\s*(?P<message>.*)$"
+    ),
+]
+
+
+def parse_whatsapp_export_messages(text: str) -> list[dict]:
+    if not text:
+        return []
+
+    messages = []
+    current_message = None
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip("\ufeff").rstrip()
+        matched = None
+
+        for pattern in WHATSAPP_EXPORT_LINE_PATTERNS:
+            matched = pattern.match(line)
+            if matched:
+                break
+
+        if matched:
+            if current_message:
+                messages.append(current_message)
+
+            current_message = {
+                "date": matched.group("date"),
+                "time": matched.group("time"),
+                "sender": matched.group("sender").strip(),
+                "message": matched.group("message").strip(),
+            }
+        else:
+            if current_message and line:
+                current_message["message"] += "\n" + line
+
+    if current_message:
+        messages.append(current_message)
+
+    return messages
+
+
+def is_whatsapp_export_text(text: str, filename: str | None = None) -> bool:
+    lower_filename = (filename or "").lower()
+
+    if "whatsapp" in lower_filename and lower_filename.endswith(".txt"):
+        return True
+
+    if not text:
+        return False
+
+    messages = parse_whatsapp_export_messages(text)
+
+    if len(messages) >= 3:
+        return True
+
+    lower_text = text[:3000].lower()
+
+    markers = [
+        "messages and calls are end-to-end encrypted",
+        "changed the subject",
+        "created group",
+        "added you",
+        "left",
+        "image omitted",
+        "video omitted",
+        "audio omitted",
+        "sticker omitted",
+    ]
+
+    return any(marker in lower_text for marker in markers)
+
+
+def format_whatsapp_messages_for_analysis(messages: list[dict], filename: str | None = None) -> str:
+    if not messages:
+        return ""
+
+    sender_counts = {}
+
+    for item in messages:
+        sender = item.get("sender") or "Unknown"
+        sender_counts[sender] = sender_counts.get(sender, 0) + 1
+
+    sender_summary = "\n".join(
+        f"- {sender}: {count} messages"
+        for sender, count in sorted(sender_counts.items(), key=lambda pair: pair[1], reverse=True)
+    )
+
+    formatted_messages = []
+
+    for item in messages:
+        formatted_messages.append(
+            f"[{item.get('date', '')} {item.get('time', '')}] "
+            f"{item.get('sender', 'Unknown')}: {item.get('message', '')}"
+        )
+
+    return "\n\n".join([
+        "WhatsApp chat export",
+        f"File name: {filename or 'WhatsApp export'}",
+        f"Total parsed messages: {len(messages)}",
+        "Participants:",
+        sender_summary,
+        "Messages:",
+        "\n".join(formatted_messages),
+    ]).strip()
+
+
+def normalise_whatsapp_export_text(text: str, filename: str | None = None) -> tuple[str, list[dict]]:
+    messages = parse_whatsapp_export_messages(text)
+
+    if not messages:
+        return text or "", []
+
+    return format_whatsapp_messages_for_analysis(messages, filename), messages
+
+
+def extract_whatsapp_zip_payload(file, filename: str) -> tuple[str, list[dict], str]:
+    file.seek(0)
+    zip_bytes = file.read()
+    file.seek(0)
+
+    archive = zipfile.ZipFile(io.BytesIO(zip_bytes))
+
+    txt_names = [
+        name
+        for name in archive.namelist()
+        if name.lower().endswith(".txt")
+        and "__macosx" not in name.lower()
+        and not name.endswith("/")
+    ]
+
+    if not txt_names:
+        raise ValueError("No .txt WhatsApp chat file was found inside the .zip export.")
+
+    preferred_name = None
+
+    for name in txt_names:
+        lower_name = name.lower()
+
+        if "whatsapp" in lower_name or "chat" in lower_name:
+            preferred_name = name
+            break
+
+    txt_name = preferred_name or txt_names[0]
+    raw_bytes = archive.read(txt_name)
+
+    try:
+        raw_text = raw_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raw_text = raw_bytes.decode("latin-1", errors="replace")
+
+    normalised_text, messages = normalise_whatsapp_export_text(raw_text, txt_name or filename)
+
+    return normalised_text, messages, txt_name
+
+
+def save_whatsapp_chat_history(
+    asset_id: str,
+    yacht_id: str,
+    chat_id: str | None,
+    uploaded_by: str | None,
+    original_file_name: str,
+    source_text_file_name: str | None,
+    messages: list[dict]
+):
+    if not messages:
+        return
+
+    sender_counts = {}
+
+    for item in messages:
+        sender = item.get("sender") or "Unknown"
+        sender_counts[sender] = sender_counts.get(sender, 0) + 1
+
+    first = messages[0]
+    last = messages[-1]
+
+    export_res = supabase.table("whatsapp_chat_exports").upsert({
+        "asset_id": asset_id,
+        "yacht_id": yacht_id,
+        "chat_id": chat_id,
+        "uploaded_by": uploaded_by,
+        "original_file_name": original_file_name,
+        "source_text_file_name": source_text_file_name,
+        "message_count": len(messages),
+        "participants": sender_counts,
+        "first_message_label": f"{first.get('date', '')} {first.get('time', '')}".strip(),
+        "last_message_label": f"{last.get('date', '')} {last.get('time', '')}".strip(),
+        "updated_at": "now()"
+    }, on_conflict="asset_id").execute()
+
+    if not export_res.data:
+        raise RuntimeError("Could not save WhatsApp export row.")
+
+    export_id = export_res.data[0]["id"]
+
+    supabase.table("whatsapp_chat_messages").delete().eq("asset_id", asset_id).execute()
+
+    rows = []
+
+    for index, item in enumerate(messages):
+        date_raw = item.get("date") or ""
+        time_raw = item.get("time") or ""
+
+        rows.append({
+            "export_id": export_id,
+            "asset_id": asset_id,
+            "yacht_id": yacht_id,
+            "chat_id": chat_id,
+            "uploaded_by": uploaded_by,
+            "message_index": index,
+            "sender_name": item.get("sender") or "Unknown",
+            "message_text": clean_text_for_postgres(item.get("message") or ""),
+            "message_date_raw": date_raw or None,
+            "message_time_raw": time_raw or None,
+            "message_label": f"{date_raw} {time_raw}".strip() or None,
+        })
+
+    for start in range(0, len(rows), 500):
+        supabase.table("whatsapp_chat_messages").insert(rows[start:start + 500]).execute()
+
+# ------------------------
+# WHATSAPP BUSINESS CLOUD API
+# ------------------------
+
+def verify_whatsapp_webhook_token(token: str | None) -> bool:
+    clean_token = (token or "").strip()
+
+    if not clean_token:
+        return False
+
+    if WHATSAPP_WEBHOOK_VERIFY_TOKEN and clean_token == WHATSAPP_WEBHOOK_VERIFY_TOKEN:
+        return True
+
+    res = supabase.table("whatsapp_connections") \
+        .select("id") \
+        .eq("verify_token", clean_token) \
+        .eq("is_active", True) \
+        .limit(1) \
+        .execute()
+
+    return bool(res.data)
+
+
+def exchange_whatsapp_code_for_token(code: str) -> dict:
+    """
+    Used after Meta Embedded Signup redirects back with a code.
+    """
+
+    url = f"https://graph.facebook.com/{META_GRAPH_VERSION}/oauth/access_token"
+
+    params = {
+        "client_id": META_APP_ID,
+        "client_secret": META_APP_SECRET,
+        "code": code,
+    }
+
+    res = requests.get(url, params=params, timeout=30)
+
+    if res.status_code >= 400:
+        raise RuntimeError(f"Meta token exchange failed: {res.text}")
+
+    return res.json()
+
+
+def save_client_whatsapp_connection(
+    yacht_id: str,
+    crew_id: str,
+    client_name: str | None,
+    waba_id: str | None,
+    phone_number_id: str,
+    display_phone_number: str | None,
+    access_token: str
+):
+    verify_token = WHATSAPP_WEBHOOK_VERIFY_TOKEN or f"bridgeos-whatsapp-{uuid.uuid4()}"
+
+    payload = {
+        "yacht_id": yacht_id,
+        "created_by": crew_id,
+        "client_name": client_name,
+        "waba_id": waba_id,
+        "phone_number_id": phone_number_id,
+        "display_phone_number": display_phone_number,
+        "verify_token": verify_token,
+        "access_token": access_token,
+        "is_active": True,
+        "updated_at": "now()"
+    }
+
+    res = supabase.table("whatsapp_connections") \
+        .upsert(payload, on_conflict="phone_number_id") \
+        .execute()
+
+    if not res.data:
+        raise RuntimeError("Could not save WhatsApp connection.")
+
+    return res.data[0]
+
+
+def get_whatsapp_connection_by_phone_number_id(phone_number_id: str | None):
+    if not phone_number_id:
+        return None
+
+    res = supabase.table("whatsapp_connections") \
+        .select("*") \
+        .eq("phone_number_id", phone_number_id) \
+        .eq("is_active", True) \
+        .limit(1) \
+        .execute()
+
+    if not res.data:
+        return None
+
+    return res.data[0]
+
+
+def parse_whatsapp_timestamp(timestamp_raw: str | None):
+    if not timestamp_raw:
+        return None
+
+    try:
+        return datetime.fromtimestamp(int(timestamp_raw), tz=timezone.utc).isoformat()
+    except Exception:
+        return None
+
+
+def extract_whatsapp_message_text(message: dict) -> str:
+    message_type = message.get("type")
+
+    if message_type == "text":
+        return (message.get("text") or {}).get("body") or ""
+
+    if message_type == "button":
+        return (message.get("button") or {}).get("text") or ""
+
+    if message_type == "interactive":
+        interactive = message.get("interactive") or {}
+        button_reply = interactive.get("button_reply") or {}
+        list_reply = interactive.get("list_reply") or {}
+
+        return (
+            button_reply.get("title")
+            or list_reply.get("title")
+            or list_reply.get("description")
+            or ""
+        )
+
+    if message_type == "image":
+        return (message.get("image") or {}).get("caption") or "[Image message]"
+
+    if message_type == "document":
+        document = message.get("document") or {}
+        return document.get("caption") or document.get("filename") or "[Document message]"
+
+    if message_type == "audio":
+        return "[Audio message]"
+
+    if message_type == "video":
+        return (message.get("video") or {}).get("caption") or "[Video message]"
+
+    if message_type == "sticker":
+        return "[Sticker message]"
+
+    if message_type == "location":
+        location = message.get("location") or {}
+        return f"[Location] {location.get('latitude', '')}, {location.get('longitude', '')}".strip()
+
+    if message_type == "contacts":
+        return "[Contact card]"
+
+    return f"[Unsupported WhatsApp message type: {message_type}]"
+
+
+def get_whatsapp_media_info(message: dict) -> dict:
+    message_type = message.get("type")
+
+    if message_type not in ["image", "document", "audio", "video", "sticker"]:
+        return {}
+
+    media = message.get(message_type) or {}
+
+    return {
+        "media_id": media.get("id"),
+        "media_mime_type": media.get("mime_type"),
+        "media_sha256": media.get("sha256"),
+    }
+
+
+def ensure_whatsapp_conversation_asset(
+    connection: dict,
+    contact_wa_id: str,
+    contact_name: str | None
+):
+    yacht_id = connection["yacht_id"]
+    connection_id = connection["id"]
+
+    conversation_res = supabase.table("whatsapp_conversations") \
+        .select("*") \
+        .eq("connection_id", connection_id) \
+        .eq("contact_wa_id", contact_wa_id) \
+        .limit(1) \
+        .execute()
+
+    if conversation_res.data:
+        conversation = conversation_res.data[0]
+
+        if conversation.get("asset_id"):
+            return conversation
+    else:
+        conversation_insert = supabase.table("whatsapp_conversations").insert({
+            "connection_id": connection_id,
+            "yacht_id": yacht_id,
+            "contact_wa_id": contact_wa_id,
+            "contact_name": contact_name,
+            "message_count": 0
+        }).execute()
+
+        if not conversation_insert.data:
+            raise RuntimeError("Could not create WhatsApp conversation row.")
+
+        conversation = conversation_insert.data[0]
+
+    asset_title = f"WhatsApp - {contact_name or contact_wa_id}.txt"
+    asset_id = str(uuid.uuid4())
+
+    asset_res = supabase.table("assets").insert({
+        "id": asset_id,
+        "yacht_id": yacht_id,
+        "chat_id": None,
+        "uploaded_by": connection.get("created_by"),
+        "security_level": 1,
+        "folder_name": "WhatsApp",
+        "folder_security_level": 1,
+        "file_name": asset_title,
+        "original_file_name": asset_title,
+        "original_relative_path": None,
+        "file_hash": f"whatsapp-api-{connection_id}-{contact_wa_id}",
+        "file_type": "whatsapp_api_chat",
+        "mime_type": "text/plain",
+        "storage_path": f"whatsapp-api/{connection_id}/{contact_wa_id}.txt",
+        "file_url": None,
+        "processing_status": "processed",
+        "summary": f"WhatsApp API conversation with {contact_name or contact_wa_id}"
+    }).execute()
+
+    if not asset_res.data:
+        raise RuntimeError("Could not create WhatsApp conversation asset.")
+
+    supabase.table("whatsapp_conversations").update({
+        "asset_id": asset_id,
+        "updated_at": "now()"
+    }).eq("id", conversation["id"]).execute()
+
+    conversation["asset_id"] = asset_id
+
+    return conversation
+
+
+def append_whatsapp_message_chunk(
+    asset_id: str,
+    yacht_id: str,
+    security_level: int,
+    message_index: int,
+    sender_name: str | None,
+    contact_wa_id: str,
+    message_text: str,
+    message_label: str | None,
+    message_type: str | None
+):
+    content = f"""
+WhatsApp message
+Sender: {sender_name or contact_wa_id}
+WhatsApp ID: {contact_wa_id}
+Message label: {message_label or ""}
+Message type: {message_type or ""}
+Content:
+{message_text}
+""".strip()
+
+    supabase.table("asset_chunks").insert({
+        "asset_id": asset_id,
+        "yacht_id": yacht_id,
+        "chat_id": None,
+        "security_level": security_level,
+        "content": content,
+        "content_type": "whatsapp_api_message",
+        "chunk_index": message_index,
+        "detected_date": None,
+        "detected_year": None,
+        "tags": ["whatsapp", "api", "message"],
+        "embedding": embed(content)
+    }).execute()
+
+
+def save_whatsapp_api_message(
+    connection: dict,
+    contact: dict,
+    message: dict,
+    raw_value: dict
+):
+    metadata = raw_value.get("metadata") or {}
+    phone_number_id = metadata.get("phone_number_id") or connection.get("phone_number_id")
+
+    contact_wa_id = contact.get("wa_id") or message.get("from")
+    contact_name = ((contact.get("profile") or {}).get("name")) or contact_wa_id
+
+    if not contact_wa_id:
+        return
+
+    wa_message_id = message.get("id")
+
+    if not wa_message_id:
+        return
+
+    existing = supabase.table("whatsapp_api_messages") \
+        .select("id") \
+        .eq("wa_message_id", wa_message_id) \
+        .limit(1) \
+        .execute()
+
+    if existing.data:
+        return
+
+    conversation = ensure_whatsapp_conversation_asset(
+        connection=connection,
+        contact_wa_id=contact_wa_id,
+        contact_name=contact_name
+    )
+
+    asset_id = conversation.get("asset_id")
+    yacht_id = connection["yacht_id"]
+
+    timestamp_raw = message.get("timestamp")
+    timestamp_at = parse_whatsapp_timestamp(timestamp_raw)
+    message_type = message.get("type")
+    message_text = extract_whatsapp_message_text(message)
+    media_info = get_whatsapp_media_info(message)
+
+    current_count = int(conversation.get("message_count") or 0)
+    next_index = current_count + 1
+
+    supabase.table("whatsapp_api_messages").insert({
+        "connection_id": connection["id"],
+        "conversation_id": conversation["id"],
+        "yacht_id": yacht_id,
+        "asset_id": asset_id,
+        "wa_message_id": wa_message_id,
+        "direction": "inbound",
+        "from_wa_id": message.get("from"),
+        "to_phone_number_id": phone_number_id,
+        "sender_name": contact_name,
+        "message_type": message_type,
+        "message_text": clean_text_for_postgres(message_text),
+        "media_id": media_info.get("media_id"),
+        "media_mime_type": media_info.get("media_mime_type"),
+        "media_sha256": media_info.get("media_sha256"),
+        "timestamp_raw": timestamp_raw,
+        "timestamp_at": timestamp_at,
+        "raw_payload": message
+    }).execute()
+
+    supabase.table("whatsapp_conversations").update({
+        "contact_name": contact_name,
+        "message_count": next_index,
+        "first_message_at": conversation.get("first_message_at") or timestamp_at,
+        "last_message_at": timestamp_at,
+        "updated_at": "now()"
+    }).eq("id", conversation["id"]).execute()
+
+    if asset_id:
+        append_whatsapp_message_chunk(
+            asset_id=asset_id,
+            yacht_id=yacht_id,
+            security_level=1,
+            message_index=next_index,
+            sender_name=contact_name,
+            contact_wa_id=contact_wa_id,
+            message_text=message_text,
+            message_label=timestamp_at or timestamp_raw,
+            message_type=message_type
+        )
+
+        supabase.table("assets").update({
+            "summary": clean_text_for_postgres(
+                f"WhatsApp API conversation with {contact_name or contact_wa_id}\n"
+                f"Latest message: {message_text}\n"
+                f"Last message at: {timestamp_at or ''}\n"
+                f"Message count: {next_index}"
+            ),
+            "processing_status": "processed",
+            "processing_error": None
+        }).eq("id", asset_id).execute()
+
+
+def handle_whatsapp_webhook_payload(payload: dict):
+    saved_count = 0
+
+    for entry in payload.get("entry") or []:
+        for change in entry.get("changes") or []:
+            value = change.get("value") or {}
+            metadata = value.get("metadata") or {}
+            phone_number_id = metadata.get("phone_number_id")
+
+            connection = get_whatsapp_connection_by_phone_number_id(phone_number_id)
+
+            if not connection:
+                print("WHATSAPP WEBHOOK WARNING: no connection for phone_number_id:", phone_number_id)
+                continue
+
+            contacts_by_wa_id = {}
+
+            for contact in value.get("contacts") or []:
+                wa_id = contact.get("wa_id")
+                if wa_id:
+                    contacts_by_wa_id[wa_id] = contact
+
+            for message in value.get("messages") or []:
+                sender_wa_id = message.get("from")
+                contact = contacts_by_wa_id.get(sender_wa_id) or {
+                    "wa_id": sender_wa_id,
+                    "profile": {}
+                }
+
+                save_whatsapp_api_message(
+                    connection=connection,
+                    contact=contact,
+                    message=message,
+                    raw_value=value
+                )
+
+                saved_count += 1
+
+    return {
+        "received": True,
+        "saved": saved_count
+    }
 
 # ------------------------
 # YACHT
@@ -3967,6 +4623,10 @@ def upload_asset(
 
     clean_filename = safe_filename(filename)
     file_type = detect_file_type(clean_filename, mime_type)
+
+    if clean_filename.lower().endswith(".zip"):
+        file_type = "whatsapp_zip"
+
     security_level = int(security_level)
 
     if security_level not in [1, 2, 3, 4]:
@@ -4094,7 +4754,8 @@ def upload_asset(
             file_type=file_type,
             yacht_id=yacht_id,
             chat_id=chat_id,
-            security_level=security_level
+            security_level=security_level,
+            uploaded_by=uploaded_by
         )
     except Exception as e:
         supabase.table("assets").update({
@@ -4165,7 +4826,8 @@ def process_uploaded_asset(
     file_type: str,
     yacht_id: str,
     chat_id: str | None = None,
-    security_level: int = 1
+    security_level: int = 1,
+    uploaded_by: str | None = None
 ):
     """
     Converts a raw uploaded file into searchable memory.
@@ -4180,14 +4842,53 @@ def process_uploaded_asset(
         extracted_text = ""
         visual_description = ""
         ocr_text = ""
+        whatsapp_messages = []
+        whatsapp_source_text_file_name = None
 
-        if file_type in ["text", "pdf", "docx"]:
+        if file_type == "whatsapp_zip":
+            file.seek(0)
+
+            extracted_text, whatsapp_messages, whatsapp_source_text_file_name = extract_whatsapp_zip_payload(
+                file=file,
+                filename=filename
+            )
+
+            extracted_text = clean_text_for_postgres(extracted_text)
+            file_type = "whatsapp_chat"
+
+        elif file_type in ["text", "pdf", "docx"]:
             file.seek(0)
             extracted_text = extract_text_by_file_type(
                 file=file,
                 filename=filename,
                 file_type=file_type
             )
+
+            if file_type == "text" and is_whatsapp_export_text(extracted_text, filename):
+                extracted_text, whatsapp_messages = normalise_whatsapp_export_text(
+                    text=extracted_text,
+                    filename=filename
+                )
+                whatsapp_source_text_file_name = filename
+                file_type = "whatsapp_chat"
+
+            extracted_text = clean_text_for_postgres(extracted_text)
+            file_type = "whatsapp_chat"
+
+        elif file_type in ["text", "pdf", "docx"]:
+            file.seek(0)
+            extracted_text = extract_text_by_file_type(
+                file=file,
+                filename=filename,
+                file_type=file_type
+            )
+
+            if file_type == "text" and is_whatsapp_export_text(extracted_text, filename):
+                extracted_text = normalise_whatsapp_export_text(
+                    text=extracted_text,
+                    filename=filename
+                )
+                file_type = "whatsapp_chat"
 
             extracted_text = clean_text_for_postgres(extracted_text)
 
@@ -4286,6 +4987,7 @@ def process_uploaded_asset(
         summary = combined_text[:1500]
 
         supabase.table("assets").update({
+            "file_type": file_type,
             "extracted_text": extracted_text or None,
             "visual_description": visual_description or None,
             "ocr_text": ocr_text or None,
@@ -4867,6 +5569,14 @@ For invoice/document questions:
 - If numbers are missing, say exactly which numbers are missing.
 - Do not invent missing values.
 
+For WhatsApp chat exports:
+- Analyse the upload as a conversation.
+- You may summarise the conversation, participants, dates, repeated topics, decisions, tasks, concerns, sentiment, and notable messages.
+- If the user asks who said something, use the sender names from the chat.
+- If the user asks for tasks or decisions, only include tasks or decisions clearly supported by the chat text.
+- If the user asks for tone or sentiment, explain it as an interpretation based on the messages.
+- Do not invent missing messages, deleted messages, private context, or intent that is not supported by the chat.
+
 Style:
 - Be direct.
 - Be useful.
@@ -4905,6 +5615,7 @@ Rules:
 - Answer the user's question directly.
 - If asked whether the boat is good/recommended, explain visible positives and what cannot be judged from the image.
 - If asked whether to buy, say you cannot recommend buying from an image alone and list checks needed.
+- If the uploaded file is a WhatsApp chat export, answer as a conversation analyst: summarise, identify participants, tasks, decisions, topics, concerns, dates, or tone when supported by the chat text.
 - Use only the uploaded context.
 - Use British English.
 - Plain text only.
@@ -6930,14 +7641,15 @@ Rules:
 
                 print("LOCAL CHAT DEBUG: allowed_asset_ids:", allowed_asset_ids)
 
-                if allowed_asset_ids:
+                if is_followup_query:
                     retrieval_query_input = build_memory_aware_retrieval_input(
                         query=query,
                         chat_id=chat_id
                     )
+                else:
+                    retrieval_query_input = query
 
-                    print("LOCAL CHAT DEBUG: retrieval_query_input:", retrieval_query_input)
-
+                print("LOCAL CHAT DEBUG: retrieval_query_input:", retrieval_query_input)
                     retrieval_queries = build_retrieval_queries(retrieval_query_input)
                     matched_rows_by_key = {}
 
@@ -6968,7 +7680,7 @@ Rules:
                             yacht_id=yacht_id,
                             allowed_asset_ids=allowed_asset_ids,
                             year_filter=year_filter,
-                            limit=10
+                            limit=20
                         )
 
                         for row in keyword_rows:
@@ -6984,7 +7696,7 @@ Rules:
                         try:
                             semantic_results = supabase.rpc("match_asset_chunks_secure", {
                                 "query_embedding": embed(retrieval_query),
-                                "match_count": 6,
+                                "match_count": 12,
                                 "allowed_asset_ids": allowed_asset_ids,
                                 "yacht_filter": yacht_id,
                                 "year_filter": year_filter
@@ -7003,11 +7715,26 @@ Rules:
                         except Exception as e:
                             print("SEMANTIC SEARCH ERROR:", type(e).__name__, str(e))
 
-                    matched_rows = list(matched_rows_by_key.values())[:30]
+                    matched_rows = list(matched_rows_by_key.values())[:40]
 
                     print("LOCAL CHAT DEBUG: matched chunks:", len(matched_rows))
 
-                    if matched_rows:
+                    if matched_rows and not resolved_uploaded_asset_id and not is_file_listing_query(query):
+                        direct_rows = filter_rows_that_directly_answer_query(
+                            query=query,
+                            rows=matched_rows
+                        )
+
+                        print("LOCAL CHAT DEBUG: directly answering chunks:", len(direct_rows))
+
+                        if direct_rows:
+                            matched_rows = direct_rows[:12]
+                            context = build_context_from_asset_results(matched_rows)
+                        else:
+                            matched_rows = []
+                            context = ""
+
+                    elif matched_rows:
                         context = build_context_from_asset_results(matched_rows)
                     else:
                         context = ""
@@ -7128,13 +7855,18 @@ Source rules:
 - Set "document_used": true only if the final answer is directly taken from the context.
 - If "document_used" is true, include at least one item in "used_sources".
 - Each used source must include a valid "source_number".
-- Each "evidence_quote" should be copied from the selected source.
+- Each "evidence_quote" must be an exact quote copied from that selected source.
+- Each "evidence_quote" must be long enough to verify the answer, preferably 8 words or more.
+- Do not paraphrase the evidence_quote.
 - Do not include a source just because it was retrieved.
 - If no source directly supports the answer, use the fallback answer.
 - Do not include document names inside the answer.
 - Return JSON only.
 
-User question:
+Exact user question:
+{query}
+
+Search query used for retrieval:
 {retrieval_query_input}
 
 Document context:
@@ -7191,18 +7923,17 @@ Document context:
                 used_source_numbers = []
 
             if document_used:
-                source_rows = []
+                verified_rows = verified_source_rows_from_llm_result(
+                    parsed=parsed,
+                    matched_rows=matched_rows
+                )
 
-                for source_number in used_source_numbers:
-                    index = source_number - 1
-
-                    if 0 <= index < len(matched_rows):
-                        source_rows.append(matched_rows[index])
-
-                if source_rows:
-                    sources = build_sources_from_asset_results(source_rows)
+                if verified_rows:
+                    sources = build_sources_from_asset_results(verified_rows)
                 else:
-                    # Never keep a document answer without a valid source.
+                    # Never keep a document answer unless the quoted evidence really exists
+                    # inside the selected source row.
+                    print("LOCAL CHAT SOURCE VERIFICATION FAILED")
                     answer = FALLBACK_NO_DATA_ANSWER
                     sources = []
             else:

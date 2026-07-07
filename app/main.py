@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException, Depends, Header
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, PlainTextResponse
 import io
 from urllib.parse import quote
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -1413,6 +1413,88 @@ async def get_chat_messages_api(
         crew_id=crew["id"],
         yacht_id=crew["yacht_id"]
     )
+
+@app.get("/webhooks/whatsapp")
+async def verify_whatsapp_webhook(request: Request):
+    mode = request.query_params.get("hub.mode")
+    token = request.query_params.get("hub.verify_token")
+    challenge = request.query_params.get("hub.challenge")
+
+    if mode == "subscribe" and services.verify_whatsapp_webhook_token(token):
+        return PlainTextResponse(challenge or "")
+
+    raise HTTPException(status_code=403, detail="WhatsApp webhook verification failed")
+
+
+@app.post("/webhooks/whatsapp")
+async def receive_whatsapp_webhook(request: Request):
+    payload = await request.json()
+
+    try:
+        return services.handle_whatsapp_webhook_payload(payload)
+
+    except Exception as e:
+        print("WHATSAPP WEBHOOK ERROR:", type(e).__name__, str(e))
+
+        return {
+            "received": True,
+            "saved": 0,
+            "error": type(e).__name__
+        }
+
+@app.post("/whatsapp/connect")
+async def connect_whatsapp_api(
+    request: Request,
+    user=Depends(get_current_user)
+):
+    body = await request.json()
+
+    code = body.get("code")
+    waba_id = body.get("waba_id")
+    phone_number_id = body.get("phone_number_id")
+    display_phone_number = body.get("display_phone_number")
+    client_name = body.get("client_name")
+
+    if not phone_number_id:
+        raise HTTPException(status_code=400, detail="phone_number_id is required")
+
+    crew_id = user["id"]
+    yacht_id = user.get("yacht_id")
+
+    if not yacht_id:
+        raise HTTPException(status_code=400, detail="No yacht_id found for user")
+
+    access_token = body.get("access_token")
+
+    if code and not access_token:
+        token_result = services.exchange_whatsapp_code_for_token(code)
+        access_token = token_result.get("access_token")
+
+    if not access_token:
+        raise HTTPException(status_code=400, detail="Meta access token or code is required")
+
+    connection = services.save_client_whatsapp_connection(
+        yacht_id=yacht_id,
+        crew_id=crew_id,
+        client_name=client_name,
+        waba_id=waba_id,
+        phone_number_id=phone_number_id,
+        display_phone_number=display_phone_number,
+        access_token=access_token
+    )
+
+    return {
+        "ok": True,
+        "connection": {
+            "id": connection["id"],
+            "phone_number_id": connection["phone_number_id"],
+            "display_phone_number": connection.get("display_phone_number"),
+            "client_name": connection.get("client_name"),
+            "is_active": connection.get("is_active")
+        }
+    }
+     details 
+details
 
 @app.post("/chat")
 async def chat_api(

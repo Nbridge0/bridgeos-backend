@@ -22,6 +22,11 @@ SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
 SMTP_FROM_EMAIL = os.environ.get("SMTP_FROM_EMAIL")
 SMTP_FROM_NAME = os.environ.get("SMTP_FROM_NAME", "BridgeOS")
 
+WHATSAPP_WEBHOOK_VERIFY_TOKEN = os.getenv("WHATSAPP_WEBHOOK_VERIFY_TOKEN", "")
+META_APP_ID = os.getenv("META_APP_ID", "")
+META_APP_SECRET = os.getenv("META_APP_SECRET", "")
+META_GRAPH_VERSION = os.getenv("META_GRAPH_VERSION", "v23.0")
+
 
 GMAIL_SYNC_MAX_RESULTS = int(os.environ.get("GMAIL_SYNC_MAX_RESULTS", "25"))
 BREVO_API_KEY = os.environ.get("BREVO_API_KEY")
