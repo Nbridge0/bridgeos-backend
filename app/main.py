@@ -1493,8 +1493,6 @@ async def connect_whatsapp_api(
             "is_active": connection.get("is_active")
         }
     }
-     details 
-details
 
 @app.post("/chat")
 async def chat_api(
