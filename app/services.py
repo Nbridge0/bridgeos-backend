@@ -7524,8 +7524,8 @@ def chat(
 
     print("LOCAL CHAT DEBUG: is_followup_query:", is_followup_query)
     print("LOCAL CHAT DEBUG: previous_source_asset_ids:", previous_source_asset_ids)
-    resolved_uploaded_asset_id = uploaded_asset_id
 
+    resolved_uploaded_asset_id = uploaded_asset_id
 
     if not resolved_uploaded_asset_id and query_scope != "conversational":
         resolved_uploaded_asset_id = get_latest_chat_asset_id(
@@ -7637,29 +7637,34 @@ Rules:
                         if asset_id in previous_source_asset_ids
                     ]
 
-                    print("LOCAL CHAT DEBUG: restricted follow-up allowed_asset_ids:", allowed_asset_ids)
+                    print(
+                        "LOCAL CHAT DEBUG: restricted follow-up allowed_asset_ids:",
+                        allowed_asset_ids
+                    )
 
                 print("LOCAL CHAT DEBUG: allowed_asset_ids:", allowed_asset_ids)
 
-                if is_followup_query:
-                    retrieval_query_input = build_memory_aware_retrieval_input(
-                        query=query,
-                        chat_id=chat_id
-                    )
-                else:
-                    retrieval_query_input = query
+                if allowed_asset_ids:
+                    if is_followup_query:
+                        retrieval_query_input = build_memory_aware_retrieval_input(
+                            query=query,
+                            chat_id=chat_id
+                        )
+                    else:
+                        retrieval_query_input = query
 
-                print("LOCAL CHAT DEBUG: retrieval_query_input:", retrieval_query_input)
-                retrieval_queries = build_retrieval_queries(retrieval_query_input)
-                matched_rows_by_key = {}
+                    print("LOCAL CHAT DEBUG: retrieval_query_input:", retrieval_query_input)
 
-                if is_file_listing_query(query):
-                    listing_rows = get_asset_metadata_rows_for_listing(
-                        query=query,
-                        yacht_id=yacht_id,
-                        allowed_asset_ids=allowed_asset_ids,
-                        limit=50
-                    )
+                    retrieval_queries = build_retrieval_queries(retrieval_query_input)
+                    matched_rows_by_key = {}
+
+                    if is_file_listing_query(query):
+                        listing_rows = get_asset_metadata_rows_for_listing(
+                            query=query,
+                            yacht_id=yacht_id,
+                            allowed_asset_ids=allowed_asset_ids,
+                            limit=50
+                        )
 
                         for row in listing_rows:
                             key = (
@@ -7738,6 +7743,12 @@ Rules:
                         context = build_context_from_asset_results(matched_rows)
                     else:
                         context = ""
+                else:
+                    matched_rows = []
+                    context = ""
+            else:
+                matched_rows = []
+                context = ""
 
     except Exception as e:
         print("LOCAL CHAT DOCUMENT SEARCH ERROR:", type(e).__name__, str(e))
@@ -7792,6 +7803,8 @@ Rules:
             sources = []
 
     else:
+        numbered_context = build_numbered_context_from_asset_results(matched_rows)
+
         raw_answer = ask_llm(
             query=query,
             context=f"""
@@ -7824,16 +7837,6 @@ or:
   "used_sources": []
 }}
 
-Core rules:
-- Answer only from the document context below.
-- Do not use general knowledge.
-- Do not fill gaps.
-- Do not infer facts that are not in the context.
-- Do not add assumptions, recommendations, causes, risks, names, dates, values, duties, or steps unless they are directly present in the context.
-- Do not answer from loosely related context.
-- If the exact answer is not directly present in the context, answer exactly:
-{FALLBACK_NO_DATA_ANSWER}
-
 Detail rules:
 - If the document contains a list of responsibilities, duties, steps, checks, requirements, or items, include the full relevant list.
 - Do not summarise a long relevant list into one short sentence.
@@ -7851,6 +7854,7 @@ Detail rules:
 - You may rephrase for readability, but you must preserve the meaning exactly.
 - Do not change, add, delete, soften, strengthen, or reinterpret the document content.
 - Do not include unrelated sections just because they appear nearby.
+
 Source rules:
 - Set "document_used": true only if the final answer is directly taken from the context.
 - If "document_used" is true, include at least one item in "used_sources".
@@ -7870,9 +7874,9 @@ Search query used for retrieval:
 {retrieval_query_input}
 
 Document context:
-{context}
+{numbered_context}
 """.strip()
-)
+        )
 
         parsed = parse_llm_json_response(raw_answer)
 
@@ -7885,7 +7889,6 @@ Document context:
 
             used_source_numbers = []
 
-            # Preferred shape: used_sources = [{"source_number": 1, ...}]
             raw_used_sources = parsed.get("used_sources") or []
 
             if isinstance(raw_used_sources, list):
@@ -7899,7 +7902,6 @@ Document context:
                         except Exception:
                             pass
 
-            # Backwards compatibility if model returns used_source_numbers.
             if not used_source_numbers:
                 raw_used_source_numbers = parsed.get("used_source_numbers") or []
 
@@ -7931,8 +7933,6 @@ Document context:
                 if verified_rows:
                     sources = build_sources_from_asset_results(verified_rows)
                 else:
-                    # Never keep a document answer unless the quoted evidence really exists
-                    # inside the selected source row.
                     print("LOCAL CHAT SOURCE VERIFICATION FAILED")
                     answer = FALLBACK_NO_DATA_ANSWER
                     sources = []
