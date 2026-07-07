@@ -7479,6 +7479,292 @@ Latest user message:
         print("FOLLOWUP CLASSIFIER ERROR:", type(e).__name__, str(e))
         return False
 
+# ------------------------
+# GENERIC DOCUMENT CONTEXT EXPANSION
+# ------------------------
+
+def get_row_text_for_relevance(row) -> str:
+    """
+    Returns the searchable text from an asset chunk row.
+    Generic: works for PDFs, DOCX, text, OCR, WhatsApp, tables, etc.
+    """
+
+    if not row:
+        return ""
+
+    return str(
+        row.get("content")
+        or row.get("text")
+        or row.get("summary")
+        or ""
+    )
+
+
+def normalise_search_text(value: str) -> str:
+    value = value or ""
+    value = value.lower()
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
+
+
+def meaningful_terms_from_query(query: str) -> list[str]:
+    """
+    Generic query terms, not domain-specific.
+    Used only to avoid expanding totally unrelated documents.
+    """
+
+    text = normalise_search_text(query)
+
+    stopwords = {
+        "a", "an", "the", "and", "or", "of", "to", "in", "on", "for", "from",
+        "with", "by", "is", "are", "was", "were", "be", "been", "being",
+        "it", "this", "that", "these", "those", "i", "me", "my", "we", "our",
+        "you", "your", "they", "them", "their", "what", "which", "who", "where",
+        "when", "why", "how", "many", "much", "give", "tell", "show", "find",
+        "list", "count", "currently", "please", "can", "could", "would", "should"
+    }
+
+    terms = []
+
+    for word in text.split():
+        if len(word) < 3:
+            continue
+
+        if word in stopwords:
+            continue
+
+        terms.append(word)
+
+    # Deduplicate while preserving order.
+    seen = set()
+    final_terms = []
+
+    for term in terms:
+        if term not in seen:
+            seen.add(term)
+            final_terms.append(term)
+
+    return final_terms
+
+
+def row_relevance_score_for_query(query: str, row) -> float:
+    """
+    Generic overlap scoring.
+    This does NOT answer the question.
+    It only prevents obviously unrelated assets from being expanded.
+    """
+
+    row_text = normalise_search_text(get_row_text_for_relevance(row))
+    terms = meaningful_terms_from_query(query)
+
+    if not row_text or not terms:
+        return 0.0
+
+    hits = 0
+
+    for term in terms:
+        if term in row_text:
+            hits += 1
+
+    return hits / max(len(terms), 1)
+
+
+def ordered_unique_asset_ids_from_rows(rows: list[dict], max_assets: int = 3) -> list[str]:
+    asset_ids = []
+
+    for row in rows or []:
+        asset_id = row.get("asset_id")
+
+        if not asset_id:
+            continue
+
+        if asset_id not in asset_ids:
+            asset_ids.append(asset_id)
+
+        if len(asset_ids) >= max_assets:
+            break
+
+    return asset_ids
+
+
+def choose_relevant_asset_ids_for_query(
+    query: str,
+    matched_rows: list[dict],
+    max_assets: int = 2
+) -> list[str]:
+    """
+    Chooses which matched document(s) should be expanded to full-document context.
+
+    This is generic:
+    - no crew terms
+    - no invoice terms
+    - no WhatsApp terms
+    - no document-specific hard-coding
+
+    It uses only retrieval order + generic term overlap.
+    """
+
+    if not matched_rows:
+        return []
+
+    asset_scores = {}
+    asset_order_bonus = {}
+
+    for index, row in enumerate(matched_rows):
+        asset_id = row.get("asset_id")
+
+        if not asset_id:
+            continue
+
+        score = row_relevance_score_for_query(query, row)
+
+        # Retrieval order matters, but should not overpower relevance.
+        order_bonus = max(0.0, 1.0 - (index * 0.03))
+
+        asset_scores[asset_id] = asset_scores.get(asset_id, 0.0) + score + order_bonus
+        asset_order_bonus[asset_id] = max(asset_order_bonus.get(asset_id, 0.0), order_bonus)
+
+    if not asset_scores:
+        return ordered_unique_asset_ids_from_rows(matched_rows, max_assets=max_assets)
+
+    ranked = sorted(
+        asset_scores.items(),
+        key=lambda item: item[1],
+        reverse=True
+    )
+
+    selected = []
+
+    for asset_id, score in ranked:
+        if score <= 0:
+            continue
+
+        selected.append(asset_id)
+
+        if len(selected) >= max_assets:
+            break
+
+    if selected:
+        return selected
+
+    return ordered_unique_asset_ids_from_rows(matched_rows, max_assets=max_assets)
+
+
+def get_full_asset_rows_for_context(
+    yacht_id: str,
+    asset_id: str,
+    security_level: int,
+    max_rows: int = 400
+) -> list[dict]:
+    """
+    Loads the full chunk set for one document, ordered by chunk_index.
+    This fixes multi-page PDFs/tables where the first retrieved chunks are only partial.
+    """
+
+    if not asset_id:
+        return []
+
+    try:
+        res = supabase.table("asset_chunks") \
+            .select("*") \
+            .eq("yacht_id", yacht_id) \
+            .eq("asset_id", asset_id) \
+            .lte("security_level", security_level) \
+            .order("chunk_index", desc=False) \
+            .limit(max_rows) \
+            .execute()
+
+        return res.data or []
+
+    except Exception as e:
+        print("FULL ASSET CONTEXT LOAD ERROR:", type(e).__name__, str(e), asset_id)
+        return []
+
+
+def trim_rows_for_context_limit(
+    rows: list[dict],
+    max_chars: int = 60000
+) -> list[dict]:
+    """
+    Keeps rows in document order while staying under a safe context size.
+    """
+
+    trimmed = []
+    total_chars = 0
+
+    for row in rows or []:
+        row_text = get_row_text_for_relevance(row)
+        row_length = len(row_text)
+
+        if not row_text:
+            continue
+
+        if total_chars + row_length > max_chars and trimmed:
+            break
+
+        trimmed.append(row)
+        total_chars += row_length
+
+    return trimmed
+
+
+def expand_retrieved_rows_to_full_relevant_documents(
+    query: str,
+    matched_rows: list[dict],
+    yacht_id: str,
+    security_level: int,
+    max_assets: int = 2,
+    max_rows_per_asset: int = 400,
+    max_context_chars: int = 60000
+) -> list[dict]:
+    """
+    Generic anti-hallucination / anti-partial-context fix.
+
+    Instead of answering from a few partial retrieved chunks, this:
+    1. chooses the most relevant matched document(s)
+    2. loads the full document chunks
+    3. trims safely by character limit
+    4. returns full ordered context rows
+
+    This prevents wrong counts from multi-page PDFs/tables without hard-coding any topic.
+    """
+
+    if not matched_rows:
+        return []
+
+    selected_asset_ids = choose_relevant_asset_ids_for_query(
+        query=query,
+        matched_rows=matched_rows,
+        max_assets=max_assets
+    )
+
+    print("FULL CONTEXT DEBUG selected_asset_ids:", selected_asset_ids)
+
+    expanded_rows = []
+
+    for asset_id in selected_asset_ids:
+        full_rows = get_full_asset_rows_for_context(
+            yacht_id=yacht_id,
+            asset_id=asset_id,
+            security_level=security_level,
+            max_rows=max_rows_per_asset
+        )
+
+        if full_rows:
+            expanded_rows.extend(full_rows)
+
+    if not expanded_rows:
+        return matched_rows
+
+    expanded_rows = trim_rows_for_context_limit(
+        rows=expanded_rows,
+        max_chars=max_context_chars
+    )
+
+    print("FULL CONTEXT DEBUG expanded_rows:", len(expanded_rows))
+
+    return expanded_rows or matched_rows
     
 
 def chat(
@@ -7492,13 +7778,14 @@ def chat(
     """
     Secure BridgeOS chat.
 
-    Fixed behaviour:
-    - Uploaded chat files/images are answered from that exact uploaded asset.
+    Generic fixed behaviour:
+    - Does NOT hard-code crew, departments, names, invoices, WhatsApp, or any document type.
+    - Uploaded chat files/images/docs are answered from that exact uploaded asset.
     - Standalone questions search using the exact user question.
     - Follow-up questions use memory-aware rewriting only when needed.
-    - Document retrieval is no longer blocked by an over-strict direct filter.
-    - The answer is always based on document context.
-    - Source verification is balanced: strict enough to avoid hallucination, soft enough to extract real document fields.
+    - Retrieved chunks are expanded to the full relevant document(s), so multi-page PDFs/tables/lists are not answered from partial context.
+    - Final answer must come from document context.
+    - Source verification rejects unsupported or unrelated answers.
     """
 
     chat_row = verify_chat_access(
@@ -7507,8 +7794,8 @@ def chat(
         yacht_id=yacht_id
     )
 
-    # Save the user message.
-    # If your messages table does not yet have uploaded_asset_id, this falls back safely.
+    # Save user message.
+    # If messages.uploaded_asset_id does not exist yet, fallback to the old insert shape.
     try:
         supabase.table("messages").insert({
             "chat_id": chat_id,
@@ -7561,7 +7848,7 @@ def chat(
 
     resolved_uploaded_asset_id = uploaded_asset_id
 
-    # If the frontend somehow fails to send uploaded_asset_id, still try the latest uploaded file in this chat.
+    # If frontend fails to send uploaded_asset_id, try latest uploaded file in this chat.
     # Do not do this for pure conversational messages.
     if not resolved_uploaded_asset_id and query_scope != "conversational":
         resolved_uploaded_asset_id = get_latest_chat_asset_id(
@@ -7682,9 +7969,8 @@ Rules:
                 print("LOCAL CHAT DEBUG: allowed_asset_ids:", allowed_asset_ids)
 
                 if allowed_asset_ids:
-                    # IMPORTANT FIX:
-                    # Only rewrite the search query if this is truly a follow-up.
-                    # Standalone questions must search with the exact user wording.
+                    # Standalone questions search with exact user wording.
+                    # Follow-up questions may use chat memory.
                     if is_followup_query:
                         retrieval_query_input = build_memory_aware_retrieval_input(
                             query=query,
@@ -7764,33 +8050,25 @@ Rules:
 
                     print("LOCAL CHAT DEBUG: matched chunks:", len(matched_rows))
 
-                    # IMPORTANT FIX:
-                    # The direct answer filter is now soft.
-                    # If it finds strong rows, use them.
-                    # If it finds nothing, do NOT delete the retrieved context.
                     if matched_rows and not is_file_listing_query(query):
-                        original_matched_rows = matched_rows
+                        # GENERIC FIX:
+                        # Expand from partial retrieved chunks to the full relevant document(s).
+                        # This prevents wrong answers from multi-page PDFs, tables, lists, logs, chats, receipts, etc.
+                        matched_rows = expand_retrieved_rows_to_full_relevant_documents(
+                            query=query,
+                            matched_rows=matched_rows,
+                            yacht_id=yacht_id,
+                            security_level=security_level,
+                            max_assets=2,
+                            max_rows_per_asset=400,
+                            max_context_chars=60000
+                        )
 
-                        try:
-                            direct_rows = filter_rows_that_directly_answer_query(
-                                query=query,
-                                rows=matched_rows
-                            )
-                        except Exception as e:
-                            print("DIRECT ROW FILTER ERROR:", type(e).__name__, str(e))
-                            direct_rows = []
-
-                        print("LOCAL CHAT DEBUG: directly answering chunks:", len(direct_rows))
-
-                        if direct_rows:
-                            matched_rows = direct_rows[:12]
-                            context = build_context_from_asset_results(matched_rows)
-                        else:
-                            matched_rows = original_matched_rows[:20]
-                            context = build_context_from_asset_results(matched_rows)
+                        context = build_context_from_asset_results(matched_rows)
 
                     elif matched_rows:
                         context = build_context_from_asset_results(matched_rows)
+
                     else:
                         context = ""
 
@@ -7900,14 +8178,21 @@ Core rules:
 - Do not fill gaps.
 - Do not invent facts.
 - Do not answer from loosely related context.
+- Do not answer from a different document topic just because it was retrieved.
+- The selected source must directly contain the information needed to answer the exact user question.
+- If the user asks for a count, total, list, grouping, categories, statuses, dates, names, prices, or any table/list-derived answer, inspect the whole provided context before answering.
+- If the context contains a multi-page table/list, include all visible rows/items in the provided context, not only the first page or first chunk.
 - If the exact answer is not directly present in the context, answer exactly:
 {FALLBACK_NO_DATA_ANSWER}
 
 Extraction rules:
-- If the user asks for a field, value, date, total, price, supplier, name, code, serial number, email, phone number, item, quantity, task, decision, instruction, or status, extract it exactly from the context.
+- Extract exact values from the context.
 - Short values are allowed.
-- For tables, invoices, receipts, forms, lists, WhatsApp chats, and OCR text, use the visible/extracted text exactly as written.
+- For tables, receipts, forms, lists, logs, chats, OCR text, and multi-page documents, inspect the whole provided context before answering.
+- If the question asks for a count or total, count every matching row/item/value visible in the provided context.
+- If the question asks for grouping, group every matching row/item/value visible in the provided context.
 - If multiple relevant values exist, list them clearly.
+- If the answer depends on rows/items that may continue later in the context, keep reading the context before answering.
 - If a value is missing, say it is not found in the provided context.
 - Do not reject valid answers just because the evidence is short.
 
@@ -7953,7 +8238,7 @@ Document context:
             sources = []
 
         elif document_used:
-            # First try strict quote/source verification.
+            # First try quote/source verification.
             try:
                 verified_rows = verified_source_rows_from_llm_result(
                     parsed=parsed,
@@ -7964,7 +8249,7 @@ Document context:
                 verified_rows = []
 
             # If strict quote checking fails because of OCR spacing/punctuation,
-            # run the softer answer-support validator against the selected source rows.
+            # run the softer answer-support validator against selected source rows.
             if not verified_rows:
                 selected_rows = []
 
@@ -7995,7 +8280,24 @@ Document context:
                 verified_rows = supported_rows
 
             if verified_rows:
-                sources = build_sources_from_asset_results(verified_rows)
+                # Extra generic relevance check:
+                # The verified source must still overlap with the actual user question.
+                relevant_verified_rows = []
+
+                for row in verified_rows:
+                    try:
+                        if row_relevance_score_for_query(query, row) > 0:
+                            relevant_verified_rows.append(row)
+                    except Exception as e:
+                        print("SOURCE RELEVANCE CHECK ERROR:", type(e).__name__, str(e))
+
+                if relevant_verified_rows:
+                    sources = build_sources_from_asset_results(relevant_verified_rows)
+                else:
+                    print("LOCAL CHAT VERIFIED SOURCE WAS NOT RELEVANT TO QUESTION")
+                    answer = FALLBACK_NO_DATA_ANSWER
+                    sources = []
+
             else:
                 print("LOCAL CHAT SOURCE VERIFICATION FAILED")
                 answer = FALLBACK_NO_DATA_ANSWER
