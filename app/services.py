@@ -7650,16 +7650,16 @@ Rules:
                     retrieval_query_input = query
 
                 print("LOCAL CHAT DEBUG: retrieval_query_input:", retrieval_query_input)
-                    retrieval_queries = build_retrieval_queries(retrieval_query_input)
-                    matched_rows_by_key = {}
+                retrieval_queries = build_retrieval_queries(retrieval_query_input)
+                matched_rows_by_key = {}
 
-                    if is_file_listing_query(query):
-                        listing_rows = get_asset_metadata_rows_for_listing(
-                            query=query,
-                            yacht_id=yacht_id,
-                            allowed_asset_ids=allowed_asset_ids,
-                            limit=50
-                        )
+                if is_file_listing_query(query):
+                    listing_rows = get_asset_metadata_rows_for_listing(
+                        query=query,
+                        yacht_id=yacht_id,
+                        allowed_asset_ids=allowed_asset_ids,
+                        limit=50
+                    )
 
                         for row in listing_rows:
                             key = (
