@@ -1,4 +1,93 @@
- 
+from fastapi import HTTPException, Request
+import requests
+import json
+import random
+import hashlib
+import smtplib
+from email.message import EmailMessage
+from app.database import supabase
+from app.embeddings import embed
+from app.config import (
+    BUCKET_NAME,
+    RUNPOD_BASE_URL,
+    BRIDGEOS_API_KEY,
+    API_SYNC_TIMEOUT_SECONDS,
+    GMAIL_SYNC_MAX_RESULTS
+)
+from app.llm import ask_llm, FALLBACK_NO_DATA_ANSWER
+from app.file_utils import detect_file_type, calculate_file_hash, safe_filename
+from app.metadata_utils import (
+    extract_date_from_filename,
+    extract_year_from_text,
+    detect_event,
+    generate_basic_tags,
+    extract_query_filters
+)
+from app.extractors import (
+    chunk_text,
+    extract_text_by_file_type
+)
+from app.image_ai import (
+    describe_image,
+    extract_ocr_from_image,
+    extract_ocr_from_pdf_pages
+)
+
+import base64
+from email.utils import parsedate_to_datetime
+
+import time
+import uuid
+import jwt as pyjwt
+import io
+import re
+import zipfile
+from urllib.parse import quote
+from datetime import datetime, timezone, timedelta
+
+from app.config import (
+    SUPABASE_JWT_SECRET,
+    SUPABASE_URL,
+    SUPABASE_SERVICE_KEY,
+    SMTP_HOST,
+    SMTP_PORT,
+    SMTP_USERNAME,
+    SMTP_PASSWORD,
+    SMTP_FROM_EMAIL,
+    SMTP_FROM_NAME,
+    BREVO_API_KEY,
+    BREVO_FROM_EMAIL,
+    BREVO_FROM_NAME,
+    BREVO_API_URL,
+    WHATSAPP_WEBHOOK_VERIFY_TOKEN,
+    META_APP_ID,
+    META_APP_SECRET,
+    META_GRAPH_VERSION
+)
+
+from supabase import create_client
+
+auth_admin = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+
+storage_admin = create_client(
+    SUPABASE_URL,
+    SUPABASE_SERVICE_KEY
+)
+
+# ------------------------
+# WHATSAPP EXPORT UPLOADS
+# ------------------------
+
+WHATSAPP_EXPORT_LINE_PATTERNS = [
+    re.compile(
+        r"^(?P<date>\d{1,2}/\d{1,2}/\d{2,4}),?\s+"
+        r"(?P<time>\d{1,2}:\d{2}(?::\d{2})?(?:\s?[AP]M)?)\s+-\s+"
+        r"(?P<sender>[^:]{1,120}):\s*(?P<message>.*)$"
+    ),
+    re.compile(
+        r"^\[(?P<date>\d{1,2}/\d{1,2}/\d{2,4}),?\s+"
+        r"(?P<time>\d{1,2}:\d{2}(?::\d{2})?(?:\s?[AP]M)?)\]\s+"
+        r"(?P<sender>[^:]{1,120}):\s*(?P<message>.*)$"
     ),
 ]
 
