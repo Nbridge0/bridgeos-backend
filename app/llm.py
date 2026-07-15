@@ -31,10 +31,10 @@ Current user request:
             url,
             json={
                 "prompt": prompt,
-                "max_tokens": max_output_tokens,
-                "max_new_tokens": max_output_tokens,
-                "max_output_tokens": max_output_tokens,
-                "temperature": 0.0
+                "max_tokens": 2500,
+                "max_new_tokens": 2500,
+                "max_output_tokens": 2500,
+                "temperature": 0.1
             },
             headers={
                 "Content-Type": "application/json",

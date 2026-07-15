@@ -1,72 +1,27 @@
-import re
 from pypdf import PdfReader
 from docx import Document
 from app.image_ai import extract_ocr_from_pdf_pages
 
-def chunk_text(
-    text: str,
-    chunk_size: int = 1800,
-    overlap: int = 250
-) -> list[str]:
+def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 150):
     """
-    Paragraph-aware chunking.
-
-    Preserves headings, lists and paragraph boundaries instead of cutting
-    the document at arbitrary character positions.
+    Splits text into overlapping chunks.
     """
 
     if not text:
         return []
 
-    clean = str(text)
-    clean = clean.replace("\r\n", "\n").replace("\r", "\n")
-    clean = re.sub(r"[ \t]+\n", "\n", clean)
-    clean = re.sub(r"\n{3,}", "\n\n", clean).strip()
-
-    if not clean:
-        return []
-
-    blocks = [
-        block.strip()
-        for block in re.split(r"\n\s*\n", clean)
-        if block.strip()
-    ]
-
     chunks = []
-    current_blocks = []
+    start = 0
+    text_length = len(text)
 
-    for block in blocks:
-        proposed = "\n\n".join(current_blocks + [block])
+    while start < text_length:
+        end = start + chunk_size
+        chunk = text[start:end].strip()
 
-        if current_blocks and len(proposed) > chunk_size:
-            completed = "\n\n".join(current_blocks).strip()
+        if chunk:
+            chunks.append(chunk)
 
-            if completed:
-                chunks.append(completed)
-
-            overlap_blocks = []
-            overlap_length = 0
-
-            for previous_block in reversed(current_blocks):
-                added_length = len(previous_block)
-                if overlap_blocks:
-                    added_length += 2
-
-                if overlap_length + added_length > overlap:
-                    break
-
-                overlap_blocks.insert(0, previous_block)
-                overlap_length += added_length
-
-            current_blocks = overlap_blocks
-
-        current_blocks.append(block)
-
-    if current_blocks:
-        completed = "\n\n".join(current_blocks).strip()
-
-        if completed:
-            chunks.append(completed)
+        start += chunk_size - overlap
 
     return chunks
 
@@ -158,30 +113,11 @@ def extract_pdf_text(file, filename: str = "document.pdf") -> str:
 
     extracted_text = "\n\n".join(parts).strip()
 
-    clean_text = extracted_text.strip()
+    digit_count = sum(char.isdigit() for char in extracted_text)
+    text_is_weak = len(extracted_text) < 120
+    numbers_are_weak = digit_count < 5
 
-    text_is_weak = len(clean_text) < 200
-
-    replacement_char_count = clean_text.count("\ufffd")
-
-    printable_count = sum(
-        1
-        for char in clean_text
-        if char.isprintable() or char in "\n\r\t"
-    )
-
-    printable_ratio = (
-        printable_count / len(clean_text)
-        if clean_text
-        else 0.0
-    )
-
-    text_looks_corrupt = (
-        replacement_char_count > 5
-        or printable_ratio < 0.90
-    )
-
-    should_run_ocr = text_is_weak or text_looks_corrupt
+    should_run_ocr = text_is_weak or numbers_are_weak
 
     if should_run_ocr:
         try:
