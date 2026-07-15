@@ -7281,71 +7281,6 @@ def classify_bridgeos_query_scope(query: str) -> str:
 
     # Anything else needs document proof.
     return "factual"
-
-def classify_answer_depth(query: str) -> str:
-    """
-    Returns:
-    - focused: directly answer a specific question
-    - comprehensive: return all relevant information about the requested subject
-    - document: inspect and explain the whole document
-
-    No document subjects or categories are hardcoded.
-    """
-
-    clean_query = str(query or "").strip()
-
-    if not clean_query:
-        return "focused"
-
-    try:
-        raw = ask_llm(
-            query=clean_query,
-            context="""
-Classify the requested amount of document information.
-
-Return exactly one word:
-
-focused
-comprehensive
-document
-
-Definitions:
-
-focused:
-The user asks a specific question and needs the directly relevant answer.
-
-comprehensive:
-The user requests all available information, every relevant detail,
-a complete explanation, every item, all steps, all requirements,
-or an exhaustive answer about a particular subject.
-
-document:
-The user asks to review, explain, extract, analyse, or summarise
-the entire file or document.
-
-Rules:
-- Classify the requested coverage only.
-- Do not answer the question.
-- Do not identify or rewrite the subject.
-- Do not add facts.
-- Return one word only.
-""".strip(),
-            max_output_tokens=20
-        )
-
-        value = str(raw or "").strip().lower()
-
-        if value in {"focused", "comprehensive", "document"}:
-            return value
-
-    except Exception as e:
-        print(
-            "ANSWER DEPTH CLASSIFIER ERROR:",
-            type(e).__name__,
-            str(e)
-        )
-
-    return "focused"
     
 
 def get_recent_user_context(chat_id: str, current_query: str, limit: int = 6) -> str:
@@ -7979,9 +7914,8 @@ User request:
 Document part {batch_index} of {len(batches)}:
 
 {batch_context}
-""".strip(),
-                max_output_tokens=3000
-            )
+""".strip()
+)
 
             extracted = str(raw or "").strip()
 
@@ -8929,12 +8863,7 @@ Search query used for retrieval:
 
 Document context:
 {context}
-""".strip(),
-    max_output_tokens=(
-        8000
-        if answer_depth in {"comprehensive", "document"}
-        else 4000
-    )
+""".strip()
 )
 
         parsed = parse_llm_json_response(raw_answer)
