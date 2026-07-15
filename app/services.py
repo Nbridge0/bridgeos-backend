@@ -4857,40 +4857,32 @@ def process_uploaded_asset(
             file_type = "whatsapp_chat"
 
         elif file_type in ["text", "pdf", "docx"]:
+            original_file_type = file_type
+
             file.seek(0)
             extracted_text = extract_text_by_file_type(
                 file=file,
                 filename=filename,
-                file_type=file_type
+                file_type=original_file_type
             )
 
-            if file_type == "text" and is_whatsapp_export_text(extracted_text, filename):
+            extracted_text = clean_text_for_postgres(extracted_text)
+
+            # Only genuine WhatsApp TXT exports become whatsapp_chat.
+            if (
+                original_file_type == "text"
+                and is_whatsapp_export_text(extracted_text, filename)
+            ):
                 extracted_text, whatsapp_messages = normalise_whatsapp_export_text(
                     text=extracted_text,
                     filename=filename
                 )
+
+                extracted_text = clean_text_for_postgres(extracted_text)
                 whatsapp_source_text_file_name = filename
                 file_type = "whatsapp_chat"
-
-            extracted_text = clean_text_for_postgres(extracted_text)
-            file_type = "whatsapp_chat"
-
-        elif file_type in ["text", "pdf", "docx"]:
-            file.seek(0)
-            extracted_text = extract_text_by_file_type(
-                file=file,
-                filename=filename,
-                file_type=file_type
-            )
-
-            if file_type == "text" and is_whatsapp_export_text(extracted_text, filename):
-                extracted_text = normalise_whatsapp_export_text(
-                    text=extracted_text,
-                    filename=filename
-                )
-                file_type = "whatsapp_chat"
-
-            extracted_text = clean_text_for_postgres(extracted_text)
+            else:
+                file_type = original_file_type
 
         if file_type == "pdf":
             should_run_pdf_ocr = False
@@ -6447,7 +6439,7 @@ def keyword_search_asset_chunks(
     yacht_id: str,
     allowed_asset_ids: list[str],
     year_filter: int | None = None,
-    limit: int = 8
+    limit: int = 40
 ) -> list[dict]:
     """
     Compatibility wrapper.
@@ -7290,6 +7282,72 @@ def classify_bridgeos_query_scope(query: str) -> str:
     # Anything else needs document proof.
     return "factual"
 
+def classify_answer_depth(query: str) -> str:
+    """
+    Returns:
+    - focused: directly answer a specific question
+    - comprehensive: return all relevant information about the requested subject
+    - document: inspect and explain the whole document
+
+    No document subjects or categories are hardcoded.
+    """
+
+    clean_query = str(query or "").strip()
+
+    if not clean_query:
+        return "focused"
+
+    try:
+        raw = ask_llm(
+            query=clean_query,
+            context="""
+Classify the requested amount of document information.
+
+Return exactly one word:
+
+focused
+comprehensive
+document
+
+Definitions:
+
+focused:
+The user asks a specific question and needs the directly relevant answer.
+
+comprehensive:
+The user requests all available information, every relevant detail,
+a complete explanation, every item, all steps, all requirements,
+or an exhaustive answer about a particular subject.
+
+document:
+The user asks to review, explain, extract, analyse, or summarise
+the entire file or document.
+
+Rules:
+- Classify the requested coverage only.
+- Do not answer the question.
+- Do not identify or rewrite the subject.
+- Do not add facts.
+- Return one word only.
+""".strip(),
+            max_output_tokens=20
+        )
+
+        value = str(raw or "").strip().lower()
+
+        if value in {"focused", "comprehensive", "document"}:
+            return value
+
+    except Exception as e:
+        print(
+            "ANSWER DEPTH CLASSIFIER ERROR:",
+            type(e).__name__,
+            str(e)
+        )
+
+    return "focused"
+    
+
 def get_recent_user_context(chat_id: str, current_query: str, limit: int = 6) -> str:
     """
     Gets recent user messages only.
@@ -7342,7 +7400,8 @@ def filter_rows_that_directly_answer_query(query: str, rows: list[dict]) -> list
     if not clean_query or not rows:
         return []
 
-    context = build_context_from_asset_results(rows[:20])
+    candidate_rows = rows[:100]
+    context = build_context_from_asset_results(candidate_rows)
 
     if not context.strip():
         return []
@@ -7401,8 +7460,8 @@ Retrieved sources:
             except Exception:
                 continue
 
-            if 0 <= index < len(rows[:20]):
-                direct_rows.append(rows[index])
+            if 0 <= index < len(candidate_rows):
+                direct_rows.append(candidate_rows[index])
 
         return direct_rows
 
@@ -7767,29 +7826,188 @@ def get_full_asset_rows_for_context(
 
 def trim_rows_for_context_limit(
     rows: list[dict],
-    max_chars: int = 60000
+    max_chars: int = 120000,
+    preserve_all_rows: bool = False
 ) -> list[dict]:
     """
-    Keeps rows in document order while staying under a safe context size.
+    Limits focused-answer context without silently removing later rows.
+
+    For comprehensive and whole-document requests, all rows are preserved
+    and will be processed in smaller batches later.
     """
+
+    clean_rows = []
+
+    for row in rows or []:
+        row_text = get_row_text_for_relevance(row).strip()
+
+        if row_text:
+            clean_rows.append(row)
+
+    if preserve_all_rows:
+        return clean_rows
 
     trimmed = []
     total_chars = 0
 
-    for row in rows or []:
+    for row in clean_rows:
         row_text = get_row_text_for_relevance(row)
         row_length = len(row_text)
 
-        if not row_text:
+        if total_chars + row_length > max_chars:
             continue
-
-        if total_chars + row_length > max_chars and trimmed:
-            break
 
         trimmed.append(row)
         total_chars += row_length
 
     return trimmed
+
+def deduplicate_context_rows(rows: list[dict]) -> list[dict]:
+    """
+    Removes duplicate content while preserving document order.
+    """
+
+    unique_rows = []
+    seen = set()
+
+    for row in rows or []:
+        normalised_content = normalise_search_text(
+            get_row_text_for_relevance(row)
+        )
+
+        if not normalised_content:
+            continue
+
+        key = (
+            row.get("asset_id"),
+            normalised_content
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        unique_rows.append(row)
+
+    return unique_rows
+
+def split_context_rows_into_batches(
+    rows: list[dict],
+    max_chars_per_batch: int = 30000
+) -> list[list[dict]]:
+    """
+    Splits source rows into model-sized batches without splitting rows.
+    """
+
+    batches = []
+    current_batch = []
+    current_chars = 0
+
+    for row in rows or []:
+        row_text = get_row_text_for_relevance(row).strip()
+
+        if not row_text:
+            continue
+
+        row_size = len(row_text)
+
+        if (
+            current_batch
+            and current_chars + row_size > max_chars_per_batch
+        ):
+            batches.append(current_batch)
+            current_batch = []
+            current_chars = 0
+
+        current_batch.append(row)
+        current_chars += row_size
+
+    if current_batch:
+        batches.append(current_batch)
+
+    return batches
+
+def extract_relevant_information_from_batches(
+    query: str,
+    rows: list[dict],
+    answer_depth: str
+) -> tuple[str, list[dict]]:
+    """
+    Inspects every document batch before creating the final answer.
+    """
+
+    batches = split_context_rows_into_batches(
+        rows=rows,
+        max_chars_per_batch=30000
+    )
+
+    extracted_parts = []
+    relevant_rows = []
+
+    for batch_index, batch_rows in enumerate(batches, start=1):
+        batch_context = build_context_from_asset_results(batch_rows)
+
+        try:
+            raw = ask_llm(
+                query=query,
+                context=f"""
+You are extracting evidence from one part of a larger document context.
+
+The final answer will be created later after every document part has
+been inspected.
+
+Rules:
+- Use only this document part.
+- Extract every distinct item that directly relates to the exact user request.
+- Do not summarise away details.
+- Preserve relevant names, values, dates, conditions, exceptions,
+  warnings, requirements and procedural steps.
+- Do not use outside knowledge.
+- Do not invent missing details.
+- If this document part contains no directly relevant information,
+  return exactly:
+NO_RELEVANT_INFORMATION
+- Return plain text only.
+- Do not add an introduction or conclusion.
+
+Requested answer depth:
+{answer_depth}
+
+User request:
+{query}
+
+Document part {batch_index} of {len(batches)}:
+
+{batch_context}
+""".strip(),
+                max_output_tokens=3000
+            )
+
+            extracted = str(raw or "").strip()
+
+        except Exception as e:
+            print(
+                "BATCH EXTRACTION ERROR:",
+                batch_index,
+                type(e).__name__,
+                str(e)
+            )
+            extracted = ""
+
+        if (
+            extracted
+            and extracted != "NO_RELEVANT_INFORMATION"
+        ):
+            extracted_parts.append(
+                f"Evidence part {batch_index}:\n{extracted}"
+            )
+            relevant_rows.extend(batch_rows)
+
+    return (
+        "\n\n".join(extracted_parts).strip(),
+        deduplicate_context_rows(relevant_rows)
+    )
+
 
 
 def expand_retrieved_rows_to_full_relevant_documents(
@@ -7797,24 +8015,38 @@ def expand_retrieved_rows_to_full_relevant_documents(
     matched_rows: list[dict],
     yacht_id: str,
     security_level: int,
-    max_assets: int = 2,
-    max_rows_per_asset: int = 400,
-    max_context_chars: int = 60000
+    answer_depth: str = "focused",
+    max_assets: int | None = None,
+    max_rows_per_asset: int | None = None,
+    max_context_chars: int = 120000
 ) -> list[dict]:
     """
-    Generic anti-hallucination / anti-partial-context fix.
+    Expands retrieved chunks according to the requested answer depth.
 
-    Instead of answering from a few partial retrieved chunks, this:
-    1. chooses the most relevant matched document(s)
-    2. loads the full document chunks
-    3. trims safely by character limit
-    4. returns full ordered context rows
+    focused:
+        Load the strongest relevant document with a bounded context.
 
-    This prevents wrong counts from multi-page PDFs/tables without hard-coding any topic.
+    comprehensive:
+        Load all chunks from several relevant documents.
+
+    document:
+        Load all chunks from the strongest relevant document.
     """
 
     if not matched_rows:
         return []
+
+    if max_assets is None:
+        if answer_depth == "comprehensive":
+            max_assets = 5
+        else:
+            max_assets = 1
+
+    if max_rows_per_asset is None:
+        if answer_depth in {"comprehensive", "document"}:
+            max_rows_per_asset = 5000
+        else:
+            max_rows_per_asset = 800
 
     selected_asset_ids = choose_relevant_asset_ids_for_query(
         query=query,
@@ -7822,7 +8054,13 @@ def expand_retrieved_rows_to_full_relevant_documents(
         max_assets=max_assets
     )
 
-    print("FULL CONTEXT DEBUG selected_asset_ids:", selected_asset_ids)
+    print(
+        "FULL CONTEXT DEBUG:",
+        {
+            "answer_depth": answer_depth,
+            "selected_asset_ids": selected_asset_ids
+        }
+    )
 
     expanded_rows = []
 
@@ -7840,15 +8078,340 @@ def expand_retrieved_rows_to_full_relevant_documents(
     if not expanded_rows:
         return matched_rows
 
+    preserve_all_rows = answer_depth in {
+        "comprehensive",
+        "document"
+    }
+
     expanded_rows = trim_rows_for_context_limit(
         rows=expanded_rows,
-        max_chars=max_context_chars
+        max_chars=max_context_chars,
+        preserve_all_rows=preserve_all_rows
     )
 
     print("FULL CONTEXT DEBUG expanded_rows:", len(expanded_rows))
 
     return expanded_rows or matched_rows
     
+# ------------------------
+# GENERIC NUMERIC TABLE / LIST COMPARISON
+# ------------------------
+
+def parse_numeric_comparison_query(query: str):
+    """
+    Detects generic numeric comparison questions.
+
+    Examples:
+    - less than 10
+    - below 5
+    - under 3
+    - more than 100
+    - greater than 12
+    - at least 8
+    - no more than 20
+
+    This is NOT domain-specific.
+    """
+
+    q = (query or "").lower()
+
+    patterns = [
+        ("lte", r"(?:less than or equal to|lower than or equal to|at most|no more than|maximum of|<=)\s*(\d+(?:\.\d+)?)"),
+        ("gte", r"(?:greater than or equal to|more than or equal to|at least|no less than|minimum of|>=)\s*(\d+(?:\.\d+)?)"),
+        ("lt", r"(?:less than|lower than|below|under|fewer than|<)\s*(\d+(?:\.\d+)?)"),
+        ("gt", r"(?:greater than|more than|above|over|>)\s*(\d+(?:\.\d+)?)"),
+        ("eq", r"(?:equal to|equals|exactly|=)\s*(\d+(?:\.\d+)?)"),
+    ]
+
+    for operator, pattern in patterns:
+        match = re.search(pattern, q)
+
+        if match:
+            return {
+                "operator": operator,
+                "threshold": float(match.group(1))
+            }
+
+    return None
+
+
+def compare_numeric_value(value: float, operator: str, threshold: float) -> bool:
+    if operator == "lt":
+        return value < threshold
+
+    if operator == "lte":
+        return value <= threshold
+
+    if operator == "gt":
+        return value > threshold
+
+    if operator == "gte":
+        return value >= threshold
+
+    if operator == "eq":
+        return value == threshold
+
+    return False
+
+
+def format_number_for_answer(value):
+    try:
+        number = float(value)
+
+        if number.is_integer():
+            return str(int(number))
+
+        return str(number)
+
+    except Exception:
+        return str(value)
+
+
+def extract_numeric_rows_with_llm(
+    query: str,
+    context: str
+) -> list[dict]:
+    """
+    Generic row extractor.
+
+    The LLM is only allowed to extract rows and numbers.
+    It is NOT allowed to decide the comparison result.
+    Python performs the numeric comparison afterwards.
+    """
+
+    raw = ask_llm(
+        query=query,
+        context=f"""
+You are a strict document table/list extractor.
+
+The user is asking a numeric comparison question.
+
+Your job:
+- Find the table, list, log, form, or section in the document context that is most relevant to the user's question.
+- Extract ALL relevant rows/items from that table/list/section.
+- Do NOT perform the comparison.
+- Do NOT decide who matches.
+- Do NOT skip rows.
+- Do NOT invent rows.
+- Use only the document context.
+
+Return ONLY valid JSON in this exact shape:
+
+{{
+  "rows": [
+    {{
+      "label": "row/person/item label copied from the document",
+      "numeric_values": [10, 8, 12],
+      "evidence": "exact row or nearby text copied from the document"
+    }}
+  ]
+}}
+
+Rules:
+- "label" should identify the row/item/person/entity.
+- "numeric_values" must contain every numeric value in that row that is relevant to the user's comparison.
+- If the relevant table has multiple date/value columns, include all relevant numbers from that row.
+- If a row has no relevant numeric values, do not include it.
+- Evidence must be copied from the document context.
+- Do not include commentary outside JSON.
+
+User question:
+{query}
+
+Document context:
+{context}
+""".strip()
+    )
+
+    parsed = parse_llm_json_response(raw)
+
+    if not parsed or not isinstance(parsed, dict):
+        return []
+
+    rows = parsed.get("rows") or []
+
+    clean_rows = []
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        label = str(row.get("label") or "").strip()
+        evidence = str(row.get("evidence") or "").strip()
+        numeric_values = row.get("numeric_values") or []
+
+        if not label or not numeric_values:
+            continue
+
+        clean_numbers = []
+
+        for value in numeric_values:
+            try:
+                clean_numbers.append(float(value))
+            except Exception:
+                continue
+
+        if not clean_numbers:
+            continue
+
+        clean_rows.append({
+            "label": label,
+            "numeric_values": clean_numbers,
+            "evidence": evidence
+        })
+
+    return clean_rows
+
+
+def answer_numeric_comparison_from_context(
+    query: str,
+    context: str,
+    matched_rows: list[dict]
+):
+    """
+    Answers generic numeric comparison questions deterministically.
+
+    The LLM extracts rows/numbers.
+    Python compares the numbers.
+    This prevents hallucinated comparisons such as saying 10 is less than 10.
+    """
+
+    comparison = parse_numeric_comparison_query(query)
+
+    if not comparison:
+        return None
+
+    extracted_rows = extract_numeric_rows_with_llm(
+        query=query,
+        context=context
+    )
+
+    print("NUMERIC COMPARISON DEBUG extracted_rows:", len(extracted_rows))
+
+    if not extracted_rows:
+        return None
+
+    operator = comparison["operator"]
+    threshold = comparison["threshold"]
+
+    matching_rows = []
+
+    for row in extracted_rows:
+        matching_values = [
+            value
+            for value in row["numeric_values"]
+            if compare_numeric_value(value, operator, threshold)
+        ]
+
+        if matching_values:
+            matching_rows.append({
+                "label": row["label"],
+                "matching_values": matching_values,
+                "evidence": row.get("evidence") or ""
+            })
+
+    operator_text = {
+        "lt": "less than",
+        "lte": "less than or equal to",
+        "gt": "greater than",
+        "gte": "greater than or equal to",
+        "eq": "equal to"
+    }.get(operator, "matching")
+
+    threshold_text = format_number_for_answer(threshold)
+
+    if not matching_rows:
+        answer = f"No matching rows were found with values {operator_text} {threshold_text} in the provided document context."
+    else:
+        parts = []
+
+        for item in matching_rows:
+            values_text = ", ".join(
+                format_number_for_answer(value)
+                for value in item["matching_values"]
+            )
+
+            parts.append(f"{item['label']} ({values_text})")
+
+        answer = (
+            f"The rows with values {operator_text} {threshold_text} are: "
+            + "; ".join(parts)
+            + "."
+        )
+
+    sources = build_sources_from_asset_results(matched_rows[:3])
+
+    return {
+        "answer": answer,
+        "sources": sources
+    }
+
+def classify_answer_depth(query: str) -> str:
+    """
+    Determines how much document context the user is requesting.
+
+    Returns:
+    - "focused": answer the specific question from the most relevant section
+    - "comprehensive": include all relevant information about the requested subject
+    - "document": inspect the entire relevant document
+
+    This classifier contains no document topics or subject names.
+    """
+
+    clean_query = str(query or "").strip()
+
+    if not clean_query:
+        return "focused"
+
+    try:
+        raw = ask_llm(
+            query=clean_query,
+            context="""
+Classify how much source information the user is requesting.
+
+Return exactly one of these words:
+
+focused
+comprehensive
+document
+
+Definitions:
+
+focused:
+The user asks a specific question and needs the directly relevant answer.
+
+comprehensive:
+The user asks for all information, every detail, everything available,
+a complete explanation, a full list, all entries, all steps, all requirements,
+all actions, all findings, or otherwise requests exhaustive information
+about a subject.
+
+document:
+The user asks to summarise, analyse, extract, review, or explain the entire
+file or document.
+
+Rules:
+- Classify intent only.
+- Do not answer the question.
+- Do not identify the subject.
+- Do not add facts.
+- Return one word only.
+""".strip()
+        )
+
+        value = str(raw or "").strip().lower()
+
+        if value in {"focused", "comprehensive", "document"}:
+            return value
+
+    except Exception as e:
+        print(
+            "ANSWER DEPTH CLASSIFIER ERROR:",
+            type(e).__name__,
+            str(e)
+        )
+
+    return "focused"
 
 def chat(
     query: str,
@@ -7916,6 +8479,10 @@ def chat(
     retrieval_query_input = query
 
     query_scope = classify_bridgeos_query_scope(query)
+
+    answer_depth = classify_answer_depth(query)
+
+    print("LOCAL CHAT DEBUG: answer_depth:", answer_depth)
 
     is_followup_query = is_contextual_followup_query(
         query=query,
@@ -8014,7 +8581,23 @@ Rules:
             )
 
             if matched_rows:
-                context = build_context_from_asset_results(matched_rows)
+                matched_rows = deduplicate_context_rows(matched_rows)
+
+                if answer_depth in {"comprehensive", "document"}:
+                    extracted_evidence, evidence_rows = (
+                        extract_relevant_information_from_batches(
+                            query=query,
+                            rows=matched_rows,
+                            answer_depth=answer_depth
+                        )
+                    )
+
+                    context = extracted_evidence
+
+                    if evidence_rows:
+                        matched_rows = evidence_rows
+                else:
+                    context = build_context_from_asset_results(matched_rows)
             else:
                 context = ""
 
@@ -8096,7 +8679,7 @@ Rules:
                             yacht_id=yacht_id,
                             allowed_asset_ids=allowed_asset_ids,
                             year_filter=year_filter,
-                            limit=20
+                            limit=40
                         )
 
                         for row in keyword_rows:
@@ -8112,7 +8695,7 @@ Rules:
                         try:
                             semantic_results = supabase.rpc("match_asset_chunks_secure", {
                                 "query_embedding": embed(retrieval_query),
-                                "match_count": 12,
+                                "match_count": 40,
                                 "allowed_asset_ids": allowed_asset_ids,
                                 "yacht_filter": yacht_id,
                                 "year_filter": year_filter
@@ -8131,7 +8714,7 @@ Rules:
                         except Exception as e:
                             print("SEMANTIC SEARCH ERROR:", type(e).__name__, str(e))
 
-                    matched_rows = list(matched_rows_by_key.values())[:40]
+                    matched_rows = list(matched_rows_by_key.values())[:100]
 
                     print("LOCAL CHAT DEBUG: matched chunks:", len(matched_rows))
 
@@ -8141,22 +8724,42 @@ Rules:
                         # It expands from top retrieved chunks to the full best-matching document.
                         # max_assets=1 prevents unrelated documents from being mixed in.
                         matched_rows = expand_retrieved_rows_to_full_relevant_documents(
-                            query=query,
+                            query=retrieval_query_input,
                             matched_rows=matched_rows,
                             yacht_id=yacht_id,
                             security_level=security_level,
-                            max_assets=1,
-                            max_rows_per_asset=400,
-                            max_context_chars=60000
+                            answer_depth=answer_depth
                         )
 
-                        expanded_context_preview = build_context_from_asset_results(matched_rows)
+                        matched_rows = deduplicate_context_rows(matched_rows)
 
-                        print("FULL CONTEXT DEBUG final expanded matched_rows:", len(matched_rows))
-                        print("FULL CONTEXT DEBUG final expanded context preview:", expanded_context_preview[:1000])
+                        if answer_depth in {"comprehensive", "document"}:
+                            extracted_evidence, evidence_rows = (
+                                extract_relevant_information_from_batches(
+                                    query=query,
+                                    rows=matched_rows,
+                                    answer_depth=answer_depth
+                                )
+                            )
 
-                        context = expanded_context_preview
+                            if extracted_evidence:
+                                context = extracted_evidence
 
+                                if evidence_rows:
+                                    matched_rows = evidence_rows
+                            else:
+                                context = ""
+                        else:
+                            context = build_context_from_asset_results(matched_rows)
+
+                        print(
+                            "FULL CONTEXT DEBUG final expanded matched_rows:",
+                            len(matched_rows)
+                        )
+                        print(
+                            "FULL CONTEXT DEBUG final context preview:",
+                            context[:1000]
+                        )
                     elif matched_rows:
                         context = build_context_from_asset_results(matched_rows)
 
@@ -8276,6 +8879,24 @@ Core rules:
 - If the exact answer is not directly present in the context, answer exactly:
 {FALLBACK_NO_DATA_ANSWER}
 
+Requested answer depth:
+{answer_depth}
+
+Completeness rules:
+- If the requested depth is "focused", directly answer the exact question
+  with every detail needed to make the answer correct.
+- If the requested depth is "comprehensive", include every distinct relevant
+  fact, item, condition, exception, warning, requirement, value and step
+  present in the supplied evidence.
+- If the requested depth is "document", cover all relevant information from
+  the entire supplied document evidence in an organised answer.
+- Do not stop after finding the first valid item.
+- Do not omit later items because an earlier item was already found.
+- Merge exact duplicates only.
+- Do not shorten a comprehensive answer merely to make it brief.
+- Before finishing, check that every relevant item in the supplied evidence
+  is represented in the answer.
+
 Extraction rules:
 - Extract exact values from the context.
 - Short values are allowed.
@@ -8308,8 +8929,13 @@ Search query used for retrieval:
 
 Document context:
 {context}
-""".strip()
-        )
+""".strip(),
+    max_output_tokens=(
+        8000
+        if answer_depth in {"comprehensive", "document"}
+        else 4000
+    )
+)
 
         parsed = parse_llm_json_response(raw_answer)
 
