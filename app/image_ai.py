@@ -1,16 +1,41 @@
 import base64
 import io
-import json
 import mimetypes
 import re
-from typing import Any
 
-import requests
+from openai import OpenAI
 
-from app.config import RUNPOD_BASE_URL, BRIDGEOS_API_KEY
+from app.config import (
+    OPENAI_API_KEY,
+    OPENAI_VISION_MODEL
+)
 
 
 VISION_TIMEOUT_SECONDS = 180
+
+_openai_vision_client = None
+
+
+def get_openai_vision_client() -> OpenAI:
+    """
+    Returns one reusable OpenAI client for image analysis and OCR.
+    """
+
+    global _openai_vision_client
+
+    if not OPENAI_API_KEY:
+        raise RuntimeError(
+            "OPENAI_API_KEY is missing from the backend environment."
+        )
+
+    if _openai_vision_client is None:
+        _openai_vision_client = OpenAI(
+            api_key=OPENAI_API_KEY,
+            timeout=VISION_TIMEOUT_SECONDS,
+            max_retries=2
+        )
+
+    return _openai_vision_client
 
 
 def _read_file_bytes(file) -> bytes:
@@ -24,85 +49,46 @@ def _read_file_bytes(file) -> bytes:
     return data or b""
 
 
-def _guess_mime_type(filename: str | None, default: str = "application/octet-stream") -> str:
-    mime_type, _ = mimetypes.guess_type(filename or "")
+def _guess_mime_type(
+    filename: str | None,
+    default: str = "application/octet-stream"
+) -> str:
+    mime_type, _ = mimetypes.guess_type(
+        filename or ""
+    )
+
     return mime_type or default
 
 
-def _file_to_base64(file) -> str:
-    data = _read_file_bytes(file)
-    return base64.b64encode(data).decode("utf-8")
+def _file_to_data_url(
+    file,
+    filename: str,
+    mime_type: str | None = None
+) -> str:
+    file_bytes = _read_file_bytes(file)
 
-
-def _extract_response_text(data: Any) -> str:
-    """
-    Supports different possible RunPod response shapes without hard-coding one.
-    """
-
-    if data is None:
+    if not file_bytes:
         return ""
 
-    if isinstance(data, str):
-        return data.strip()
+    final_mime_type = (
+        mime_type
+        or _guess_mime_type(
+            filename,
+            "image/png"
+        )
+    )
 
-    if isinstance(data, dict):
-        for key in [
-            "response",
-            "answer",
-            "text",
-            "content",
-            "message",
-            "output",
-            "result",
-        ]:
-            value = data.get(key)
+    encoded = base64.b64encode(
+        file_bytes
+    ).decode("utf-8")
 
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-
-            if isinstance(value, dict):
-                nested = _extract_response_text(value)
-                if nested:
-                    return nested
-
-            if isinstance(value, list):
-                parts = []
-
-                for item in value:
-                    nested = _extract_response_text(item)
-                    if nested:
-                        parts.append(nested)
-
-                if parts:
-                    return "\n".join(parts).strip()
-
-        choices = data.get("choices")
-
-        if isinstance(choices, list):
-            parts = []
-
-            for choice in choices:
-                nested = _extract_response_text(choice)
-                if nested:
-                    parts.append(nested)
-
-            if parts:
-                return "\n".join(parts).strip()
-
-    if isinstance(data, list):
-        parts = []
-
-        for item in data:
-            nested = _extract_response_text(item)
-            if nested:
-                parts.append(nested)
-
-        return "\n".join(parts).strip()
-
-    return ""
+    return (
+        f"data:{final_mime_type};"
+        f"base64,{encoded}"
+    )
 
 
-def _call_vision_chat(
+def _call_openai_vision(
     *,
     user_input: str,
     file,
@@ -111,92 +97,116 @@ def _call_vision_chat(
     mime_type: str | None = None
 ) -> str:
     """
-    Sends image/PDF-page image to the RunPod vision endpoint.
+    Sends one image to the OpenAI Responses API.
 
-    Important:
-    - Sends multiple common image fields for compatibility.
-    - Does not hard-code yacht/image answers.
-    - The anti-hallucination rules are generic.
+    There is no RunPod fallback.
     """
 
-    if not RUNPOD_BASE_URL:
+    data_url = _file_to_data_url(
+        file=file,
+        filename=filename,
+        mime_type=mime_type
+    )
+
+    if not data_url:
         return ""
 
-    if not BRIDGEOS_API_KEY:
-        return ""
+    client = get_openai_vision_client()
 
-    clean_filename = filename or "uploaded-image"
-    clean_mime_type = mime_type or _guess_mime_type(clean_filename, "image/png")
-    image_base64 = _file_to_base64(file)
+    system_instructions = """
+You are BridgeOS visual document analysis.
 
-    if not image_base64:
-        return ""
+You must analyse only the actual uploaded image.
 
-    data_url = f"data:{clean_mime_type};base64,{image_base64}"
+Never invent:
+- names;
+- brands;
+- logos;
+- vessel names;
+- locations;
+- dates;
+- prices;
+- quantities;
+- invoice values;
+- currencies;
+- unreadable text;
+- hidden details.
 
-    url = f"{RUNPOD_BASE_URL.rstrip('/')}/api/bridgeos/chat"
+When text is blurry, cropped, hidden or unreadable, explicitly treat it
+as unreadable rather than guessing.
 
-    payload = {
-        "user_input": user_input,
-        "history": [],
-        "image": image_base64,
-        "image_base64": image_base64,
-        "image_data_url": data_url,
-        "mime_type": clean_mime_type,
-        "images": [
-            {
-                "filename": clean_filename,
-                "mime_type": clean_mime_type,
-                "data": image_base64,
-                "data_url": data_url,
-            }
-        ],
-        "backend_context": {
-            "filename": clean_filename,
-            "mime_type": clean_mime_type,
-            "task": task,
-            "important_instruction": (
-                "Analyse only the actual uploaded visual content. "
-                "Do not invent names, brands, logos, vessel names, locations, text, numbers, prices, "
-                "invoice values, dates, or financial amounts. "
-                "If something is not visible or not readable, say it is not visible or not readable. "
-                "For boats, classify only the broad visible vessel type and explain the visible evidence. "
-                "Never pretend to know condition, build quality, price, maintenance history, engine status, "
-                "survey status, suitability for purchase, or exact make/model from an image alone."
-            ),
-        },
-    }
+Return only the requested result.
+""".strip()
+
+    print(
+        "OPENAI VISION REQUEST:",
+        {
+            "provider": "openai",
+            "model": OPENAI_VISION_MODEL,
+            "filename": filename,
+            "task": task
+        }
+    )
 
     try:
-        response = requests.post(
-            url,
-            json=payload,
-            headers={
-                "Content-Type": "application/json",
-                "x-api-key": BRIDGEOS_API_KEY,
-            },
-            timeout=VISION_TIMEOUT_SECONDS,
+        response = client.responses.create(
+            model=OPENAI_VISION_MODEL,
+            instructions=system_instructions,
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": user_input
+                        },
+                        {
+                            "type": "input_image",
+                            "image_url": data_url,
+                            "detail": "high"
+                        }
+                    ]
+                }
+            ]
         )
 
-        print("VISION DEBUG status:", response.status_code)
-        print("VISION DEBUG response:", response.text[:800])
+        result = str(
+            response.output_text or ""
+        ).strip()
 
-        if response.status_code >= 400:
-            return ""
+        print(
+            "OPENAI VISION SUCCESS:",
+            {
+                "provider": "openai",
+                "model": OPENAI_VISION_MODEL,
+                "response_id": getattr(
+                    response,
+                    "id",
+                    None
+                ),
+                "characters": len(result)
+            }
+        )
 
-        try:
-            data = response.json()
-        except Exception:
-            return response.text.strip()
+        return result
 
-        return _extract_response_text(data)
+    except Exception as error:
+        print(
+            "OPENAI VISION ERROR:",
+            {
+                "provider": "openai",
+                "model": OPENAI_VISION_MODEL,
+                "error_type": type(error).__name__,
+                "error": str(error)
+            }
+        )
 
-    except Exception as e:
-        print("VISION REQUEST ERROR:", type(e).__name__, str(e))
-        return ""
+        raise
 
 
-def _clean_visual_description(text: str) -> str:
+def _clean_visual_description(
+    text: str
+) -> str:
     clean = str(text or "").strip()
 
     if not clean:
@@ -206,7 +216,7 @@ def _clean_visual_description(text: str) -> str:
         "image visual description:",
         "visual description:",
         "analysis:",
-        "answer:",
+        "answer:"
     ]
 
     lowered = clean.lower()
@@ -216,39 +226,28 @@ def _clean_visual_description(text: str) -> str:
             clean = clean[len(prefix):].strip()
             lowered = clean.lower()
 
-    # Remove fake OCR/financial boilerplate if the model added it to image descriptions.
-    unwanted_lines = []
+    kept_lines = []
 
     for line in clean.splitlines():
         stripped = line.strip()
-        low = stripped.lower()
+        lowered_line = stripped.lower()
 
-        if not stripped:
-            unwanted_lines.append(line)
+        if lowered_line.startswith("ocr text"):
             continue
 
-        if low.startswith("ocr text"):
+        if "financial document extraction" in lowered_line:
             continue
 
-        if "financial document extraction" in low:
-            continue
+        kept_lines.append(line)
 
-        if "no relevant numbers or financial values" in low:
-            continue
-
-        unwanted_lines.append(line)
-
-    clean = "\n".join(unwanted_lines).strip()
-
-    return clean
+    return "\n".join(
+        kept_lines
+    ).strip()
 
 
-def _looks_like_scene_description_not_ocr(text: str) -> bool:
-    """
-    OCR must be visible written text only.
-    If the model describes the scene, it is not OCR.
-    """
-
+def _looks_like_scene_description_not_ocr(
+    text: str
+) -> bool:
     clean = str(text or "").strip().lower()
 
     if not clean:
@@ -269,20 +268,30 @@ def _looks_like_scene_description_not_ocr(text: str) -> bool:
         "a boat",
         "a marina",
         "calm water",
-        "clear sky",
+        "clear sky"
     ]
 
-    if any(phrase in clean for phrase in scene_phrases):
+    if any(
+        phrase in clean
+        for phrase in scene_phrases
+    ):
         return True
 
-    # OCR should usually contain short text fragments, not long paragraphs.
-    if len(clean.split()) > 35 and not re.search(r"[A-Z0-9]{2,}", text or ""):
+    if (
+        len(clean.split()) > 35
+        and not re.search(
+            r"[A-Z0-9]{2,}",
+            text or ""
+        )
+    ):
         return True
 
     return False
 
 
-def _clean_ocr_text(text: str) -> str:
+def _clean_ocr_text(
+    text: str
+) -> str:
     clean = str(text or "").strip()
 
     if not clean:
@@ -290,27 +299,29 @@ def _clean_ocr_text(text: str) -> str:
 
     lowered = clean.lower().strip()
 
-    no_text_markers = [
+    exact_no_text_markers = {
+        "no_readable_text",
         "no readable text",
         "no clearly readable text",
         "no text visible",
         "no visible text",
-        "not applicable",
         "none",
-        "n/a",
-    ]
+        "n/a"
+    }
 
-    if any(marker in lowered for marker in no_text_markers):
+    if lowered in exact_no_text_markers:
         return ""
 
-    if _looks_like_scene_description_not_ocr(clean):
+    if _looks_like_scene_description_not_ocr(
+        clean
+    ):
         return ""
 
     remove_prefixes = [
         "ocr text:",
         "extracted text:",
         "visible text:",
-        "text:",
+        "text:"
     ]
 
     for prefix in remove_prefixes:
@@ -321,76 +332,83 @@ def _clean_ocr_text(text: str) -> str:
     return clean.strip()
 
 
-def describe_image(file, filename: str) -> str:
+def describe_image(
+    file,
+    filename: str
+) -> str:
     """
-    Creates a grounded visual description.
-
-    The output should be useful for later chat answers, not a salesy caption.
+    Produces a grounded visual description.
     """
 
     prompt = """
-You are analysing one uploaded image.
+Analyse this uploaded image.
 
 Return a concise factual description of what is visibly present.
 
 Rules:
 - Describe only visible objects and layout.
-- Do not invent brands, logos, names, locations, dates, numbers, or text.
-- Do not say text is visible unless it is clearly readable.
-- Do not guess exact make/model.
-- Do not judge whether something is good, bad, safe, seaworthy, damaged, expensive, or worth buying.
-- If the image contains a boat, identify only the broad visible type, such as motor yacht, sailing yacht, catamaran, tender, or unknown.
-- Explain the visible evidence for the broad type.
-- Mention visible limitations, such as exact model or condition not being visible.
-- Do not include OCR output.
-- Do not include financial-document comments unless the image is actually a financial document.
-
-Write in plain text, 3 to 6 sentences maximum.
+- Do not invent brands, names, locations, dates, numbers or text.
+- Do not claim text is readable unless it is clearly readable.
+- Do not guess an exact make or model.
+- Do not judge safety, seaworthiness, price, damage, maintenance history
+  or purchase suitability.
+- For a vessel, identify only the broad visible type.
+- Mention important visual limitations.
+- Do not include OCR text.
+- Write 3 to 6 sentences maximum.
 """.strip()
 
-    raw = _call_vision_chat(
+    raw = _call_openai_vision(
         user_input=prompt,
         file=file,
         filename=filename,
-        task="image_visual_description",
+        task="image_visual_description"
     )
 
-    return _clean_visual_description(raw)
+    return _clean_visual_description(
+        raw
+    )
 
 
-def extract_ocr_from_image(file, filename: str) -> str:
+def extract_ocr_from_image(
+    file,
+    filename: str
+) -> str:
     """
-    Extracts only actual visible written text.
+    Extracts only visible written text.
 
-    If there is no readable text, returns NO_READABLE_TEXT.
+    Returns NO_READABLE_TEXT when no reliable text is visible.
     """
 
     prompt = """
-You are doing OCR on one uploaded image.
+Perform OCR on this uploaded image.
 
-Return ONLY the written text that is visibly readable in the image.
+Return only text that is clearly visible and readable.
 
 Rules:
 - Do not describe the scene.
-- Do not summarise the image.
-- Do not invent text.
-- Do not infer hidden or blurry text.
-- Preserve line breaks when useful.
-- For invoices/receipts, preserve supplier, invoice number, dates, line items, quantities, unit prices, subtotal, VAT/tax, total, and currency exactly as visible.
+- Do not summarise.
+- Do not guess missing, hidden, cropped or blurry text.
+- Preserve useful line breaks.
+- Preserve names, dates, invoice numbers, quantities, prices, taxes,
+  totals and currencies exactly as visible.
+- Never calculate or correct values during OCR.
 - If no text is clearly readable, return exactly:
 NO_READABLE_TEXT
 
 Return OCR text only.
 """.strip()
 
-    raw = _call_vision_chat(
+    raw = _call_openai_vision(
         user_input=prompt,
         file=file,
         filename=filename,
-        task="image_ocr_only",
+        task="image_ocr_only"
     )
 
-    clean = _clean_ocr_text(raw)
+    clean = _clean_ocr_text(
+        raw
+    )
 
     if not clean:
         return "NO_READABLE_TEXT"
@@ -398,18 +416,28 @@ Return OCR text only.
     return clean
 
 
-def extract_ocr_from_pdf_pages(file, filename: str, max_pages: int = 12) -> str:
+def extract_ocr_from_pdf_pages(
+    file,
+    filename: str,
+    max_pages: int = 12
+) -> str:
     """
-    OCR fallback for scanned PDFs.
+    Renders scanned PDF pages locally and sends each rendered page
+    to OpenAI for OCR.
 
-    Requires pymupdf:
+    Requires:
         pip install pymupdf
     """
 
     try:
         import fitz
-    except Exception as e:
-        print("PDF OCR ERROR: pymupdf not installed:", type(e).__name__, str(e))
+    except Exception as error:
+        print(
+            "PDF OCR ERROR: pymupdf is not installed:",
+            type(error).__name__,
+            str(error)
+        )
+
         return ""
 
     try:
@@ -420,34 +448,65 @@ def extract_ocr_from_pdf_pages(file, filename: str, max_pages: int = 12) -> str:
         if not pdf_bytes:
             return ""
 
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        page_count = min(len(doc), max_pages)
+        document = fitz.open(
+            stream=pdf_bytes,
+            filetype="pdf"
+        )
+
+        page_count = min(
+            len(document),
+            max_pages
+        )
 
         all_text = []
 
         for page_index in range(page_count):
-            page = doc.load_page(page_index)
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
-            image_bytes = pix.tobytes("png")
-
-            image_file = io.BytesIO(image_bytes)
-
-            page_text = extract_ocr_from_image(
-                image_file,
-                f"{filename or 'document'}-page-{page_index + 1}.png"
+            page = document.load_page(
+                page_index
             )
 
-            page_text = _clean_ocr_text(page_text)
+            pixmap = page.get_pixmap(
+                matrix=fitz.Matrix(2, 2),
+                alpha=False
+            )
+
+            image_bytes = pixmap.tobytes(
+                "png"
+            )
+
+            image_file = io.BytesIO(
+                image_bytes
+            )
+
+            page_text = extract_ocr_from_image(
+                file=image_file,
+                filename=(
+                    f"{filename or 'document'}"
+                    f"-page-{page_index + 1}.png"
+                )
+            )
+
+            page_text = _clean_ocr_text(
+                page_text
+            )
 
             if page_text:
                 all_text.append(
-                    f"Page {page_index + 1} OCR:\n{page_text}"
+                    f"Page {page_index + 1} OCR:\n"
+                    f"{page_text}"
                 )
 
-        doc.close()
+        document.close()
 
-        return "\n\n".join(all_text).strip()
+        return "\n\n".join(
+            all_text
+        ).strip()
 
-    except Exception as e:
-        print("PDF OCR ERROR:", type(e).__name__, str(e))
+    except Exception as error:
+        print(
+            "PDF OCR ERROR:",
+            type(error).__name__,
+            str(error)
+        )
+
         return ""

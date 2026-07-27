@@ -1,142 +1,138 @@
-import requests
+from openai import OpenAI
 
-from app.config import RUNPOD_BASE_URL, BRIDGEOS_API_KEY
-
-
-# IMPORTANT:
-# Set this to the exact dimension used by the vector column in Supabase.
-# Examples:
-# vector(384)  -> 384
-# vector(768)  -> 768
-# vector(1024) -> 1024
-# vector(1536) -> 1536
-EMBEDDING_DIMENSIONS = 1024
+from app.config import (
+    OPENAI_API_KEY,
+    OPENAI_EMBEDDING_MODEL,
+    OPENAI_EMBEDDING_DIMENSIONS
+)
 
 
-def _zero_embedding() -> list[float]:
-    return [0.0] * EMBEDDING_DIMENSIONS
+EMBEDDING_DIMENSIONS = OPENAI_EMBEDDING_DIMENSIONS
+
+_openai_embedding_client = None
 
 
-def is_zero_embedding(vector: list[float] | None) -> bool:
+def get_openai_embedding_client() -> OpenAI:
+    """
+    Returns one reusable OpenAI client for embeddings.
+    """
+
+    global _openai_embedding_client
+
+    if not OPENAI_API_KEY:
+        raise RuntimeError(
+            "OPENAI_API_KEY is missing from the backend environment."
+        )
+
+    if _openai_embedding_client is None:
+        _openai_embedding_client = OpenAI(
+            api_key=OPENAI_API_KEY,
+            timeout=120.0,
+            max_retries=2
+        )
+
+    return _openai_embedding_client
+
+
+def is_zero_embedding(
+    vector: list[float] | None
+) -> bool:
     if not isinstance(vector, list):
         return True
 
     if len(vector) != EMBEDDING_DIMENSIONS:
         return True
 
-    return not any(abs(float(value or 0)) > 0.0000001 for value in vector)
+    return not any(
+        abs(float(value or 0)) > 0.0000001
+        for value in vector
+    )
 
 
-def embed(text: str, required: bool = False) -> list[float] | None:
+def embed(
+    text: str,
+    required: bool = False
+) -> list[float] | None:
+    """
+    Creates an OpenAI embedding.
+
+    The returned vector dimension is forced to match the existing
+    Supabase vector column dimension.
+
+    There is no RunPod fallback.
+    """
+
     clean_text = str(text or "").strip()
 
     if not clean_text:
         if required:
-            raise RuntimeError("Cannot create an embedding for empty text.")
-        return None
+            raise RuntimeError(
+                "Cannot create an embedding for empty text."
+            )
 
-    if not RUNPOD_BASE_URL:
-        if required:
-            raise RuntimeError("RUNPOD_BASE_URL is missing.")
         return None
-
-    if not BRIDGEOS_API_KEY:
-        if required:
-            raise RuntimeError("BRIDGEOS_API_KEY is missing.")
-        return None
-
-    url = f"{RUNPOD_BASE_URL.rstrip('/')}/api/bridgeos/embed"
 
     try:
-        response = requests.post(
-            url,
-            json={
-                "input": clean_text,
-                "text": clean_text
-            },
-            headers={
-                "Content-Type": "application/json",
-                "x-api-key": BRIDGEOS_API_KEY
-            },
-            timeout=120
+        client = get_openai_embedding_client()
+
+        response = client.embeddings.create(
+            model=OPENAI_EMBEDDING_MODEL,
+            input=clean_text,
+            dimensions=EMBEDDING_DIMENSIONS,
+            encoding_format="float"
         )
 
-        print("EMBEDDING DEBUG:", {
-            "url": url,
-            "status": response.status_code,
-            "response_preview": response.text[:500]
-        })
-
-        if response.status_code >= 400:
-            message = (
-                f"Embedding endpoint returned {response.status_code}: "
-                f"{response.text[:500]}"
+        if not response.data:
+            raise RuntimeError(
+                "OpenAI returned no embedding data."
             )
 
-            if required:
-                raise RuntimeError(message)
+        vector = response.data[0].embedding
 
-            print("EMBEDDING WARNING:", message)
-            return None
+        if not isinstance(vector, list):
+            vector = list(vector)
 
-        data = response.json()
+        vector = [
+            float(value)
+            for value in vector
+        ]
 
-        embedding = (
-            data.get("embedding")
-            or data.get("vector")
-            or (data.get("data") or {}).get("embedding")
-            or (data.get("result") or {}).get("embedding")
+        if len(vector) != EMBEDDING_DIMENSIONS:
+            raise RuntimeError(
+                "OpenAI returned the wrong embedding dimension. "
+                f"Expected {EMBEDDING_DIMENSIONS}, "
+                f"received {len(vector)}."
+            )
+
+        if is_zero_embedding(vector):
+            raise RuntimeError(
+                "OpenAI returned an all-zero embedding."
+            )
+
+        print(
+            "OPENAI EMBEDDING SUCCESS:",
+            {
+                "provider": "openai",
+                "model": OPENAI_EMBEDDING_MODEL,
+                "dimensions": len(vector),
+                "input_characters": len(clean_text)
+            }
         )
 
-        if not isinstance(embedding, list):
-            if required:
-                raise RuntimeError(
-                    f"Embedding response did not contain a list: {data}"
-                )
-
-            return None
-
-        try:
-            embedding = [float(value) for value in embedding]
-        except Exception as error:
-            if required:
-                raise RuntimeError(
-                    f"Embedding contains invalid values: {error}"
-                )
-
-            return None
-
-        if len(embedding) != EMBEDDING_DIMENSIONS:
-            message = (
-                f"Wrong embedding dimension. Expected "
-                f"{EMBEDDING_DIMENSIONS}, received {len(embedding)}."
-            )
-
-            if required:
-                raise RuntimeError(message)
-
-            print("EMBEDDING WARNING:", message)
-            return None
-
-        if is_zero_embedding(embedding):
-            if required:
-                raise RuntimeError("Embedding endpoint returned an all-zero vector.")
-
-            return None
-
-        return embedding
-
-    except RuntimeError:
-        raise
+        return vector
 
     except Exception as error:
         message = (
-            f"Embedding request failed: "
+            "OpenAI embedding request failed: "
             f"{type(error).__name__}: {error}"
         )
 
-        if required:
-            raise RuntimeError(message)
+        print(
+            "OPENAI EMBEDDING ERROR:",
+            message
+        )
 
-        print("EMBEDDING REQUEST ERROR:", message)
+        if required:
+            raise RuntimeError(message) from error
+
         return None

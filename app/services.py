@@ -4,18 +4,22 @@ import json
 import random
 import hashlib
 import smtplib
+from openai import OpenAI
 from email.message import EmailMessage
 from app.database import supabase
 from app.embeddings import embed
 from app.config import (
     BUCKET_NAME,
-    RUNPOD_BASE_URL,
-    BRIDGEOS_API_KEY,
     API_SYNC_TIMEOUT_SECONDS,
     GMAIL_SYNC_MAX_RESULTS,
-    OPENAI_CHAT_MODEL
+    OPENAI_CHAT_MODEL,
+    OPENAI_TRANSCRIPTION_MODEL
 )
-from app.llm import ask_llm, FALLBACK_NO_DATA_ANSWER
+from app.llm import (
+    ask_llm,
+    FALLBACK_NO_DATA_ANSWER,
+    get_openai_client
+)
 from app.file_utils import detect_file_type, calculate_file_hash, safe_filename
 from app.metadata_utils import (
     extract_date_from_filename,
@@ -50,6 +54,8 @@ from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from app.config import (
+    OPENAI_EMBEDDING_MODEL,
+    OPENAI_EMBEDDING_DIMENSIONS,
     SUPABASE_JWT_SECRET,
     SUPABASE_URL,
     SUPABASE_SERVICE_KEY,
@@ -727,6 +733,116 @@ def handle_whatsapp_webhook_payload(payload: dict):
     return {
         "received": True,
         "saved": saved_count
+    }
+
+def reembed_all_asset_chunks(
+    admin_crew: dict,
+    batch_size: int = 100
+):
+    """
+    Recreates every accessible asset-chunk embedding using OpenAI.
+
+    Run this once after changing embedding providers.
+
+    This preserves:
+    - chunk content;
+    - asset relationships;
+    - permissions;
+    - metadata;
+    - chunk indexes.
+
+    Only the embedding column is changed.
+    """
+
+    _require_tier_1_admin(
+        admin_crew
+    )
+
+    clean_batch_size = max(
+        1,
+        min(
+            int(batch_size or 100),
+            500
+        )
+    )
+
+    offset = 0
+    updated_count = 0
+    failed = []
+
+    while True:
+        result = supabase.table(
+            "asset_chunks"
+        ).select(
+            "id, asset_id, content"
+        ).eq(
+            "yacht_id",
+            admin_crew["yacht_id"]
+        ).range(
+            offset,
+            offset + clean_batch_size - 1
+        ).execute()
+
+        rows = result.data or []
+
+        if not rows:
+            break
+
+        for row in rows:
+            chunk_id = row.get("id")
+            content = str(
+                row.get("content") or ""
+            ).strip()
+
+            if not chunk_id or not content:
+                failed.append({
+                    "chunk_id": chunk_id,
+                    "reason": "Missing chunk ID or content"
+                })
+                continue
+
+            try:
+                vector = embed(
+                    content,
+                    required=True
+                )
+
+                supabase.table(
+                    "asset_chunks"
+                ).update({
+                    "embedding": vector
+                }).eq(
+                    "id",
+                    chunk_id
+                ).eq(
+                    "yacht_id",
+                    admin_crew["yacht_id"]
+                ).execute()
+
+                updated_count += 1
+
+            except Exception as error:
+                failed.append({
+                    "chunk_id": chunk_id,
+                    "asset_id": row.get("asset_id"),
+                    "reason": (
+                        f"{type(error).__name__}: "
+                        f"{error}"
+                    )
+                })
+
+        offset += len(rows)
+
+        if len(rows) < clean_batch_size:
+            break
+
+    return {
+        "message": "OpenAI re-embedding completed",
+        "embedding_model": OPENAI_EMBEDDING_MODEL,
+        "embedding_dimensions": OPENAI_EMBEDDING_DIMENSIONS,
+        "updated_count": updated_count,
+        "failed_count": len(failed),
+        "failures": failed[:100]
     }
 
 # ------------------------

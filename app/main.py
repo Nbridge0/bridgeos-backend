@@ -187,6 +187,41 @@ class DirectApiIngestRequest(BaseModel):
     file_name: Optional[str] = None
     security_level: int = 1
 
+class ReembedRequest(BaseModel):
+    batch_size: int = 100
+
+
+@app.post("/admin/reembed-asset-chunks")
+async def reembed_asset_chunks_api(
+    body: ReembedRequest,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(
+        user["sub"]
+    )
+
+    if not admin_crew:
+        raise HTTPException(
+            status_code=403,
+            detail="No access"
+        )
+
+    if int(
+        admin_crew["security_level"]
+    ) != 1:
+        raise HTTPException(
+            status_code=403,
+            detail="Only Tier 1 admins can re-embed documents"
+        )
+
+    return services.reembed_all_asset_chunks(
+        admin_crew=admin_crew,
+        batch_size=body.batch_size
+    )
+
 @app.post("/auth/dev-login")
 async def dev_login(body: DevLoginRequest, request: Request):
     return services.dev_login(
@@ -252,16 +287,37 @@ async def login(body: LoginRequest, request: Request):
 # CURRENT USER
 # ------------------------
 
-from app.config import RUNPOD_BASE_URL, BRIDGEOS_API_KEY
+from app.config import (
+    OPENAI_API_KEY,
+    OPENAI_CHAT_MODEL,
+    OPENAI_VISION_MODEL,
+    OPENAI_EMBEDDING_MODEL,
+    OPENAI_EMBEDDING_DIMENSIONS,
+    OPENAI_TRANSCRIPTION_MODEL
+)
+
 
 @app.get("/debug-ai-config")
 async def debug_ai_config():
+    """
+    Backend-only debugging route.
+
+    This does not return the API key itself.
+    Protect or remove this route in production.
+    """
+
     return {
-        "runpod_base_url": RUNPOD_BASE_URL,
-        "bridgeos_key_present": bool(BRIDGEOS_API_KEY),
-        "bridgeos_key_length": len(BRIDGEOS_API_KEY or ""),
-        "bridgeos_key_last4": (BRIDGEOS_API_KEY or "")[-4:]
+        "provider": "openai",
+        "openai_key_present": bool(
+            OPENAI_API_KEY
+        ),
+        "chat_model": OPENAI_CHAT_MODEL,
+        "vision_model": OPENAI_VISION_MODEL,
+        "embedding_model": OPENAI_EMBEDDING_MODEL,
+        "embedding_dimensions": OPENAI_EMBEDDING_DIMENSIONS,
+        "transcription_model": OPENAI_TRANSCRIPTION_MODEL
     }
+
 
 @app.get("/me")
 async def me(
