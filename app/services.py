@@ -11065,6 +11065,283 @@ def answer_subject_spending_from_context(
         "sources": sources
     }
 
+def extract_spending_subjects(query: str) -> list[str]:
+    """
+    Dynamically extracts every independent subject requested in a
+    financial calculation.
+
+    Nothing is hard-coded:
+    - no product names
+    - no supplier names
+    - no categories
+    - no fixed question formats
+    """
+
+    clean_query = str(query or "").strip()
+
+    if not clean_query:
+        return []
+
+    try:
+        raw_response = ask_llm(
+            query=clean_query,
+            context="""
+You are an intent extraction engine.
+
+Analyse the user's request and identify every distinct entity for which
+the user is requesting a monetary value, cost, price, payment, spending
+amount, quantity-based total, invoice amount, or financial calculation.
+
+An entity may be any:
+- product
+- service
+- supplier
+- person
+- department
+- project
+- location
+- expense category
+- document category
+- purpose
+- asset
+- activity
+- custom user-defined concept
+
+Return ONLY valid JSON:
+
+{
+  "subjects": [
+    {
+      "value": "exact subject wording",
+      "normalised_value": "clean subject wording"
+    }
+  ],
+  "whole_document_total_request": false
+}
+
+Rules:
+- Identify subjects from meaning, not from a fixed question pattern.
+- Keep independent subjects as separate objects.
+- Do not merge separate subjects into one phrase.
+- Preserve multi-word subjects as one subject when they describe one entity.
+- Remove only words that express the request or calculation operation.
+- Do not remove meaningful words from entity names.
+- Do not calculate anything.
+- Do not answer the question.
+- Do not invent an entity.
+- If the user requests complete invoice or document totals without naming
+  a particular entity, return an empty subjects list and set
+  whole_document_total_request to true.
+- Otherwise set whole_document_total_request to false.
+- Return JSON only.
+""".strip()
+        )
+
+        parsed = parse_llm_json_response(
+            raw_response
+        )
+
+        if not isinstance(parsed, dict):
+            parsed = {}
+
+        raw_subjects = parsed.get("subjects") or []
+
+        if not isinstance(raw_subjects, list):
+            raw_subjects = []
+
+        subjects = []
+        seen_subjects = set()
+
+        for item in raw_subjects:
+            if isinstance(item, dict):
+                subject = str(
+                    item.get("normalised_value")
+                    or item.get("value")
+                    or ""
+                ).strip()
+
+            elif isinstance(item, str):
+                subject = item.strip()
+
+            else:
+                continue
+
+            subject = subject.strip(
+                " \t\r\n.,;:!?\"'()[]{}"
+            )
+
+            normalised_subject = normalise_search_text(
+                subject
+            )
+
+            if not subject or not normalised_subject:
+                continue
+
+            if normalised_subject in seen_subjects:
+                continue
+
+            seen_subjects.add(
+                normalised_subject
+            )
+
+            subjects.append(
+                subject
+            )
+
+        if subjects:
+            print(
+                "DYNAMIC FINANCIAL SUBJECTS:",
+                {
+                    "query": clean_query,
+                    "subjects": subjects
+                }
+            )
+
+            return subjects
+
+        if bool(
+            parsed.get(
+                "whole_document_total_request"
+            )
+        ):
+            return []
+
+    except Exception as e:
+        print(
+            "DYNAMIC SUBJECT EXTRACTION ERROR:",
+            type(e).__name__,
+            str(e)
+        )
+
+    # =========================================================
+    # GENERIC FALLBACK
+    # =========================================================
+    # This is used only when the structured LLM response fails.
+    # It does not contain any product, supplier or category names.
+
+    normalised_query = normalise_search_text(
+        clean_query
+    )
+
+    # Try to capture the content following a generic relationship
+    # preposition. The captured content remains fully dynamic.
+    subject_section = ""
+
+    relationship_patterns = [
+        r"\b(?:on|for|towards|toward|related to|associated with)\b\s+(.+)$",
+        r"\b(?:cost of|price of|amount for|spending for)\b\s+(.+)$",
+    ]
+
+    for pattern in relationship_patterns:
+        match = re.search(
+            pattern,
+            normalised_query,
+            flags=re.IGNORECASE
+        )
+
+        if match:
+            subject_section = str(
+                match.group(1) or ""
+            ).strip()
+
+            break
+
+    if not subject_section:
+        return []
+
+    # Split independent entities through generic separators.
+    possible_subjects = re.split(
+        r"\s*(?:,|;|\band\b|\bor\b|\bplus\b|&)\s*",
+        subject_section,
+        flags=re.IGNORECASE
+    )
+
+    generic_request_terms = {
+        "total",
+        "totals",
+        "amount",
+        "amounts",
+        "money",
+        "cost",
+        "costs",
+        "price",
+        "prices",
+        "spend",
+        "spent",
+        "spending",
+        "pay",
+        "paid",
+        "payment",
+        "payments",
+        "charge",
+        "charged",
+        "charges",
+        "purchase",
+        "purchased",
+        "purchases",
+        "calculate",
+        "calculated",
+        "calculation",
+        "combine",
+        "combined",
+        "altogether",
+        "overall",
+        "invoice",
+        "invoices",
+        "receipt",
+        "receipts",
+        "document",
+        "documents",
+        "file",
+        "files",
+        "the",
+        "a",
+        "an",
+        "all",
+    }
+
+    fallback_subjects = []
+    fallback_seen = set()
+
+    for possible_subject in possible_subjects:
+        words = [
+            word
+            for word in possible_subject.split()
+            if word not in generic_request_terms
+        ]
+
+        subject = " ".join(words).strip(
+            " \t\r\n.,;:!?\"'()[]{}"
+        )
+
+        normalised_subject = normalise_search_text(
+            subject
+        )
+
+        if not subject or not normalised_subject:
+            continue
+
+        if normalised_subject in fallback_seen:
+            continue
+
+        fallback_seen.add(
+            normalised_subject
+        )
+
+        fallback_subjects.append(
+            subject
+        )
+
+    print(
+        "FALLBACK DYNAMIC FINANCIAL SUBJECTS:",
+        {
+            "query": clean_query,
+            "subjects": fallback_subjects
+        }
+    )
+
+    return fallback_subjects
+
 def chat(
     query: str,
     crew_id: str,
