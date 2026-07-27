@@ -4991,10 +4991,12 @@ def process_uploaded_asset(
                 mime_type=None
             )
 
-    extracted_text = clean_text_for_postgres(extracted_text)
+            extracted_text = clean_text_for_postgres(extracted_text)
 
-    if not extracted_text:
-        raise ValueError("The audio file did not contain detectable speech")
+            if not extracted_text:
+                raise ValueError(
+                    "The audio file did not contain detectable speech"
+                )
 
         elif file_type in ["text", "pdf", "docx"]:
             original_file_type = file_type
