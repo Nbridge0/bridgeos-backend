@@ -13868,96 +13868,217 @@ Rules:
             mode="document_qa"
         )
 
-    # =========================================================
+        # =========================================================
     # NORMAL GROUNDED DOCUMENT ANSWER
     # =========================================================
 
-    parsed = None
+    clean_context = clean_text_for_postgres(
+        str(context or "")
+    ).strip()
 
-    try:
-        raw_answer = ask_llm(
-            query=clean_query,
-            context=f"""
-You are BridgeOS, a private document-based assistant.
-
-Always respond in British English.
-
-Return ONLY valid JSON:
-
-{{
-  "answer": "answer grounded only in the supplied documents",
-  "document_used": true,
-  "used_sources": [
-    {{
-      "source_number": 1,
-      "evidence_quote": "exact supporting text copied from the source"
-    }}
-  ]
-}}
-
-When unsupported, return:
-
-{{
-  "answer": "{FALLBACK_NO_DATA_ANSWER}",
-  "document_used": false,
-  "used_sources": []
-}}
-
-Rules:
-- Use only the supplied document context.
-- Do not use outside knowledge.
-- Do not invent facts, numbers, dates, names or statuses.
-- Answer the exact question.
-- Select only sources that directly support the answer.
-- Every evidence_quote must be copied from its selected source.
-- Return JSON only.
-
-Requested answer depth:
-{answer_depth}
-
-User question:
-{clean_query}
-
-Retrieval query:
-{retrieval_query_input}
-
-Document context:
-{context}
-""".strip()
-        )
-
-        parsed = parse_llm_json_response(
-            raw_answer
-        )
-
-    except Exception as error:
-        print(
-            "NORMAL DOCUMENT ANSWER ERROR:",
-            type(error).__name__,
-            str(error)
-        )
-
-        parsed = None
-
-    if not isinstance(parsed, dict):
+    if not clean_context:
         return finish(
             final_answer=FALLBACK_NO_DATA_ANSWER,
             final_sources=[],
             mode="document_qa"
         )
 
-    answer = str(
-        parsed.get("answer")
-        or ""
-    ).strip()
+    # Use the retrieved document rows as the only factual context.
+    # The model is asked for structured JSON first, but a plain-text
+    # fallback is allowed because some RunPod models do not reliably
+    # follow JSON-only instructions.
+    answer = ""
+    verified_rows = []
 
-    document_used = bool(
-        parsed.get("document_used")
-    )
+    try:
+        raw_answer = ask_llm(
+            query=clean_query,
+            context=f"""
+You are BridgeOS, a private document assistant.
+
+Answer the user's question using ONLY the supplied document context.
+
+Return valid JSON when possible:
+
+{{
+  "answer": "direct answer supported by the documents",
+  "used_sources": [
+    {{
+      "source_number": 1,
+      "evidence_quote": "short exact supporting text from that source"
+    }}
+  ]
+}}
+
+Rules:
+- Use only the document context below.
+- Do not use outside knowledge.
+- Do not invent names, dates, numbers, events, requirements or conclusions.
+- Answer the exact user question.
+- If the answer is not present, return:
+  {{
+    "answer": "{FALLBACK_NO_DATA_ANSWER}",
+    "used_sources": []
+  }}
+- Source numbers correspond to the numbered sources below.
+- Keep evidence quotes short and copied from the source.
+- Use British English.
+
+User question:
+{clean_query}
+
+Document context:
+{clean_context}
+""".strip()
+        )
+
+        raw_answer = clean_text_for_postgres(
+            str(raw_answer or "")
+        ).strip()
+
+        parsed_answer = parse_llm_json_response(
+            raw_answer
+        )
+
+        if isinstance(parsed_answer, dict):
+            candidate_answer = clean_text_for_postgres(
+                str(
+                    parsed_answer.get("answer")
+                    or parsed_answer.get("response")
+                    or parsed_answer.get("message")
+                    or ""
+                )
+            ).strip()
+
+            used_sources = (
+                parsed_answer.get("used_sources")
+                or parsed_answer.get("sources")
+                or []
+            )
+
+            if (
+                candidate_answer
+                and candidate_answer != FALLBACK_NO_DATA_ANSWER
+            ):
+                answer = candidate_answer
+
+            if isinstance(used_sources, list):
+                for used_source in used_sources:
+                    if not isinstance(used_source, dict):
+                        continue
+
+                    try:
+                        source_number = int(
+                            used_source.get("source_number")
+                        )
+                    except Exception:
+                        continue
+
+                    source_index = source_number - 1
+
+                    if (
+                        source_index < 0
+                        or source_index >= len(matched_rows)
+                    ):
+                        continue
+
+                    selected_row = matched_rows[
+                        source_index
+                    ]
+
+                    evidence_quote = clean_text_for_postgres(
+                        str(
+                            used_source.get("evidence_quote")
+                            or used_source.get("quote")
+                            or ""
+                        )
+                    ).strip()
+
+                    # Accept an exact/normalised quote match.
+                    if (
+                        evidence_quote
+                        and source_quote_exists_in_row(
+                            selected_row,
+                            evidence_quote
+                        )
+                    ):
+                        verified_rows.append(
+                            selected_row
+                        )
+
+        else:
+            # Some RunPod models return a correct plain-text answer
+            # despite being instructed to return JSON.
+            if (
+                raw_answer
+                and raw_answer != FALLBACK_NO_DATA_ANSWER
+                and not raw_answer.lower().startswith(
+                    "runpod "
+                )
+            ):
+                answer = raw_answer
+
+    except Exception as error:
+        print(
+            "STRUCTURED DOCUMENT ANSWER ERROR:",
+            type(error).__name__,
+            str(error)
+        )
+
+    # =========================================================
+    # PLAIN-TEXT FALLBACK
+    # =========================================================
+
+    if not answer:
+        try:
+            fallback_answer = ask_llm(
+                query=clean_query,
+                context=f"""
+You are BridgeOS, a private document assistant.
+
+Answer the user's question directly using ONLY the document context below.
+
+Rules:
+- Do not use outside knowledge.
+- Do not invent information.
+- Do not mention that you are an AI.
+- Do not describe the retrieval process.
+- Do not return JSON.
+- Use British English.
+- If the documents do not contain the answer, return exactly:
+{FALLBACK_NO_DATA_ANSWER}
+
+User question:
+{clean_query}
+
+Document context:
+{clean_context}
+""".strip()
+            )
+
+            fallback_answer = clean_text_for_postgres(
+                str(fallback_answer or "")
+            ).strip()
+
+            if (
+                fallback_answer
+                and fallback_answer
+                != FALLBACK_NO_DATA_ANSWER
+                and not fallback_answer.lower().startswith(
+                    "runpod "
+                )
+            ):
+                answer = fallback_answer
+
+        except Exception as error:
+            print(
+                "PLAIN DOCUMENT ANSWER ERROR:",
+                type(error).__name__,
+                str(error)
+            )
 
     if (
         not answer
-        or not document_used
         or answer == FALLBACK_NO_DATA_ANSWER
     ):
         return finish(
@@ -13966,30 +14087,54 @@ Document context:
             mode="document_qa"
         )
 
-    try:
-        verified_rows = (
-            verified_source_rows_from_llm_result(
-                parsed=parsed,
-                matched_rows=matched_rows
-            )
-            or []
-        )
+    # =========================================================
+    # SOURCE FALLBACK
+    # =========================================================
 
-    except Exception as error:
-        print(
-            "SOURCE VERIFICATION ERROR:",
-            type(error).__name__,
-            str(error)
-        )
-
+    # When valid evidence quotes were returned, use only those rows.
+    # Otherwise use the strongest retrieved document rows rather than
+    # throwing away a valid answer merely because the model did not
+    # produce perfect source JSON.
+    if not verified_rows:
         verified_rows = []
 
-    if not verified_rows:
-        return finish(
-            final_answer=FALLBACK_NO_DATA_ANSWER,
-            final_sources=[],
-            mode="document_qa"
-        )
+        seen_verified_assets = set()
+
+        for row in matched_rows:
+            if not isinstance(row, dict):
+                continue
+
+            asset_id = row.get("asset_id")
+
+            if not asset_id:
+                continue
+
+            if asset_id in seen_verified_assets:
+                continue
+
+            row_text = clean_text_for_postgres(
+                str(
+                    row.get("content")
+                    or row.get("search_text")
+                    or row.get("text")
+                    or ""
+                )
+            ).strip()
+
+            if not row_text:
+                continue
+
+            seen_verified_assets.add(
+                asset_id
+            )
+
+            verified_rows.append(
+                row
+            )
+
+            # Keep the displayed sources focused.
+            if len(verified_rows) >= 3:
+                break
 
     verified_sources = build_sources_from_asset_results(
         verified_rows
