@@ -8284,29 +8284,31 @@ def create_voice_note_and_answer(
     
 MONEY_PATTERN = re.compile(
     r"""
+    (?<![\w\d])
     (?P<currency_before>
-        USD|EUR|GBP|AED|SAR|QAR|CAD|AUD|
         US\$|CA\$|AU\$|
+        USD|EUR|GBP|AED|SAR|QAR|CAD|AUD|
         \$|€|£
     )?
     \s*
     (?P<amount>
         \(?
-        \d{1,3}
         (?:
-            [,\s]\d{3}
-        )*
-        (?:\.\d{1,2})?
-        |
-        \(?
-        \d+
-        (?:[.,]\d{1,2})?
+            \d{1,3}(?:,\d{3})+(?:\.\d{1,2})?
+            |
+            \d{1,3}(?:\.\d{3})+(?:,\d{1,2})?
+            |
+            \d+(?:\.\d{1,2})?
+            |
+            \d+(?:,\d{1,2})
+        )
+        \)?
     )
-    \)?
     \s*
     (?P<currency_after>
         USD|EUR|GBP|AED|SAR|QAR|CAD|AUD
     )?
+    (?![\w\d])
     """,
     re.IGNORECASE | re.VERBOSE
 )
@@ -8492,14 +8494,30 @@ def parse_decimal_money(raw_amount: str) -> Decimal | None:
 
 
 def extract_money_values_from_line(line: str) -> list[dict]:
+    """
+    Extracts complete monetary amounts from one line.
+
+    It rejects:
+    - dates
+    - percentages
+    - invoice/reference numbers
+    - isolated integers without currency unless they contain decimals or
+      thousands separators
+    """
+
+    clean_line = normalise_invoice_line(line)
     values = []
 
-    for match in MONEY_PATTERN.finditer(line or ""):
-        raw_amount = match.group("amount")
-        amount = parse_decimal_money(raw_amount)
+    if not clean_line:
+        return values
 
-        if amount is None:
+    for match in MONEY_PATTERN.finditer(clean_line):
+        raw_amount = str(match.group("amount") or "").strip()
+
+        if not raw_amount:
             continue
+
+        full_match = str(match.group(0) or "").strip()
 
         currency_raw = (
             match.group("currency_before")
@@ -8509,12 +8527,46 @@ def extract_money_values_from_line(line: str) -> list[dict]:
 
         currency = normalise_currency(currency_raw)
 
+        start = match.start()
+        end = match.end()
+
+        before = clean_line[max(0, start - 2):start]
+        after = clean_line[end:end + 2]
+
+        # Reject percentages.
+        if "%" in after or "%" in before:
+            continue
+
+        # Reject date fragments such as 27/07/2026.
+        if "/" in before or "/" in after:
+            continue
+
+        # Reject time fragments such as 14:30.
+        if ":" in before or ":" in after:
+            continue
+
+        # Reject plain, currency-free integers because these are commonly:
+        # invoice numbers, quantities, dates, references or page numbers.
+        has_decimal_separator = "." in raw_amount or "," in raw_amount
+
+        if not currency and not has_decimal_separator:
+            continue
+
+        amount = parse_decimal_money(raw_amount)
+
+        if amount is None:
+            continue
+
+        # Monetary totals should not be negative for spend aggregation.
+        if amount < Decimal("0.00"):
+            continue
+
         values.append({
             "amount": amount,
             "currency": currency,
-            "raw": match.group(0).strip(),
-            "start": match.start(),
-            "end": match.end(),
+            "raw": full_match,
+            "start": start,
+            "end": end,
         })
 
     return values
@@ -8522,24 +8574,29 @@ def extract_money_values_from_line(line: str) -> list[dict]:
 
 def determine_currency_from_document(text: str) -> str:
     """
-    Returns one currency only when the document clearly contains a single
-    currency. Returns an empty string if it is missing or ambiguous.
+    Determines the document currency conservatively.
+
+    Repeated appearances of the same currency are allowed.
+    Different currencies make the result ambiguous.
     """
 
-    detected = set()
+    clean_text = str(text or "")
 
-    for match in re.finditer(
-        r"\b(?:USD|EUR|GBP|AED|SAR|QAR|CAD|AUD)\b|US\$|CA\$|AU\$|\$|€|£",
-        text or "",
+    matches = re.findall(
+        r"US\$|CA\$|AU\$|\bUSD\b|\bEUR\b|\bGBP\b|\bAED\b|"
+        r"\bSAR\b|\bQAR\b|\bCAD\b|\bAUD\b|\$|€|£",
+        clean_text,
         flags=re.IGNORECASE
-    ):
-        currency = normalise_currency(match.group(0))
+    )
 
-        if currency:
-            detected.add(currency)
+    currencies = {
+        normalise_currency(match)
+        for match in matches
+        if normalise_currency(match)
+    }
 
-    if len(detected) == 1:
-        return next(iter(detected))
+    if len(currencies) == 1:
+        return next(iter(currencies))
 
     return ""
 
@@ -8633,14 +8690,20 @@ def extract_invoice_total_candidates(
     document_text: str
 ) -> list[dict]:
     """
-    Extracts only labelled invoice-total candidates.
+    Finds labelled final invoice totals.
 
-    It does not add line items, subtotal, VAT, discount or unrelated amounts.
+    Only accepts:
+    - a monetary amount on the same line after the total label; or
+    - a monetary amount on the immediately following short line.
+
+    It rejects subtotal, tax, VAT, discount, delivery and other non-final totals.
     """
+
+    raw_lines = str(document_text or "").splitlines()
 
     lines = [
         normalise_invoice_line(line)
-        for line in str(document_text or "").splitlines()
+        for line in raw_lines
     ]
 
     lines = [
@@ -8661,57 +8724,70 @@ def extract_invoice_total_candidates(
         if not label:
             continue
 
-        # First preference: amount on the same labelled line.
-        same_line_values = extract_money_values_from_line(line)
+        lower_line = line.lower()
+        phrase_position = lower_line.find(label["phrase"])
 
-        # Remove values occurring before the total label where possible.
-        phrase_position = line.lower().find(label["phrase"])
+        if phrase_position < 0:
+            continue
 
-        values_after_label = [
-            item
-            for item in same_line_values
-            if item["start"] >= phrase_position
-        ]
+        phrase_end = phrase_position + len(label["phrase"])
 
-        selected_values = values_after_label or same_line_values
+        # Only inspect text following the total label.
+        text_after_label = line[phrase_end:].strip(" :-–—")
 
-        # Second preference: amount on the next short line.
+        selected_values = extract_money_values_from_line(
+            text_after_label
+        )
+
+        evidence = line
+
+        # Some invoices put the amount on the next line.
         if not selected_values and index + 1 < len(lines):
-            next_line = lines[index + 1]
+            next_line = lines[index + 1].strip()
 
-            if len(next_line) <= 80:
-                selected_values = extract_money_values_from_line(
-                    next_line
-                )
+            if len(next_line) <= 60:
+                next_label = find_total_label(next_line)
 
-        # Reject a line with multiple different possible totals.
-        unique_values = {}
+                if not next_label:
+                    selected_values = extract_money_values_from_line(
+                        next_line
+                    )
+
+                    if selected_values:
+                        evidence = f"{line} {next_line}"
+
+        clean_values = {}
 
         for value in selected_values:
+            amount = value.get("amount")
+
+            if not isinstance(amount, Decimal):
+                continue
+
             currency = (
                 value.get("currency")
                 or document_currency
             )
 
+            # Do not guess the currency.
+            if not currency:
+                continue
+
             key = (
-                str(value["amount"]),
-                currency
+                currency,
+                amount
             )
 
-            unique_values[key] = {
+            clean_values[key] = {
                 **value,
-                "currency": currency,
+                "currency": currency
             }
 
-        if len(unique_values) != 1:
+        # The labelled section must contain exactly one possible total.
+        if len(clean_values) != 1:
             continue
 
-        selected = next(iter(unique_values.values()))
-
-        # A total must have a known currency.
-        # This prevents mixing an unlabeled number with another invoice.
-        if not selected["currency"]:
-            continue
+        selected = next(iter(clean_values.values()))
 
         candidates.append({
             "label_type": label["type"],
@@ -8719,7 +8795,7 @@ def extract_invoice_total_candidates(
             "priority": label["priority"],
             "amount": selected["amount"],
             "currency": selected["currency"],
-            "evidence": line,
+            "evidence": evidence,
             "line_index": index,
         })
 
@@ -8826,10 +8902,14 @@ def answer_financial_total_from_context(
     matched_rows: list[dict]
 ):
     """
-    Finds one labelled final total per financial document and calculates
-    totals using Python Decimal.
+    Calculates invoice totals deterministically.
 
-    The LLM is not used for extracting or adding amounts.
+    Important:
+    - The LLM does not calculate anything.
+    - One final total is selected per document.
+    - Subtotals, VAT, tax, discounts and line-item prices are excluded.
+    - Decimal is used instead of float.
+    - Different currencies are never combined.
     """
 
     if not is_financial_total_query(query):
@@ -8849,6 +8929,39 @@ def answer_financial_total_from_context(
             "sources": []
         }
 
+    # Remove generic calculation words so that a request such as
+    # "how much did we spend on fuel" can focus on "fuel".
+    generic_terms = {
+        "spend",
+        "spent",
+        "spending",
+        "cost",
+        "costs",
+        "total",
+        "amount",
+        "price",
+        "paid",
+        "payment",
+        "invoice",
+        "invoices",
+        "bill",
+        "bills",
+        "calculate",
+        "calculation",
+        "much",
+        "have",
+        "what",
+        "grand",
+        "sum",
+        "add",
+    }
+
+    query_subject_terms = [
+        term
+        for term in meaningful_terms_from_query(query)
+        if term not in generic_terms
+    ]
+
     verified_documents = []
     rejected_documents = []
 
@@ -8860,6 +8973,29 @@ def answer_financial_total_from_context(
         if not document_text:
             continue
 
+        normalised_document = normalise_search_text(document_text)
+        normalised_file_name = normalise_search_text(
+            asset_data.get("file_name") or ""
+        )
+
+        searchable_document = (
+            normalised_file_name
+            + " "
+            + normalised_document
+        )
+
+        # When the user names a subject, include only documents that contain it.
+        # Example: "How much did we spend on fuel?"
+        if query_subject_terms:
+            subject_matches = [
+                term
+                for term in query_subject_terms
+                if term in searchable_document
+            ]
+
+            if not subject_matches:
+                continue
+
         candidates = extract_invoice_total_candidates(
             document_text=document_text
         )
@@ -8870,113 +9006,108 @@ def answer_financial_total_from_context(
 
         if not selected_total:
             rejected_documents.append({
-                "file_name": asset_data.get("file_name") or "Document",
-                "reason": rejection_reason or "No verified total found"
+                "file_name": asset_data.get("file_name"),
+                "reason": rejection_reason or "No verified total"
             })
-
             continue
 
         amount = selected_total.get("amount")
         currency = selected_total.get("currency")
+        evidence = selected_total.get("evidence") or ""
 
         if not isinstance(amount, Decimal):
             rejected_documents.append({
-                "file_name": asset_data.get("file_name") or "Document",
-                "reason": "The total was not a valid decimal value"
+                "file_name": asset_data.get("file_name"),
+                "reason": "Invalid monetary value"
             })
-
-            continue
-
-        if amount < Decimal("0.00"):
-            rejected_documents.append({
-                "file_name": asset_data.get("file_name") or "Document",
-                "reason": "The selected total was negative"
-            })
-
             continue
 
         if not currency:
             rejected_documents.append({
-                "file_name": asset_data.get("file_name") or "Document",
-                "reason": "The currency could not be verified"
+                "file_name": asset_data.get("file_name"),
+                "reason": "Currency could not be verified"
             })
+            continue
 
+        # Verify that the selected amount actually appears in this document.
+        evidence_values = extract_money_values_from_line(
+            evidence
+        )
+
+        amount_verified = any(
+            item.get("amount") == amount
+            and (
+                item.get("currency") == currency
+                or not item.get("currency")
+            )
+            for item in evidence_values
+        )
+
+        if not amount_verified:
+            rejected_documents.append({
+                "file_name": asset_data.get("file_name"),
+                "reason": "Selected total was not found in the document"
+            })
             continue
 
         source_rows = asset_data.get("rows") or []
 
+        if not source_rows:
+            continue
+
         verified_documents.append({
             "asset_id": asset_id,
-            "file_name": asset_data.get("file_name") or "Document",
-            "amount": amount,
+            "file_name": asset_data.get("file_name") or "Invoice",
+            "amount": amount.quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP
+            ),
             "currency": currency,
-            "label": selected_total.get("label_phrase") or "total",
-            "evidence": selected_total.get("evidence") or "",
-            "source_row": source_rows[0] if source_rows else None
+            "evidence": evidence,
+            "source_row": source_rows[0],
         })
 
-    print(
-        "FINANCIAL DEBUG verified:",
-        [
-            {
-                "file": item["file_name"],
-                "amount": str(item["amount"]),
-                "currency": item["currency"],
-                "evidence": item["evidence"]
-            }
-            for item in verified_documents
-        ]
-    )
-
-    print(
-        "FINANCIAL DEBUG rejected:",
-        rejected_documents
-    )
-
     if not verified_documents:
+        print(
+            "FINANCIAL TOTAL: no verified documents",
+            rejected_documents
+        )
+
         return {
-            "answer": (
-                "I found the documents, but I could not verify a labelled final "
-                "total and currency from their extracted text. Check the document "
-                "OCR or extracted_text fields."
-            ),
+            "answer": FALLBACK_NO_DATA_ANSWER,
             "sources": []
         }
 
-    currencies = sorted({
+    currencies = {
         item["currency"]
         for item in verified_documents
-    })
+    }
 
     source_rows = [
         item["source_row"]
         for item in verified_documents
-        if item.get("source_row")
     ]
 
-    sources = build_sources_from_asset_results(source_rows)
+    sources = build_sources_from_asset_results(
+        source_rows
+    )
 
-    # Never add amounts from different currencies.
+    # Never add unlike currencies.
     if len(currencies) > 1:
-        answer_lines = [
+        lines = [
             (
-                "The verified documents contain different currencies, so they "
-                "cannot be combined into one total without an exchange rate."
+                "The verified documents contain different currencies, "
+                "so they cannot be combined into one accurate total."
             ),
             ""
         ]
 
-        for currency in currencies:
-            currency_items = [
-                item
-                for item in verified_documents
-                if item["currency"] == currency
-            ]
-
+        for currency in sorted(currencies):
             currency_total = sum(
                 (
                     item["amount"]
-                    for item in currency_items
+                    for item in verified_documents
+                    if item["currency"] == currency
                 ),
                 Decimal("0.00")
             ).quantize(
@@ -8984,31 +9115,17 @@ def answer_financial_total_from_context(
                 rounding=ROUND_HALF_UP
             )
 
-            answer_lines.append(
-                f"{currency}: {format_currency_amount(currency_total, currency)}"
+            lines.append(
+                f"- {currency}: "
+                f"{format_currency_amount(currency_total, currency)}"
             )
 
-            for item in currency_items:
-                answer_lines.append(
-                    f"- {item['file_name']}: "
-                    f"{format_currency_amount(item['amount'], currency)}"
-                )
-
-        if rejected_documents:
-            answer_lines.extend([
-                "",
-                (
-                    f"{len(rejected_documents)} document(s) were excluded because "
-                    "their final total or currency could not be verified."
-                )
-            ])
-
         return {
-            "answer": "\n".join(answer_lines),
+            "answer": "\n".join(lines),
             "sources": sources
         }
 
-    currency = currencies[0]
+    currency = next(iter(currencies))
 
     total = sum(
         (
@@ -9034,13 +9151,13 @@ def answer_financial_total_from_context(
 
     if len(verified_documents) > 1:
         calculation = " + ".join(
-            f"{item['amount']:,.2f}"
+            f"{item['amount']:.2f}"
             for item in verified_documents
         )
 
         answer_lines.extend([
             "",
-            f"Calculation: {calculation} = {total:,.2f}"
+            f"Calculation: {calculation} = {total:.2f}"
         ])
 
     if rejected_documents:
@@ -9048,7 +9165,7 @@ def answer_financial_total_from_context(
             "",
             (
                 f"{len(rejected_documents)} document(s) were excluded because "
-                "their final total or currency could not be verified."
+                "a unique final total could not be verified."
             )
         ])
 
@@ -9157,8 +9274,12 @@ def chat(
     retrieval_query_input = clean_query
 
     query_scope = classify_bridgeos_query_scope(clean_query)
-    answer_depth = classify_answer_depth(clean_query)
     financial_query = is_financial_total_query(clean_query)
+
+    if financial_query:
+        answer_depth = "comprehensive"
+    else:
+        answer_depth = classify_answer_depth(clean_query)
 
     print("LOCAL CHAT DEBUG: answer_depth:", answer_depth)
     print("LOCAL CHAT DEBUG: financial_query:", financial_query)
@@ -9444,29 +9565,15 @@ Rules:
                                 or ""
                             ).strip()
 
-                            document_parts = []
-
-                            if extracted_text:
-                                document_parts.append(
-                                    "Extracted document text:\n"
-                                    + extracted_text
-                                )
-
-                            if ocr_text:
-                                document_parts.append(
-                                    "OCR text:\n"
-                                    + ocr_text
-                                )
-
-                            if summary:
-                                document_parts.append(
-                                    "Document summary:\n"
-                                    + summary
-                                )
-
-                            combined_document_text = "\n\n".join(
-                                document_parts
-                            ).strip()
+                            # Do not combine extracted text, OCR and summary.
+                            # They frequently contain duplicate or conflicting representations
+                            # of the same invoice amount.
+                            if ocr_text and len(ocr_text) >= 80:
+                                combined_document_text = ocr_text
+                            elif extracted_text:
+                                combined_document_text = extracted_text
+                            else:
+                                combined_document_text = summary
 
                             if not combined_document_text:
                                 continue
