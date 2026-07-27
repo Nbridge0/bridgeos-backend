@@ -4,8 +4,7 @@ import json
 import random
 import hashlib
 import smtplib
-from email.mess
-age import EmailMessage
+from email.message import EmailMessage
 from app.database import supabase
 from app.embeddings import embed
 from app.config import (
