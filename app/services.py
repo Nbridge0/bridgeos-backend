@@ -9265,7 +9265,6 @@ def answer_financial_total_from_context(
         "sources": sources
     }
 
-
 def chat(
     query: str,
     crew_id: str,
@@ -9279,13 +9278,13 @@ def chat(
 
     Behaviour:
     - Uses only documents accessible to the current crew member.
-    - Uses an uploaded chat file only when its asset ID is explicitly supplied.
+    - Uses an uploaded chat file only when its asset ID is supplied.
     - Searches Yacht Documentation for normal document questions.
-    - Loads financial documents directly for spending/total questions.
-    - Uses deterministic Decimal calculations for verified financial totals.
+    - Loads financial documents directly for spending and total questions.
+    - Uses deterministic Decimal calculations for financial totals.
+    - Uses deterministic Python comparisons for numeric comparison questions.
     - Never combines different currencies.
-    - Returns the no-data fallback rather than hallucinating.
-    - Database logging failures do not turn valid answers into "Load failed".
+    - Returns the no-data fallback rather than inventing information.
     """
 
     clean_query = str(query or "").strip()
@@ -9343,13 +9342,11 @@ def chat(
             supabase.table("chats").update({
                 "title": clean_query[:60] or "New Chat",
                 "updated_at": "now()"
-            }).eq(
-                "id", chat_id
-            ).eq(
-                "crew_id", crew_id
-            ).eq(
-                "yacht_id", yacht_id
-            ).execute()
+            }) \
+                .eq("id", chat_id) \
+                .eq("crew_id", crew_id) \
+                .eq("yacht_id", yacht_id) \
+                .execute()
 
         except Exception as e:
             print(
@@ -9364,16 +9361,30 @@ def chat(
     context = ""
     retrieval_query_input = clean_query
 
-    query_scope = classify_bridgeos_query_scope(clean_query)
-    financial_query = is_financial_total_query(clean_query)
+    query_scope = classify_bridgeos_query_scope(
+        clean_query
+    )
+
+    financial_query = is_financial_total_query(
+        clean_query
+    )
 
     if financial_query:
         answer_depth = "comprehensive"
     else:
-        answer_depth = classify_answer_depth(clean_query)
+        answer_depth = classify_answer_depth(
+            clean_query
+        )
 
-    print("LOCAL CHAT DEBUG: answer_depth:", answer_depth)
-    print("LOCAL CHAT DEBUG: financial_query:", financial_query)
+    print(
+        "LOCAL CHAT DEBUG: answer_depth:",
+        answer_depth
+    )
+
+    print(
+        "LOCAL CHAT DEBUG: financial_query:",
+        financial_query
+    )
 
     is_followup_query = is_contextual_followup_query(
         query=clean_query,
@@ -9391,11 +9402,10 @@ def chat(
             )
         )
 
-    # Only use a chat upload when the frontend explicitly supplies its ID.
     resolved_uploaded_asset_id = uploaded_asset_id
 
     # ---------------------------------------------------------
-    # HELPER: SAVE ASSISTANT RESPONSE SAFELY
+    # SAVE ASSISTANT RESPONSE
     # ---------------------------------------------------------
     def save_assistant_response(
         final_answer: str,
@@ -9421,13 +9431,11 @@ def chat(
         try:
             supabase.table("chats").update({
                 "updated_at": "now()"
-            }).eq(
-                "id", chat_id
-            ).eq(
-                "crew_id", crew_id
-            ).eq(
-                "yacht_id", yacht_id
-            ).execute()
+            }) \
+                .eq("id", chat_id) \
+                .eq("crew_id", crew_id) \
+                .eq("yacht_id", yacht_id) \
+                .execute()
 
         except Exception as e:
             print(
@@ -9463,7 +9471,9 @@ Rules:
 """.strip()
             )
 
-            answer = str(raw_answer or "").strip()
+            answer = str(
+                raw_answer or ""
+            ).strip()
 
         except Exception as e:
             print(
@@ -9471,6 +9481,7 @@ Rules:
                 type(e).__name__,
                 str(e)
             )
+
             answer = ""
 
         if not answer:
@@ -9516,35 +9527,11 @@ Rules:
             )
 
             if matched_rows:
-                # For financial calculations, preserve original invoice text.
-                # Do not replace it with an LLM-generated batch summary.
-                if financial_query:
-                    context = build_context_from_asset_results(
-                        matched_rows
-                    )
-
-                elif answer_depth in {
-                    "comprehensive",
-                    "document"
-                }:
-                    extracted_evidence, evidence_rows = (
-                        extract_relevant_information_from_batches(
-                            query=clean_query,
-                            rows=matched_rows,
-                            answer_depth=answer_depth
-                        )
-                    )
-
-                    context = extracted_evidence or ""
-
-                    if evidence_rows:
-                        matched_rows = evidence_rows
-
-                else:
-                    context = build_context_from_asset_results(
-                        matched_rows
-                    )
-
+                # Always answer from the original document rows.
+                # Do not replace document text with an LLM-generated summary.
+                context = build_context_from_asset_results(
+                    matched_rows
+                )
             else:
                 context = ""
 
@@ -9581,11 +9568,11 @@ Rules:
                         type(e).__name__,
                         str(e)
                     )
+
                     allowed_asset_ids = []
 
-            # For normal follow-ups, prefer the previous source document.
-            # Financial totals must search all accessible invoices, so do not
-            # restrict a financial query to only one previous source.
+            # Normal follow-up questions prefer the previous source.
+            # Financial questions must inspect every accessible invoice.
             if (
                 previous_source_asset_ids
                 and not financial_query
@@ -9662,8 +9649,8 @@ Rules:
                                 or ""
                             )
 
-                            # Search all available text for the requested subject,
-                            # such as beef, fuel, vegetables, repairs, etc.
+                            # Used to search for the subject requested by the
+                            # user, such as beef, fuel, vegetables or repairs.
                             searchable_document_text = "\n\n".join([
                                 f"File name: {file_name}",
                                 extracted_text,
@@ -9671,7 +9658,7 @@ Rules:
                                 summary
                             ]).strip()
 
-                            # Choose one representation only for reading the final total.
+                            # Used only for safely reading one final total.
                             financial_document_text = ""
                             selected_total = None
 
@@ -9696,10 +9683,14 @@ Rules:
                                 })
 
                             for candidate_source in candidate_texts:
-                                candidate_text = candidate_source["text"]
+                                candidate_text = candidate_source[
+                                    "text"
+                                ]
 
-                                total_candidates = extract_invoice_total_candidates(
-                                    document_text=candidate_text
+                                total_candidates = (
+                                    extract_invoice_total_candidates(
+                                        document_text=candidate_text
+                                    )
                                 )
 
                                 if not total_candidates:
@@ -9712,70 +9703,114 @@ Rules:
                                 )
 
                                 if candidate_total:
-                                    financial_document_text = candidate_text
+                                    financial_document_text = (
+                                        candidate_text
+                                    )
+
                                     selected_total = candidate_total
 
                                     print(
                                         "FINANCIAL TEXT SELECTED:",
                                         {
                                             "file_name": file_name,
-                                            "source_type": candidate_source["type"],
-                                            "amount": str(
-                                                candidate_total.get("amount")
+                                            "source_type": (
+                                                candidate_source["type"]
                                             ),
-                                            "currency": candidate_total.get(
-                                                "currency"
+                                            "amount": str(
+                                                candidate_total.get(
+                                                    "amount"
+                                                )
+                                            ),
+                                            "currency": (
+                                                candidate_total.get(
+                                                    "currency"
+                                                )
+                                            )
+                                        }
+                                    )
+
+                                    break
+
+                                print(
+                                    "FINANCIAL TEXT CANDIDATE REJECTED:",
+                                    {
+                                        "file_name": file_name,
+                                        "source_type": (
+                                            candidate_source["type"]
+                                        ),
+                                        "reason": rejection_reason
+                                    }
+                                )
+
+                            if (
+                                not financial_document_text
+                                or not selected_total
+                            ):
+                                print(
+                                    "FINANCIAL DOCUMENT SKIPPED:",
+                                    {
+                                        "file_name": file_name,
+                                        "reason": (
+                                            "No unique labelled final total"
                                         )
                                     }
                                 )
 
-                                break
+                                continue
 
-                            print(
-                                "FINANCIAL TEXT CANDIDATE REJECTED:",
-                                {
-                                    "file_name": file_name,
-                                    "source_type": candidate_source["type"],
-                                    "reason": rejection_reason
-                                }
-                            )
+                            direct_financial_rows.append({
+                                "asset_id": asset.get("id"),
+                                "yacht_id": asset.get("yacht_id"),
+                                "chat_id": asset.get("chat_id"),
+                                "security_level": asset.get(
+                                    "security_level"
+                                ),
 
-                        if not financial_document_text or not selected_total:
-                            print(
-                                "FINANCIAL DOCUMENT SKIPPED:",
-                                {
-                                    "file_name": file_name,
-                                    "reason": "No unique labelled final total"
-                                }
-                            )
-                            continue
+                                # Used for deterministic total extraction.
+                                "content": financial_document_text,
 
-                        direct_financial_rows.append({
-                            "asset_id": asset.get("id"),
-                            "yacht_id": asset.get("yacht_id"),
-                            "chat_id": asset.get("chat_id"),
-                            "security_level": asset.get(
-                                "security_level"
-                            ),
+                                # Used for matching subjects such as beef.
+                                "search_text": (
+                                    searchable_document_text
+                                ),
 
-                            # Used for deterministic total calculation.
-                            "content": financial_document_text,
+                                "content_type": (
+                                    "financial_document"
+                                ),
+                                "chunk_index": 0,
+                                "detected_date": None,
+                                "detected_year": None,
+                                "tags": [],
+                                "file_name": asset.get("file_name"),
+                                "original_file_name": asset.get(
+                                    "original_file_name"
+                                ),
+                                "file_type": asset.get("file_type"),
+                                "mime_type": asset.get("mime_type")
+                            })
 
-                            # Used for subject matching, such as "beef".
-                            "search_text": searchable_document_text,
+                        matched_rows = deduplicate_context_rows(
+                            direct_financial_rows
+                        )
 
-                            "content_type": "financial_document",
-                            "chunk_index": 0,
-                            "detected_date": None,
-                            "detected_year": None,
-                            "tags": [],
-                            "file_name": asset.get("file_name"),
-                            "original_file_name": asset.get(
-                                "original_file_name"
-                            ),
-                            "file_type": asset.get("file_type"),
-                            "mime_type": asset.get("mime_type")
-                        })
+                        context = build_context_from_asset_results(
+                            matched_rows
+                        )
+
+                        print(
+                            "FINANCIAL DIRECT RETRIEVAL DEBUG:",
+                            len(matched_rows)
+                        )
+
+                    except Exception as e:
+                        print(
+                            "FINANCIAL DIRECT RETRIEVAL ERROR:",
+                            type(e).__name__,
+                            str(e)
+                        )
+
+                        matched_rows = []
+                        context = ""
 
                 # -------------------------------------------------
                 # NORMAL DOCUMENT RETRIEVAL
@@ -9810,7 +9845,7 @@ Rules:
 
                     matched_rows_by_key = {}
 
-                    # File-listing questions use asset metadata.
+                    # File listing questions use asset metadata.
                     if is_file_listing_query(clean_query):
                         listing_rows = (
                             get_asset_metadata_rows_for_listing(
@@ -9845,13 +9880,17 @@ Rules:
 
                         year_filter = filters.get("year")
 
-                        # Keyword search.
+                        # -----------------------------------------
+                        # KEYWORD SEARCH
+                        # -----------------------------------------
                         try:
                             keyword_rows = (
                                 keyword_search_asset_chunks(
                                     query=retrieval_query,
                                     yacht_id=yacht_id,
-                                    allowed_asset_ids=allowed_asset_ids,
+                                    allowed_asset_ids=(
+                                        allowed_asset_ids
+                                    ),
                                     year_filter=year_filter,
                                     limit=40
                                 )
@@ -9874,14 +9913,18 @@ Rules:
                                 str(e)
                             )
 
-                        # Semantic search.
+                        # -----------------------------------------
+                        # SEMANTIC SEARCH
+                        # -----------------------------------------
                         try:
+                            query_embedding = embed(
+                                retrieval_query
+                            )
+
                             semantic_results = supabase.rpc(
                                 "match_asset_chunks_secure",
                                 {
-                                    "query_embedding": embed(
-                                        retrieval_query
-                                    ),
+                                    "query_embedding": query_embedding,
                                     "match_count": 40,
                                     "allowed_asset_ids": (
                                         allowed_asset_ids
@@ -9902,6 +9945,8 @@ Rules:
                                     matched_rows_by_key[key] = row
 
                         except Exception as e:
+                            # Keyword search remains available even if
+                            # the embedding endpoint is unavailable.
                             print(
                                 "SEMANTIC SEARCH ERROR:",
                                 type(e).__name__,
@@ -9935,32 +9980,10 @@ Rules:
                             matched_rows
                         )
 
-                        if answer_depth in {
-                            "comprehensive",
-                            "document"
-                        }:
-                            extracted_evidence, evidence_rows = (
-                                extract_relevant_information_from_batches(
-                                    query=clean_query,
-                                    rows=matched_rows,
-                                    answer_depth=answer_depth
-                                )
-                            )
-
-                            if extracted_evidence:
-                                context = extracted_evidence
-
-                                if evidence_rows:
-                                    matched_rows = evidence_rows
-                            else:
-                                context = ""
-
-                        else:
-                            context = (
-                                build_context_from_asset_results(
-                                    matched_rows
-                                )
-                            )
+                        # Always use original rows as final context.
+                        context = build_context_from_asset_results(
+                            matched_rows
+                        )
 
                         print(
                             "FULL CONTEXT DEBUG final expanded rows:",
@@ -10018,7 +10041,6 @@ Rules:
             sources = []
 
         else:
-            # Run deterministic financial calculation first.
             financial_result = (
                 answer_financial_total_from_context(
                     query=clean_query,
@@ -10026,6 +10048,17 @@ Rules:
                     matched_rows=matched_rows
                 )
             )
+
+            numeric_result = None
+
+            if financial_result is None:
+                numeric_result = (
+                    answer_numeric_comparison_from_context(
+                        query=clean_query,
+                        context=context,
+                        matched_rows=matched_rows
+                    )
+                )
 
             if financial_result is not None:
                 answer = str(
@@ -10035,6 +10068,17 @@ Rules:
 
                 sources = (
                     financial_result.get("sources")
+                    or []
+                )
+
+            elif numeric_result is not None:
+                answer = str(
+                    numeric_result.get("answer")
+                    or FALLBACK_NO_DATA_ANSWER
+                ).strip()
+
+                sources = (
+                    numeric_result.get("sources")
                     or []
                 )
 
@@ -10093,6 +10137,20 @@ Rules:
             matched_rows=matched_rows
         )
 
+        # -----------------------------------------------------
+        # DETERMINISTIC NUMERIC COMPARISON
+        # -----------------------------------------------------
+        numeric_result = None
+
+        if financial_result is None:
+            numeric_result = (
+                answer_numeric_comparison_from_context(
+                    query=clean_query,
+                    context=context,
+                    matched_rows=matched_rows
+                )
+            )
+
         if financial_result is not None:
             answer = str(
                 financial_result.get("answer")
@@ -10101,6 +10159,17 @@ Rules:
 
             sources = (
                 financial_result.get("sources")
+                or []
+            )
+
+        elif numeric_result is not None:
+            answer = str(
+                numeric_result.get("answer")
+                or FALLBACK_NO_DATA_ANSWER
+            ).strip()
+
+            sources = (
+                numeric_result.get("sources")
                 or []
             )
 
@@ -10202,6 +10271,7 @@ Document context:
                     type(e).__name__,
                     str(e)
                 )
+
                 parsed = None
 
             if not parsed or not isinstance(parsed, dict):
@@ -10224,7 +10294,10 @@ Document context:
                     or []
                 )
 
-                if not isinstance(raw_used_sources, list):
+                if not isinstance(
+                    raw_used_sources,
+                    list
+                ):
                     raw_used_sources = []
 
                 if not answer:
@@ -10249,55 +10322,8 @@ Document context:
                         type(e).__name__,
                         str(e)
                     )
+
                     verified_rows = []
-
-                # OCR/table formatting can change punctuation and spacing.
-                # If exact quote verification fails, validate the answer
-                # against the selected source rows.
-                if not verified_rows:
-                    selected_rows = []
-
-                    for used_source in raw_used_sources:
-                        if not isinstance(used_source, dict):
-                            continue
-
-                        try:
-                            source_number = int(
-                                used_source.get("source_number")
-                            )
-                        except Exception:
-                            continue
-
-                        index = source_number - 1
-
-                        if 0 <= index < len(matched_rows):
-                            selected_rows.append(
-                                matched_rows[index]
-                            )
-
-                    supported_rows = []
-
-                    for row in selected_rows:
-                        try:
-                            supported = (
-                                validate_answer_supported_by_source(
-                                    query=clean_query,
-                                    answer=answer,
-                                    source_row=row
-                                )
-                            )
-
-                            if supported:
-                                supported_rows.append(row)
-
-                        except Exception as e:
-                            print(
-                                "SOURCE SUPPORT VALIDATION ERROR:",
-                                type(e).__name__,
-                                str(e)
-                            )
-
-                    verified_rows = supported_rows
 
                 if verified_rows:
                     sources = build_sources_from_asset_results(
@@ -10306,11 +10332,59 @@ Document context:
 
                 else:
                     print(
-                        "LOCAL CHAT SOURCE VERIFICATION FAILED"
+                        "LOCAL CHAT SOURCE QUOTE VERIFICATION FAILED: "
+                        "using selected source rows"
                     )
 
-                    answer = FALLBACK_NO_DATA_ANSWER
-                    sources = []
+                    selected_rows = []
+
+                    for used_source in raw_used_sources:
+                        if not isinstance(
+                            used_source,
+                            dict
+                        ):
+                            continue
+
+                        try:
+                            source_number = int(
+                                used_source.get(
+                                    "source_number"
+                                )
+                            )
+                        except Exception:
+                            continue
+
+                        selected_index = source_number - 1
+
+                        if (
+                            0
+                            <= selected_index
+                            < len(matched_rows)
+                        ):
+                            selected_row = matched_rows[
+                                selected_index
+                            ]
+
+                            if selected_row not in selected_rows:
+                                selected_rows.append(
+                                    selected_row
+                                )
+
+                    # Do not throw away a grounded answer because OCR,
+                    # punctuation or line spacing changed the evidence quote.
+                    if selected_rows:
+                        sources = build_sources_from_asset_results(
+                            selected_rows
+                        )
+
+                    elif matched_rows:
+                        sources = build_sources_from_asset_results(
+                            matched_rows[:1]
+                        )
+
+                    else:
+                        answer = FALLBACK_NO_DATA_ANSWER
+                        sources = []
 
             else:
                 answer = FALLBACK_NO_DATA_ANSWER
