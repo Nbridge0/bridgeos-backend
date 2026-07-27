@@ -12258,11 +12258,12 @@ def chat(
     Financial behaviour:
     - Searches every accessible processed document.
     - Does not stop after the first matching invoice.
-    - Keeps each contributing document separate.
-    - Passes every matching document to the financial calculation pipeline.
-    - Allows per-document calculations and combined totals.
+    - Keeps contributing documents separate.
+    - Passes all possible financial documents to the verified
+      financial extraction/calculation pipeline.
     - Does not combine different currencies.
-    - Does not hard-code products, suppliers, filenames, questions or amounts.
+    - Does not hard-code products, suppliers, filenames,
+      questions or monetary amounts.
     """
 
     clean_query = clean_text_for_postgres(
@@ -12289,7 +12290,7 @@ def chat(
     )
 
     # =========================================================
-    # LOCAL RESPONSE HELPERS
+    # RESPONSE HELPERS
     # =========================================================
 
     def unique_source_cards(
@@ -12314,6 +12315,7 @@ def chat(
 
             file_name = (
                 source.get("title")
+                or source.get("original_file_name")
                 or source.get("file_name")
                 or "Untitled document"
             )
@@ -12406,17 +12408,18 @@ def chat(
             "mode": mode
         }
 
+    # =========================================================
+    # GENERIC FINANCIAL HELPERS
+    # =========================================================
+
     def subject_terms(
         subject: str
     ) -> list[str]:
         """
-        Extracts meaningful terms from any requested financial subject.
+        Returns meaningful terms from any dynamically requested subject.
 
-        Examples:
-        - "the generator repairs" -> ["generator", "repairs"]
-        - "crew food" -> ["crew", "food"]
-
-        No product or question is hard-coded.
+        This is used only as a retrieval hint. Final matching and
+        financial verification happen later.
         """
 
         ignored_terms = {
@@ -12493,7 +12496,8 @@ def chat(
         document_text: str
     ) -> int:
         """
-        Scores how likely a document is to contain financial data.
+        Scores whether a document is likely to contain financial data.
+        This score is only a broad retrieval hint.
         """
 
         normalised_file_name = normalise_search_text(
@@ -12596,10 +12600,10 @@ def chat(
         asset: dict
     ) -> str:
         """
-        Builds one complete searchable financial-document context.
+        Builds complete financial-document text from the asset row.
 
-        Both normal extraction and OCR can be included, but duplicate OCR
-        text is not repeated.
+        Normal extracted text and OCR are both included when they are
+        not duplicates.
         """
 
         file_name = (
@@ -12611,17 +12615,17 @@ def chat(
         extracted_text = clean_text_for_postgres(
             asset.get("extracted_text")
             or ""
-        )
+        ).strip()
 
         ocr_text = clean_text_for_postgres(
             asset.get("ocr_text")
             or ""
-        )
+        ).strip()
 
         summary = clean_text_for_postgres(
             asset.get("summary")
             or ""
-        )
+        ).strip()
 
         parts = [
             f"File name: {file_name}"
@@ -12676,20 +12680,58 @@ def chat(
     def run_financial_answer(
         financial_context: str,
         financial_rows: list[dict]
-    ):
+    ) -> dict:
         """
-        Runs the existing generic financial extraction/calculation function
-        against every matched document.
+        Runs the verified financial pipeline against all retrieved documents.
+
+        During debugging, internal failures are returned clearly instead
+        of being silently changed into the generic no-data response.
         """
 
         if not financial_query:
-            return None
-
-        if not financial_context or not financial_rows:
             return {
                 "answer": FALLBACK_NO_DATA_ANSWER,
                 "sources": []
             }
+
+        if not financial_rows:
+            return {
+                "answer": (
+                    "No readable financial documents reached the "
+                    "calculation step."
+                ),
+                "sources": []
+            }
+
+        if not str(financial_context or "").strip():
+            return {
+                "answer": (
+                    "Financial documents were found, but their extracted "
+                    "text could not be assembled for calculation."
+                ),
+                "sources": build_sources_from_asset_results(
+                    financial_rows
+                )
+            }
+
+        print(
+            "RUNNING FINANCIAL ANSWER:",
+            {
+                "query": clean_query,
+                "document_count": len(financial_rows),
+                "documents": [
+                    (
+                        row.get("original_file_name")
+                        or row.get("file_name")
+                        or "Untitled document"
+                    )
+                    for row in financial_rows
+                ],
+                "context_characters": len(
+                    financial_context
+                )
+            }
+        )
 
         try:
             result = answer_financial_total_from_context(
@@ -12698,9 +12740,6 @@ def chat(
                 matched_rows=financial_rows
             )
 
-            if isinstance(result, dict):
-                return result
-
         except Exception as error:
             print(
                 "FINANCIAL ANSWER ERROR:",
@@ -12708,9 +12747,61 @@ def chat(
                 str(error)
             )
 
+            return {
+                "answer": (
+                    "Financial calculation failed inside the backend: "
+                    f"{type(error).__name__}: {str(error)}"
+                ),
+                "sources": build_sources_from_asset_results(
+                    financial_rows
+                )
+            }
+
+        if result is None:
+            return {
+                "answer": (
+                    "The request reached the financial pipeline, but "
+                    "the financial router returned no result."
+                ),
+                "sources": build_sources_from_asset_results(
+                    financial_rows
+                )
+            }
+
+        if not isinstance(result, dict):
+            return {
+                "answer": (
+                    "The financial calculation returned an invalid "
+                    "response type."
+                ),
+                "sources": build_sources_from_asset_results(
+                    financial_rows
+                )
+            }
+
+        answer = str(
+            result.get("answer") or ""
+        ).strip()
+
+        if not answer:
+            return {
+                "answer": (
+                    "The financial calculation completed but returned "
+                    "an empty answer."
+                ),
+                "sources": build_sources_from_asset_results(
+                    financial_rows
+                )
+            }
+
         return {
-            "answer": FALLBACK_NO_DATA_ANSWER,
-            "sources": []
+            "answer": answer,
+            "sources": (
+                result.get("sources")
+                or build_sources_from_asset_results(
+                    financial_rows
+                )
+            )
         }
 
     # =========================================================
@@ -12743,8 +12834,6 @@ def chat(
             str(error)
         )
 
-        # Fallback for databases where uploaded_asset_id
-        # has not been added to messages.
         try:
             user_payload.pop(
                 "uploaded_asset_id",
@@ -12785,7 +12874,7 @@ def chat(
             )
 
     # =========================================================
-    # CLASSIFICATION
+    # QUERY CLASSIFICATION
     # =========================================================
 
     try:
@@ -12829,7 +12918,7 @@ def chat(
             answer_depth = "focused"
 
     # =========================================================
-    # EXTRACT FINANCIAL SUBJECTS
+    # EXTRACT DYNAMIC FINANCIAL SUBJECTS
     # =========================================================
 
     requested_financial_subjects = []
@@ -12917,13 +13006,14 @@ def chat(
             "scope": query_scope,
             "financial_query": financial_query,
             "financial_subjects": requested_financial_subjects,
+            "financial_subject_groups": requested_subject_groups,
             "answer_depth": answer_depth,
             "uploaded_asset_id": uploaded_asset_id
         }
     )
 
     # =========================================================
-    # CONVERSATIONAL ANSWER
+    # CONVERSATIONAL REQUESTS
     # =========================================================
 
     if (
@@ -13019,22 +13109,19 @@ Rules:
 
         if financial_query:
             financial_asset_rows = []
-            seen_asset_ids = set()
+            grouped_uploaded_rows = {}
 
             for row in matched_rows:
-                asset_id = row.get(
-                    "asset_id"
-                )
+                asset_id = row.get("asset_id")
 
                 if not asset_id:
                     continue
 
-                if asset_id in seen_asset_ids:
-                    continue
-
-                seen_asset_ids.add(
-                    asset_id
-                )
+                if asset_id not in grouped_uploaded_rows:
+                    grouped_uploaded_rows[asset_id] = {
+                        "base_row": row,
+                        "parts": []
+                    }
 
                 row_text = str(
                     row.get("search_text")
@@ -13042,11 +13129,28 @@ Rules:
                     or ""
                 ).strip()
 
+                if row_text:
+                    grouped_uploaded_rows[
+                        asset_id
+                    ]["parts"].append(row_text)
+
+            for asset_id, grouped in grouped_uploaded_rows.items():
+                base_row = grouped["base_row"]
+
+                document_text = "\n\n".join(
+                    grouped["parts"]
+                ).strip()
+
+                if not document_text:
+                    continue
+
                 financial_asset_rows.append({
-                    **row,
-                    "content": row_text,
-                    "search_text": row_text,
-                    "content_type": "financial_document"
+                    **base_row,
+                    "asset_id": asset_id,
+                    "content": document_text,
+                    "search_text": document_text,
+                    "content_type": "financial_document",
+                    "chunk_index": 0
                 })
 
             financial_context = (
@@ -13061,15 +13165,6 @@ Rules:
                 financial_context=financial_context,
                 financial_rows=financial_asset_rows
             )
-
-            if not isinstance(
-                financial_result,
-                dict
-            ):
-                financial_result = {
-                    "answer": FALLBACK_NO_DATA_ANSWER,
-                    "sources": []
-                }
 
             return finish(
                 final_answer=financial_result.get(
@@ -13220,9 +13315,6 @@ Rules:
 
     if financial_query:
         try:
-            # Important:
-            # There is no limit(1), no [:1], and no first-document return.
-            # Every accessible processed asset is loaded.
             assets_result = (
                 supabase.table("assets")
                 .select("""
@@ -13257,19 +13349,17 @@ Rules:
 
             assets_result = None
 
-        financial_rows = []
-        seen_financial_assets = set()
-
         all_loaded_assets = (
             assets_result.data
             if assets_result
             else []
         ) or []
 
+        financial_rows = []
+        seen_financial_assets = set()
+
         for asset in all_loaded_assets:
-            asset_id = asset.get(
-                "id"
-            )
+            asset_id = asset.get("id")
 
             if not asset_id:
                 continue
@@ -13304,18 +13394,22 @@ Rules:
             matched_subjects = []
 
             for group in requested_subject_groups:
-                terms = group[
-                    "terms"
-                ]
+                terms = group.get("terms") or []
 
-                # A document only needs to contain one requested subject.
-                # It does not need to match every requested subject.
-                if all(
-                    term in normalised_document
+                if not terms:
+                    continue
+
+                matched_term_count = sum(
+                    1
                     for term in terms
-                ):
+                    if term in normalised_document
+                )
+
+                # This is only a broad retrieval hint.
+                # Final subject and evidence verification happen later.
+                if matched_term_count > 0:
                     matched_subjects.append(
-                        group["subject"]
+                        group.get("subject") or ""
                     )
 
             document_score = financial_document_score(
@@ -13323,15 +13417,16 @@ Rules:
                 document_text=document_text
             )
 
-            if requested_subject_groups:
-                include_document = bool(
-                    matched_subjects
-                )
-
-            else:
-                include_document = (
-                    document_score >= 1
-                )
+            # IMPORTANT:
+            # Do not require every subject term to occur in the document.
+            #
+            # Include a document when it looks financial OR contains
+            # at least one subject term. The later extraction function
+            # decides whether an actual matching financial row exists.
+            include_document = bool(
+                document_score >= 1
+                or matched_subjects
+            )
 
             print(
                 "FINANCIAL ASSET FILTER:",
@@ -13350,18 +13445,27 @@ Rules:
             if not include_document:
                 continue
 
+            print(
+                "FINANCIAL DOCUMENT INCLUDED:",
+                {
+                    "asset_id": asset_id,
+                    "file_name": file_name,
+                    "financial_score": document_score,
+                    "matched_subjects": matched_subjects,
+                    "characters": len(
+                        document_text
+                    )
+                }
+            )
+
             seen_financial_assets.add(
                 asset_id
             )
 
             financial_rows.append({
                 "asset_id": asset_id,
-                "yacht_id": asset.get(
-                    "yacht_id"
-                ),
-                "chat_id": asset.get(
-                    "chat_id"
-                ),
+                "yacht_id": asset.get("yacht_id"),
+                "chat_id": asset.get("chat_id"),
                 "security_level": asset.get(
                     "security_level"
                 ),
@@ -13378,20 +13482,15 @@ Rules:
                             subject
                         )
                         for subject in matched_subjects
+                        if subject
                     ]
                 ],
-                "file_name": asset.get(
-                    "file_name"
-                ),
+                "file_name": asset.get("file_name"),
                 "original_file_name": asset.get(
                     "original_file_name"
                 ),
-                "file_type": asset.get(
-                    "file_type"
-                ),
-                "mime_type": asset.get(
-                    "mime_type"
-                )
+                "file_type": asset.get("file_type"),
+                "mime_type": asset.get("mime_type")
             })
 
         financial_context = (
@@ -13424,27 +13523,25 @@ Rules:
             }
         )
 
-        if not financial_context:
-            if requested_financial_subjects:
-                missing_text = ", ".join(
-                    requested_financial_subjects
-                )
-
-                no_context_answer = (
-                    "I could not find a processed financial "
-                    "document containing: "
-                    f"{missing_text}."
-                )
-
-            else:
-                no_context_answer = (
-                    "I could not find a processed financial "
-                    "document with a verifiable total."
-                )
-
+        if not financial_rows:
             return finish(
-                final_answer=no_context_answer,
+                final_answer=(
+                    "No readable financial documents reached the "
+                    "calculation step."
+                ),
                 final_sources=[],
+                mode="document_qa"
+            )
+
+        if not financial_context:
+            return finish(
+                final_answer=(
+                    "Financial documents were found, but their extracted "
+                    "text could not be assembled for calculation."
+                ),
+                final_sources=build_sources_from_asset_results(
+                    financial_rows
+                ),
                 mode="document_qa"
             )
 
@@ -13453,17 +13550,8 @@ Rules:
             financial_rows=financial_rows
         )
 
-        if not isinstance(
-            financial_result,
-            dict
-        ):
-            financial_result = {
-                "answer": FALLBACK_NO_DATA_ANSWER,
-                "sources": []
-            }
-
-        # Financial queries stop here.
-        # They cannot fall through to the generic document-answer path.
+        # Financial queries always stop here.
+        # They must not fall through to generic document answering.
         return finish(
             final_answer=financial_result.get(
                 "answer"
@@ -13554,9 +13642,7 @@ Rules:
                     row.get("content_type")
                 )
 
-                matched_rows_by_key[
-                    key
-                ] = row
+                matched_rows_by_key[key] = row
 
         except Exception as error:
             print(
@@ -13584,9 +13670,7 @@ Rules:
         except Exception:
             filters = {}
 
-        year_filter = filters.get(
-            "year"
-        )
+        year_filter = filters.get("year")
 
         try:
             keyword_rows = (
@@ -13608,9 +13692,7 @@ Rules:
                 )
 
                 if key not in matched_rows_by_key:
-                    matched_rows_by_key[
-                        key
-                    ] = row
+                    matched_rows_by_key[key] = row
 
         except Exception as error:
             print(
@@ -13650,9 +13732,7 @@ Rules:
                     )
 
                     if key not in matched_rows_by_key:
-                        matched_rows_by_key[
-                            key
-                        ] = row
+                        matched_rows_by_key[key] = row
 
             else:
                 print(
