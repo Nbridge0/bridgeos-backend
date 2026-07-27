@@ -17,9 +17,9 @@ _openai_client = None
 
 def get_openai_client() -> OpenAI:
     """
-    Creates and reuses one OpenAI client.
+    Return one reusable OpenAI client.
 
-    The API key is read from the backend environment through app.config.
+    This function does not use RunPod and has no RunPod fallback.
     """
 
     global _openai_client
@@ -39,52 +39,6 @@ def get_openai_client() -> OpenAI:
     return _openai_client
 
 
-def extract_openai_response_text(response) -> str:
-    """
-    Extracts the final text from an OpenAI Responses API response.
-    """
-
-    direct_text = getattr(
-        response,
-        "output_text",
-        None
-    )
-
-    if direct_text:
-        return str(direct_text).strip()
-
-    text_parts = []
-
-    output_items = getattr(
-        response,
-        "output",
-        None
-    ) or []
-
-    for output_item in output_items:
-        content_items = getattr(
-            output_item,
-            "content",
-            None
-        ) or []
-
-        for content_item in content_items:
-            content_text = getattr(
-                content_item,
-                "text",
-                None
-            )
-
-            if content_text:
-                text_parts.append(
-                    str(content_text)
-                )
-
-    return "\n".join(
-        text_parts
-    ).strip()
-
-
 def ask_llm(
     query: str,
     context: str = ""
@@ -92,23 +46,12 @@ def ask_llm(
     """
     Main BridgeOS language-model function.
 
-    Existing code can continue calling:
-
-        ask_llm(
-            query=query,
-            context=context
-        )
-
-    No services.py call sites need to change.
+    Every existing call to ask_llm() in services.py will use OpenAI.
+    There is deliberately no RunPod fallback in this function.
     """
 
-    clean_query = str(
-        query or ""
-    ).strip()
-
-    clean_context = str(
-        context or ""
-    ).strip()
+    clean_query = str(query or "").strip()
+    clean_context = str(context or "").strip()
 
     if not clean_query:
         return ""
@@ -118,19 +61,15 @@ def ask_llm(
     system_instructions = """
 You are BridgeOS, a private document-based assistant.
 
-Follow the instructions contained in the supplied context.
-
 Rules:
-- Use British English unless the requested format requires otherwise.
-- When document context is supplied, use only that document context
-  for factual answers.
-- Do not invent facts, names, numbers, dates, sources, values or events.
-- When asked to return JSON, return valid JSON only.
+- Use British English.
+- Follow the instructions supplied in the context.
+- When document context is supplied, use only that context.
+- Do not invent facts, names, dates, numbers, currencies or sources.
+- When JSON is requested, return valid JSON only.
 - Do not wrap JSON in markdown code fences.
-- Preserve monetary values, decimal separators, quantities and currencies.
-- Do not perform approximate arithmetic when exact values are available.
-- Follow the requested output structure exactly.
-- Return only the requested answer or structured result.
+- Preserve values from documents exactly.
+- Return only the requested result.
 """.strip()
 
     if clean_context:
@@ -141,9 +80,18 @@ Instructions and document context:
 User request:
 {clean_query}
 """.strip()
-
     else:
         user_input = clean_query
+
+    print(
+        "OPENAI REQUEST START:",
+        {
+            "provider": "openai",
+            "model": OPENAI_CHAT_MODEL,
+            "query_characters": len(clean_query),
+            "context_characters": len(clean_context)
+        }
+    )
 
     try:
         response = client.responses.create(
@@ -152,41 +100,40 @@ User request:
             input=user_input
         )
 
-        answer = extract_openai_response_text(
-            response
-        )
+        answer = str(
+            response.output_text or ""
+        ).strip()
 
         print(
-            "OPENAI LLM RESPONSE:",
+            "OPENAI REQUEST SUCCESS:",
             {
+                "provider": "openai",
                 "model": OPENAI_CHAT_MODEL,
-                "query_characters": len(
-                    clean_query
+                "response_id": getattr(
+                    response,
+                    "id",
+                    None
                 ),
-                "context_characters": len(
-                    clean_context
-                ),
-                "answer_characters": len(
-                    answer
-                )
+                "answer_characters": len(answer)
             }
         )
+
+        if not answer:
+            raise RuntimeError(
+                "OpenAI returned an empty response."
+            )
 
         return answer
 
     except Exception as error:
         print(
-            "OPENAI LLM ERROR:",
+            "OPENAI REQUEST FAILED:",
             {
+                "provider": "openai",
                 "model": OPENAI_CHAT_MODEL,
-                "error_type": type(
-                    error
-                ).__name__,
+                "error_type": type(error).__name__,
                 "error": str(error)
             }
         )
 
-        raise RuntimeError(
-            "OpenAI generation failed: "
-            f"{type(error).__name__}: {str(error)}"
-        ) from error
+        raise

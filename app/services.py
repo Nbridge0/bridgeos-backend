@@ -12,7 +12,8 @@ from app.config import (
     RUNPOD_BASE_URL,
     BRIDGEOS_API_KEY,
     API_SYNC_TIMEOUT_SECONDS,
-    GMAIL_SYNC_MAX_RESULTS
+    GMAIL_SYNC_MAX_RESULTS,
+    OPENAI_CHAT_MODEL
 )
 from app.llm import ask_llm, FALLBACK_NO_DATA_ANSWER
 from app.file_utils import detect_file_type, calculate_file_hash, safe_filename
