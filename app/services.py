@@ -8948,51 +8948,18 @@ def format_currency_amount(
 
     return f"{amount:,.2f} {currency}".strip()
 
-def is_financial_total_query(query: str) -> bool:
-    clean_query = " ".join(
-        str(query or "").strip().lower().split()
-    )
-
-    phrases = [
-        "how much did we spend",
-        "how much have we spent",
-        "how much we spent",
-        "how much was spent",
-        "what did we spend",
-        "what have we spent",
-        "what was spent",
-        "total spent",
-        "total spend",
-        "total spending",
-        "total cost",
-        "total costs",
-        "total amount",
-        "total price",
-        "grand total",
-        "invoice total",
-        "amount paid",
-        "amount due",
-        "balance due",
-        "sum of",
-        "add up",
-        "calculate the total",
-        "calculate total"
-    ]
-
-    return any(
-        phrase in clean_query
-        for phrase in phrases
-    )
 
 def extract_spending_subject(query: str) -> str:
     """
-    Uses the LLM to determine whether the user is asking for spending
-    on a specific subject and extracts that subject generically.
+    Extracts the object/category whose monetary amount is requested.
 
-    No hard-coded question wording.
+    It first asks the LLM. If the LLM response is invalid, it applies
+    a generic language cleanup. No product or supplier is hard-coded.
     """
 
-    clean_query = str(query or "").strip()
+    clean_query = " ".join(
+        str(query or "").strip().split()
+    )
 
     if not clean_query:
         return ""
@@ -9001,13 +8968,13 @@ def extract_spending_subject(query: str) -> str:
         raw = ask_llm(
             query=clean_query,
             context="""
-Classify the user's request.
+Extract the subject whose monetary amount the user wants.
 
-Return ONLY valid JSON in this exact shape:
+Return only valid JSON:
 
 {
   "is_specific_spending_question": true,
-  "subject": "requested item or category"
+  "subject": "subject"
 }
 
 or:
@@ -9017,44 +8984,95 @@ or:
   "subject": ""
 }
 
-Definitions:
-- A specific spending question asks for the monetary amount spent,
-  paid, charged, purchased, billed, or incurred for a particular
-  item, service, category, person, supplier, project, or purpose.
-- The subject is only the thing whose cost the user wants.
-- Remove generic words such as total, money, amount, cost, spending,
-  spent, paid, invoice, purchase, and in total.
-- Preserve the user's actual subject.
-- Do not answer the question.
-- Do not calculate anything.
-- Do not invent a subject.
+Rules:
+- The subject can be any item, service, supplier, category,
+  project, person, department or purpose.
+- Remove request language such as how much, spend, spent,
+  money, total, amount, cost, paid, charged, billed,
+  purchased, invoice and in total.
+- Preserve the actual requested subject.
+- Do not answer.
 - Return JSON only.
 """.strip()
         )
 
         parsed = parse_llm_json_response(raw)
 
-        if not parsed or not isinstance(parsed, dict):
-            return ""
+        if (
+            isinstance(parsed, dict)
+            and parsed.get("is_specific_spending_question")
+        ):
+            subject = str(
+                parsed.get("subject") or ""
+            ).strip(" .?!,;:")
 
-        if not bool(parsed.get("is_specific_spending_question")):
-            return ""
-
-        subject = str(
-            parsed.get("subject")
-            or ""
-        ).strip(" .?!,;:")
-
-        return subject
+            if subject:
+                return subject
 
     except Exception as e:
         print(
-            "SPENDING SUBJECT CLASSIFICATION ERROR:",
+            "SPENDING SUBJECT LLM ERROR:",
             type(e).__name__,
             str(e)
         )
 
-        return ""
+    # -----------------------------------------------------
+    # GENERIC DETERMINISTIC FALLBACK
+    # -----------------------------------------------------
+    fallback = clean_query.lower()
+
+    removable_patterns = [
+        r"\bhow much\b",
+        r"\bwhat amount\b",
+        r"\bwhat was the amount\b",
+        r"\bwhat is the amount\b",
+        r"\bdid we\b",
+        r"\bhave we\b",
+        r"\bwas\b",
+        r"\bwere\b",
+        r"\bdo we\b",
+        r"\bspend\b",
+        r"\bspent\b",
+        r"\bspending\b",
+        r"\bpay\b",
+        r"\bpaid\b",
+        r"\bcharged\b",
+        r"\bbilled\b",
+        r"\bpurchased\b",
+        r"\bcost\b",
+        r"\bcosts\b",
+        r"\bmoney\b",
+        r"\bamount\b",
+        r"\btotal\b",
+        r"\bin total\b",
+        r"\boverall\b",
+        r"\baltogether\b",
+        r"\bon\b",
+        r"\bfor\b",
+        r"\bthe\b",
+    ]
+
+    for pattern in removable_patterns:
+        fallback = re.sub(
+            pattern,
+            " ",
+            fallback,
+            flags=re.IGNORECASE
+        )
+
+    fallback = re.sub(
+        r"[^a-zA-Z0-9&'/-]+",
+        " ",
+        fallback
+    )
+
+    fallback = re.sub(
+        r"\s+",
+        " ",
+        fallback
+    ).strip()
+
+    return fallback
     
 def extract_subject_line_items_with_llm(
     query: str,
@@ -9335,75 +9353,87 @@ Document sources:
 
 def is_financial_total_query(query: str) -> bool:
     """
-    Generic financial-calculation intent classifier.
+    Detects a request for monetary arithmetic.
 
-    No hard-coded question phrases.
+    This does not hard-code any item, supplier, invoice name,
+    category, project or exact user question.
     """
 
-    clean_query = str(query or "").strip()
+    clean = normalise_search_text(query)
 
-    if not clean_query:
+    if not clean:
         return False
 
-    try:
-        raw = ask_llm(
-            query=clean_query,
-            context="""
-Classify whether the user is requesting a monetary calculation from documents.
+    words = set(clean.split())
 
-Return ONLY valid JSON:
+    monetary_words = {
+        "spend",
+        "spent",
+        "spending",
+        "cost",
+        "costs",
+        "costing",
+        "price",
+        "prices",
+        "paid",
+        "pay",
+        "payment",
+        "payments",
+        "charged",
+        "charge",
+        "charges",
+        "billed",
+        "billing",
+        "amount",
+        "amounts",
+        "money",
+        "total",
+        "totals",
+        "invoice",
+        "invoices",
+        "purchase",
+        "purchased",
+        "purchases",
+        "owed",
+        "owing",
+        "due",
+    }
 
-{
-  "is_financial_calculation": true
-}
+    calculation_words = {
+        "how",
+        "much",
+        "total",
+        "totals",
+        "sum",
+        "add",
+        "combined",
+        "combine",
+        "calculate",
+        "calculation",
+        "altogether",
+        "overall",
+        "aggregate",
+    }
 
-or:
+    has_monetary_intent = bool(
+        words.intersection(monetary_words)
+    )
 
-{
-  "is_financial_calculation": false
-}
+    has_calculation_intent = bool(
+        words.intersection(calculation_words)
+    )
 
-A financial calculation includes requests to:
-- add monetary values
-- calculate spending or costs
-- calculate invoice totals
-- calculate line-item costs
-- calculate amounts paid, charged, owed, due, purchased, or billed
-- calculate a monetary value for a category, item, supplier, project,
-  date range, person, department, or purpose
+    # Phrases such as "how much" are also financial calculation
+    # requests when accompanied by a monetary/spending term.
+    has_how_much = "how much" in clean
 
-It does not include:
-- asking what a document says without requesting arithmetic
-- asking to list files
-- general conversation
-- non-monetary numeric comparisons
-
-Rules:
-- Classify intent only.
-- Do not answer.
-- Do not calculate.
-- Do not use outside knowledge.
-- Return JSON only.
-""".strip()
+    return (
+        has_monetary_intent
+        and (
+            has_calculation_intent
+            or has_how_much
         )
-
-        parsed = parse_llm_json_response(raw)
-
-        if not parsed or not isinstance(parsed, dict):
-            return False
-
-        return bool(
-            parsed.get("is_financial_calculation")
-        )
-
-    except Exception as e:
-        print(
-            "FINANCIAL QUERY CLASSIFICATION ERROR:",
-            type(e).__name__,
-            str(e)
-        )
-
-        return False
+    )
 
 def parse_general_decimal(
     raw_value: str
@@ -10241,17 +10271,24 @@ def chat(
 
     Behaviour:
     - Uses only documents accessible to the current crew member.
-    - Uses an uploaded chat file only when its asset ID is supplied.
-    - Searches Yacht Documentation for normal document questions.
-    - Loads financial documents directly for spending and total questions.
-    - Uses deterministic Decimal calculations for financial totals.
-    - Uses deterministic Python comparisons for numeric comparison questions.
-    - Never combines different currencies.
-    - Returns the no-data fallback rather than inventing information.
+    - Handles explicitly uploaded chat files.
+    - Searches Yacht Documentation for normal questions.
+    - Loads complete processed documents for financial calculations.
+    - Does not require an invoice grand total for line-item calculations.
+    - Calculates quantity x unit price using Decimal.
+    - Combines matching line items across multiple documents.
+    - Never combines conflicting currencies.
+    - Uses keyword retrieval even when semantic embedding search fails.
     """
 
     clean_query = str(query or "").strip()
     security_level = int(security_level)
+
+    if not clean_query:
+        raise HTTPException(
+            status_code=400,
+            detail="Query is required"
+        )
 
     chat_row = verify_chat_access(
         chat_id=chat_id,
@@ -10259,9 +10296,9 @@ def chat(
         yacht_id=yacht_id
     )
 
-    # ---------------------------------------------------------
+    # =========================================================
     # SAVE USER MESSAGE
-    # ---------------------------------------------------------
+    # =========================================================
     try:
         supabase.table("messages").insert({
             "chat_id": chat_id,
@@ -10275,7 +10312,7 @@ def chat(
 
     except Exception as e:
         print(
-            "USER MESSAGE INSERT WITH UPLOADED ASSET FAILED:",
+            "USER MESSAGE INSERT WITH ASSET ERROR:",
             type(e).__name__,
             str(e)
         )
@@ -10292,14 +10329,14 @@ def chat(
 
         except Exception as second_error:
             print(
-                "USER MESSAGE FALLBACK INSERT FAILED:",
+                "USER MESSAGE FALLBACK INSERT ERROR:",
                 type(second_error).__name__,
                 str(second_error)
             )
 
-    # ---------------------------------------------------------
+    # =========================================================
     # UPDATE DEFAULT CHAT TITLE
-    # ---------------------------------------------------------
+    # =========================================================
     if chat_row.get("title") == "New Chat":
         try:
             supabase.table("chats").update({
@@ -10340,19 +10377,30 @@ def chat(
         )
 
     print(
-        "LOCAL CHAT DEBUG: answer_depth:",
-        answer_depth
+        "LOCAL CHAT DEBUG:",
+        {
+            "query": clean_query,
+            "query_scope": query_scope,
+            "financial_query": financial_query,
+            "answer_depth": answer_depth,
+            "uploaded_asset_id": uploaded_asset_id
+        }
     )
 
-    print(
-        "LOCAL CHAT DEBUG: financial_query:",
-        financial_query
-    )
+    is_followup_query = False
 
-    is_followup_query = is_contextual_followup_query(
-        query=clean_query,
-        chat_id=chat_id
-    )
+    try:
+        is_followup_query = is_contextual_followup_query(
+            query=clean_query,
+            chat_id=chat_id
+        )
+
+    except Exception as e:
+        print(
+            "FOLLOW-UP CHECK ERROR:",
+            type(e).__name__,
+            str(e)
+        )
 
     previous_source_asset_ids = []
 
@@ -10367,21 +10415,34 @@ def chat(
 
     resolved_uploaded_asset_id = uploaded_asset_id
 
-    # ---------------------------------------------------------
-    # SAVE ASSISTANT RESPONSE
-    # ---------------------------------------------------------
+    # =========================================================
+    # SAVE ASSISTANT RESPONSE HELPER
+    # =========================================================
     def save_assistant_response(
         final_answer: str,
         final_sources: list[dict]
     ):
+        safe_answer = str(
+            final_answer or FALLBACK_NO_DATA_ANSWER
+        ).strip()
+
+        safe_sources = (
+            final_sources
+            if isinstance(final_sources, list)
+            else []
+        )
+
+        if safe_answer == FALLBACK_NO_DATA_ANSWER:
+            safe_sources = []
+
         try:
             supabase.table("messages").insert({
                 "chat_id": chat_id,
                 "yacht_id": yacht_id,
                 "crew_id": crew_id,
                 "role": "assistant",
-                "content": final_answer,
-                "sources": final_sources
+                "content": safe_answer,
+                "sources": safe_sources
             }).execute()
 
         except Exception as e:
@@ -10402,14 +10463,14 @@ def chat(
 
         except Exception as e:
             print(
-                "CHAT UPDATE ERROR:",
+                "CHAT TIMESTAMP UPDATE ERROR:",
                 type(e).__name__,
                 str(e)
             )
 
-    # ---------------------------------------------------------
+    # =========================================================
     # CONVERSATIONAL MODE
-    # ---------------------------------------------------------
+    # =========================================================
     if (
         query_scope == "conversational"
         and not resolved_uploaded_asset_id
@@ -10420,23 +10481,20 @@ def chat(
                 context="""
 You are BridgeOS, a helpful private document assistant.
 
-The user message is conversational or asks how to use the assistant.
+The user's message is conversational or asks how to use the assistant.
 
 Rules:
 - Reply briefly and naturally.
-- You may explain that you can search uploaded documents.
-- Do not answer factual, technical, operational, financial, legal,
-  medical, recommendation, or outside-knowledge questions without documents.
-- Do not invent document data.
-- Do not claim that a document was used.
+- Explain that BridgeOS can search uploaded documents when relevant.
+- Do not answer factual, operational, financial, legal, medical,
+  technical or recommendation questions without document evidence.
+- Do not invent document information.
 - Use British English.
 - Return plain text only.
 """.strip()
             )
 
-            answer = str(
-                raw_answer or ""
-            ).strip()
+            answer = str(raw_answer or "").strip()
 
         except Exception as e:
             print(
@@ -10464,16 +10522,16 @@ Rules:
             "mode": "conversational"
         }
 
-    # ---------------------------------------------------------
+    # =========================================================
     # DOCUMENT RETRIEVAL
-    # ---------------------------------------------------------
+    # =========================================================
     try:
         # =====================================================
-        # EXPLICIT CHAT-UPLOADED FILE
+        # EXPLICITLY UPLOADED CHAT FILE
         # =====================================================
         if resolved_uploaded_asset_id:
             print(
-                "LOCAL CHAT DEBUG: using explicit uploaded asset:",
+                "LOCAL CHAT DEBUG: explicit uploaded asset:",
                 resolved_uploaded_asset_id
             )
 
@@ -10489,14 +10547,9 @@ Rules:
                 matched_rows
             )
 
-            if matched_rows:
-                # Always answer from the original document rows.
-                # Do not replace document text with an LLM-generated summary.
-                context = build_context_from_asset_results(
-                    matched_rows
-                )
-            else:
-                context = ""
+            context = build_context_from_asset_results(
+                matched_rows
+            )
 
         # =====================================================
         # YACHT DOCUMENTATION
@@ -10520,9 +10573,9 @@ Rules:
                         .execute()
 
                     allowed_asset_ids = [
-                        asset["id"]
-                        for asset in (assets_res.data or [])
-                        if asset.get("id")
+                        row["id"]
+                        for row in (assets_res.data or [])
+                        if row.get("id")
                     ]
 
                 except Exception as e:
@@ -10532,10 +10585,9 @@ Rules:
                         str(e)
                     )
 
-                    allowed_asset_ids = []
-
-            # Normal follow-up questions prefer the previous source.
-            # Financial questions must inspect every accessible invoice.
+            # Follow-up questions may stay inside the document used
+            # in the previous answer. Financial calculations must inspect
+            # every accessible processed document.
             if (
                 previous_source_asset_ids
                 and not financial_query
@@ -10549,277 +10601,407 @@ Rules:
                 if restricted_ids:
                     allowed_asset_ids = restricted_ids
 
-                print(
-                    "LOCAL CHAT DEBUG: follow-up allowed_asset_ids:",
-                    allowed_asset_ids
-                )
-
             print(
-                "LOCAL CHAT DEBUG: allowed_asset_ids:",
-                allowed_asset_ids
+                "LOCAL CHAT DEBUG: allowed assets:",
+                len(allowed_asset_ids)
             )
 
-            if allowed_asset_ids:
-                # -------------------------------------------------
-                # FINANCIAL DIRECT RETRIEVAL
-                # -------------------------------------------------
-                if financial_query:
-                    try:
-                        financial_assets_res = (
-                            supabase.table("assets")
-                            .select("""
-                                id,
-                                yacht_id,
-                                chat_id,
-                                security_level,
-                                file_name,
-                                original_file_name,
-                                file_type,
-                                mime_type,
-                                extracted_text,
-                                ocr_text,
-                                summary,
-                                processing_status,
-                                processing_error
-                            """)
-                            .eq("yacht_id", yacht_id)
-                            .in_("id", allowed_asset_ids)
-                            .eq("processing_status", "processed")
-                            .execute()
-                        )
+            if not allowed_asset_ids:
+                matched_rows = []
+                context = ""
 
-                        direct_financial_rows = []
+            # =================================================
+            # FINANCIAL DOCUMENT RETRIEVAL
+            # =================================================
+            elif financial_query:
+                try:
+                    financial_assets_res = (
+                        supabase.table("assets")
+                        .select("""
+                            id,
+                            yacht_id,
+                            chat_id,
+                            security_level,
+                            file_name,
+                            original_file_name,
+                            file_type,
+                            mime_type,
+                            extracted_text,
+                            ocr_text,
+                            summary,
+                            processing_status,
+                            processing_error
+                        """)
+                        .eq("yacht_id", yacht_id)
+                        .in_("id", allowed_asset_ids)
+                        .eq("processing_status", "processed")
+                        .execute()
+                    )
 
-                        for asset in financial_assets_res.data or []:
-                            extracted_text = str(
+                    direct_financial_rows = []
+
+                    for asset in financial_assets_res.data or []:
+                        extracted_text = clean_text_for_postgres(
+                            str(
                                 asset.get("extracted_text")
                                 or ""
-                            ).strip()
+                            )
+                        ).strip()
 
-                            ocr_text = str(
+                        ocr_text = clean_text_for_postgres(
+                            str(
                                 asset.get("ocr_text")
                                 or ""
-                            ).strip()
+                            )
+                        ).strip()
 
-                            summary = str(
+                        summary = clean_text_for_postgres(
+                            str(
                                 asset.get("summary")
                                 or ""
-                            ).strip()
+                            )
+                        ).strip()
 
-                            file_name = (
-                                asset.get("original_file_name")
-                                or asset.get("file_name")
-                                or ""
+                        file_name = (
+                            asset.get("original_file_name")
+                            or asset.get("file_name")
+                            or "Untitled document"
+                        )
+
+                        # -----------------------------------------
+                        # COMPLETE SEARCHABLE DOCUMENT
+                        # -----------------------------------------
+                        # This is used for line-item/category questions.
+                        # It does not require a grand-total label.
+                        document_parts = [
+                            f"File name: {file_name}",
+                            (
+                                "File type: "
+                                f"{asset.get('file_type') or ''}"
+                            )
+                        ]
+
+                        if extracted_text:
+                            document_parts.append(
+                                "Extracted document text:\n"
+                                + extracted_text
                             )
 
-                            # Used to search for the subject requested by the
-                            # user, such as beef, fuel, vegetables or repairs.
-                            searchable_document_text = "\n\n".join([
-                                f"File name: {file_name}",
-                                extracted_text,
-                                ocr_text,
-                                summary
-                            ]).strip()
+                        normalised_extracted = (
+                            normalise_search_text(
+                                extracted_text
+                            )
+                        )
 
-                            # Used only for safely reading one final total.
-                            financial_document_text = ""
-                            selected_total = None
+                        normalised_ocr = (
+                            normalise_search_text(
+                                ocr_text
+                            )
+                        )
 
-                            candidate_texts = []
+                        # Avoid including the same OCR text twice.
+                        if (
+                            ocr_text
+                            and normalised_ocr
+                            and normalised_ocr
+                            not in normalised_extracted
+                        ):
+                            document_parts.append(
+                                "OCR document text:\n"
+                                + ocr_text
+                            )
 
-                            if extracted_text:
-                                candidate_texts.append({
-                                    "type": "extracted_text",
-                                    "text": extracted_text
-                                })
+                        # Summary is only a fallback when full document
+                        # extraction did not produce readable text.
+                        if (
+                            not extracted_text
+                            and not ocr_text
+                            and summary
+                        ):
+                            document_parts.append(
+                                "Document summary:\n"
+                                + summary
+                            )
 
-                            if ocr_text:
-                                candidate_texts.append({
-                                    "type": "ocr_text",
-                                    "text": ocr_text
-                                })
+                        searchable_document_text = "\n\n".join(
+                            part
+                            for part in document_parts
+                            if str(part or "").strip()
+                        ).strip()
 
-                            if summary:
-                                candidate_texts.append({
-                                    "type": "summary",
-                                    "text": summary
-                                })
+                        if not searchable_document_text:
+                            print(
+                                "FINANCIAL DOCUMENT SKIPPED:",
+                                {
+                                    "file_name": file_name,
+                                    "reason": "No readable text"
+                                }
+                            )
+                            continue
 
-                            for candidate_source in candidate_texts:
-                                candidate_text = candidate_source[
-                                    "text"
-                                ]
+                        # -----------------------------------------
+                        # OPTIONAL AUTHORITATIVE FINAL-TOTAL TEXT
+                        # -----------------------------------------
+                        # Whole-invoice total questions can use a labelled
+                        # final total. Line-item questions do not require it.
+                        financial_document_text = ""
 
-                                total_candidates = (
-                                    extract_invoice_total_candidates(
-                                        document_text=candidate_text
-                                    )
+                        candidate_texts = []
+
+                        if extracted_text:
+                            candidate_texts.append({
+                                "source_type": "extracted_text",
+                                "text": extracted_text
+                            })
+
+                        if (
+                            ocr_text
+                            and normalised_ocr
+                            != normalised_extracted
+                        ):
+                            candidate_texts.append({
+                                "source_type": "ocr_text",
+                                "text": ocr_text
+                            })
+
+                        for candidate_source in candidate_texts:
+                            candidate_text = str(
+                                candidate_source.get("text")
+                                or ""
+                            ).strip()
+
+                            if not candidate_text:
+                                continue
+
+                            total_candidates = (
+                                extract_invoice_total_candidates(
+                                    document_text=candidate_text
                                 )
+                            )
 
-                                if not total_candidates:
-                                    continue
-
-                                candidate_total, rejection_reason = (
-                                    choose_one_invoice_total(
-                                        candidates=total_candidates
-                                    )
+                            selected_total, rejection_reason = (
+                                choose_one_invoice_total(
+                                    candidates=total_candidates
                                 )
+                            )
 
-                                if candidate_total:
-                                    financial_document_text = (
-                                        candidate_text
-                                    )
-
-                                    selected_total = candidate_total
-
-                                    print(
-                                        "FINANCIAL TEXT SELECTED:",
-                                        {
-                                            "file_name": file_name,
-                                            "source_type": (
-                                                candidate_source["type"]
-                                            ),
-                                            "amount": str(
-                                                candidate_total.get(
-                                                    "amount"
-                                                )
-                                            ),
-                                            "currency": (
-                                                candidate_total.get(
-                                                    "currency"
-                                                )
-                                            )
-                                        }
-                                    )
-
-                                    break
+                            if selected_total:
+                                financial_document_text = (
+                                    candidate_text
+                                )
 
                                 print(
-                                    "FINANCIAL TEXT CANDIDATE REJECTED:",
+                                    "FINANCIAL FINAL TOTAL TEXT FOUND:",
                                     {
                                         "file_name": file_name,
                                         "source_type": (
-                                            candidate_source["type"]
+                                            candidate_source.get(
+                                                "source_type"
+                                            )
+                                        ),
+                                        "amount": str(
+                                            selected_total.get(
+                                                "amount"
+                                            )
+                                        ),
+                                        "currency": (
+                                            selected_total.get(
+                                                "currency"
+                                            )
+                                        )
+                                    }
+                                )
+
+                                break
+
+                            if rejection_reason:
+                                print(
+                                    "FINANCIAL TOTAL CANDIDATE REJECTED:",
+                                    {
+                                        "file_name": file_name,
+                                        "source_type": (
+                                            candidate_source.get(
+                                                "source_type"
+                                            )
                                         ),
                                         "reason": rejection_reason
                                     }
                                 )
 
-                            if (
-                                not financial_document_text
-                                or not selected_total
-                            ):
-                                print(
-                                    "FINANCIAL DOCUMENT SKIPPED:",
-                                    {
-                                        "file_name": file_name,
-                                        "reason": (
-                                            "No unique labelled final total"
-                                        )
-                                    }
-                                )
-
-                                continue
-
-                            direct_financial_rows.append({
-                                "asset_id": asset.get("id"),
-                                "yacht_id": asset.get("yacht_id"),
-                                "chat_id": asset.get("chat_id"),
-                                "security_level": asset.get(
-                                    "security_level"
-                                ),
-
-                                # Used for deterministic total extraction.
-                                "content": financial_document_text,
-
-                                # Used for matching subjects such as beef.
-                                "search_text": (
-                                    searchable_document_text
-                                ),
-
-                                "content_type": (
-                                    "financial_document"
-                                ),
-                                "chunk_index": 0,
-                                "detected_date": None,
-                                "detected_year": None,
-                                "tags": [],
-                                "file_name": asset.get("file_name"),
-                                "original_file_name": asset.get(
-                                    "original_file_name"
-                                ),
-                                "file_type": asset.get("file_type"),
-                                "mime_type": asset.get("mime_type")
-                            })
-
-                        matched_rows = deduplicate_context_rows(
-                            direct_financial_rows
-                        )
-
-                        context = build_context_from_asset_results(
-                            matched_rows
-                        )
-
-                        print(
-                            "FINANCIAL DIRECT RETRIEVAL DEBUG:",
-                            len(matched_rows)
-                        )
-
-                    except Exception as e:
-                        print(
-                            "FINANCIAL DIRECT RETRIEVAL ERROR:",
-                            type(e).__name__,
-                            str(e)
-                        )
-
-                        matched_rows = []
-                        context = ""
-
-                # -------------------------------------------------
-                # NORMAL DOCUMENT RETRIEVAL
-                # -------------------------------------------------
-                else:
-                    if is_followup_query:
-                        retrieval_query_input = (
-                            build_memory_aware_retrieval_input(
-                                query=clean_query,
-                                chat_id=chat_id
+                        # IMPORTANT:
+                        # Do not discard this document when no labelled
+                        # grand total exists. The complete document can still
+                        # contain line items such as:
+                        # Beef | 40 | 10 | 400
+                        if not financial_document_text:
+                            financial_document_text = (
+                                searchable_document_text
                             )
-                        )
-                    else:
-                        retrieval_query_input = clean_query
 
-                    if not retrieval_query_input:
-                        retrieval_query_input = clean_query
+                        direct_financial_rows.append({
+                            "asset_id": asset.get("id"),
+                            "yacht_id": asset.get("yacht_id"),
+                            "chat_id": asset.get("chat_id"),
+                            "security_level": asset.get(
+                                "security_level"
+                            ),
+
+                            # Used for deterministic final-total parsing.
+                            "financial_text": (
+                                financial_document_text
+                            ),
+
+                            # Used for subject/category row extraction.
+                            "search_text": (
+                                searchable_document_text
+                            ),
+
+                            # Context supplied to the line-item extractor
+                            # must contain the full searchable document.
+                            "content": (
+                                searchable_document_text
+                            ),
+
+                            "content_type": "financial_document",
+                            "chunk_index": 0,
+                            "detected_date": None,
+                            "detected_year": None,
+                            "tags": [],
+                            "file_name": asset.get("file_name"),
+                            "original_file_name": asset.get(
+                                "original_file_name"
+                            ),
+                            "file_type": asset.get("file_type"),
+                            "mime_type": asset.get("mime_type")
+                        })
+
+                    matched_rows = deduplicate_context_rows(
+                        direct_financial_rows
+                    )
+
+                    # Restore separate deterministic final-total text
+                    # while keeping full searchable text as context.
+                    for row in matched_rows:
+                        row["search_text"] = (
+                            row.get("search_text")
+                            or row.get("content")
+                            or ""
+                        )
+
+                        row["content"] = (
+                            row.get("search_text")
+                            or ""
+                        )
+
+                    context = build_context_from_asset_results(
+                        matched_rows
+                    )
 
                     print(
-                        "LOCAL CHAT DEBUG: retrieval_query_input:",
-                        retrieval_query_input
+                        "FINANCIAL DIRECT RETRIEVAL DEBUG:",
+                        {
+                            "documents": len(matched_rows),
+                            "context_length": len(context)
+                        }
                     )
 
-                    retrieval_queries = build_retrieval_queries(
-                        retrieval_query_input
+                except Exception as e:
+                    print(
+                        "FINANCIAL DIRECT RETRIEVAL ERROR:",
+                        type(e).__name__,
+                        str(e)
                     )
 
-                    if not retrieval_queries:
-                        retrieval_queries = [
-                            retrieval_query_input
-                        ]
+                    matched_rows = []
+                    context = ""
 
-                    matched_rows_by_key = {}
+            # =================================================
+            # NORMAL DOCUMENT RETRIEVAL
+            # =================================================
+            else:
+                if is_followup_query:
+                    retrieval_query_input = (
+                        build_memory_aware_retrieval_input(
+                            query=clean_query,
+                            chat_id=chat_id
+                        )
+                    )
+                else:
+                    retrieval_query_input = clean_query
 
-                    # File listing questions use asset metadata.
-                    if is_file_listing_query(clean_query):
-                        listing_rows = (
-                            get_asset_metadata_rows_for_listing(
-                                query=clean_query,
+                retrieval_query_input = str(
+                    retrieval_query_input
+                    or clean_query
+                ).strip()
+
+                retrieval_queries = build_retrieval_queries(
+                    retrieval_query_input
+                )
+
+                if not retrieval_queries:
+                    retrieval_queries = [
+                        retrieval_query_input
+                    ]
+
+                matched_rows_by_key = {}
+
+                # ---------------------------------------------
+                # FILE LISTING
+                # ---------------------------------------------
+                if is_file_listing_query(clean_query):
+                    listing_rows = (
+                        get_asset_metadata_rows_for_listing(
+                            query=clean_query,
+                            yacht_id=yacht_id,
+                            allowed_asset_ids=allowed_asset_ids,
+                            limit=50
+                        )
+                    )
+
+                    for row in listing_rows:
+                        key = (
+                            row.get("asset_id"),
+                            row.get("chunk_index"),
+                            row.get("content_type")
+                        )
+
+                        if key not in matched_rows_by_key:
+                            matched_rows_by_key[key] = row
+
+                # ---------------------------------------------
+                # SEARCH EACH RETRIEVAL QUERY
+                # ---------------------------------------------
+                for retrieval_query in retrieval_queries:
+                    retrieval_query = str(
+                        retrieval_query or ""
+                    ).strip()
+
+                    if not retrieval_query:
+                        continue
+
+                    filters = extract_query_filters(
+                        retrieval_query
+                    )
+
+                    year_filter = filters.get("year")
+
+                    # -----------------------------------------
+                    # KEYWORD SEARCH
+                    # -----------------------------------------
+                    try:
+                        keyword_rows = (
+                            keyword_search_asset_chunks(
+                                query=retrieval_query,
                                 yacht_id=yacht_id,
-                                allowed_asset_ids=allowed_asset_ids,
-                                limit=50
+                                allowed_asset_ids=(
+                                    allowed_asset_ids
+                                ),
+                                year_filter=year_filter,
+                                limit=40
                             )
                         )
 
-                        for row in listing_rows:
+                        for row in keyword_rows:
                             key = (
                                 row.get("asset_id"),
                                 row.get("chunk_index"),
@@ -10829,146 +11011,84 @@ Rules:
                             if key not in matched_rows_by_key:
                                 matched_rows_by_key[key] = row
 
-                    for retrieval_query in retrieval_queries:
-                        retrieval_query = str(
-                            retrieval_query or ""
-                        ).strip()
+                    except Exception as e:
+                        print(
+                            "KEYWORD SEARCH ERROR:",
+                            type(e).__name__,
+                            str(e)
+                        )
 
-                        if not retrieval_query:
-                            continue
-
-                        filters = extract_query_filters(
+                    # -----------------------------------------
+                    # SEMANTIC SEARCH
+                    # -----------------------------------------
+                    try:
+                        query_embedding = embed(
                             retrieval_query
                         )
 
-                        year_filter = filters.get("year")
+                        semantic_results = supabase.rpc(
+                            "match_asset_chunks_secure",
+                            {
+                                "query_embedding": (
+                                    query_embedding
+                                ),
+                                "match_count": 40,
+                                "allowed_asset_ids": (
+                                    allowed_asset_ids
+                                ),
+                                "yacht_filter": yacht_id,
+                                "year_filter": year_filter
+                            }
+                        ).execute()
 
-                        # -----------------------------------------
-                        # KEYWORD SEARCH
-                        # -----------------------------------------
-                        try:
-                            keyword_rows = (
-                                keyword_search_asset_chunks(
-                                    query=retrieval_query,
-                                    yacht_id=yacht_id,
-                                    allowed_asset_ids=(
-                                        allowed_asset_ids
-                                    ),
-                                    year_filter=year_filter,
-                                    limit=40
-                                )
+                        for row in semantic_results.data or []:
+                            key = (
+                                row.get("asset_id"),
+                                row.get("chunk_index"),
+                                row.get("content_type")
                             )
 
-                            for row in keyword_rows:
-                                key = (
-                                    row.get("asset_id"),
-                                    row.get("chunk_index"),
-                                    row.get("content_type")
-                                )
+                            if key not in matched_rows_by_key:
+                                matched_rows_by_key[key] = row
 
-                                if key not in matched_rows_by_key:
-                                    matched_rows_by_key[key] = row
+                    except Exception as e:
+                        # Keyword search still works if embeddings fail.
+                        print(
+                            "SEMANTIC SEARCH ERROR:",
+                            type(e).__name__,
+                            str(e)
+                        )
 
-                        except Exception as e:
-                            print(
-                                "KEYWORD SEARCH ERROR:",
-                                type(e).__name__,
-                                str(e)
-                            )
+                matched_rows = list(
+                    matched_rows_by_key.values()
+                )[:100]
 
-                        # -----------------------------------------
-                        # SEMANTIC SEARCH
-                        # -----------------------------------------
-                        try:
-                            query_embedding = embed(
-                                retrieval_query
-                            )
+                print(
+                    "LOCAL CHAT DEBUG: matched chunks:",
+                    len(matched_rows)
+                )
 
-                            semantic_results = supabase.rpc(
-                                "match_asset_chunks_secure",
-                                {
-                                    "query_embedding": query_embedding,
-                                    "match_count": 40,
-                                    "allowed_asset_ids": (
-                                        allowed_asset_ids
-                                    ),
-                                    "yacht_filter": yacht_id,
-                                    "year_filter": year_filter
-                                }
-                            ).execute()
-
-                            for row in semantic_results.data or []:
-                                key = (
-                                    row.get("asset_id"),
-                                    row.get("chunk_index"),
-                                    row.get("content_type")
-                                )
-
-                                if key not in matched_rows_by_key:
-                                    matched_rows_by_key[key] = row
-
-                        except Exception as e:
-                            # Keyword search remains available even if
-                            # the embedding endpoint is unavailable.
-                            print(
-                                "SEMANTIC SEARCH ERROR:",
-                                type(e).__name__,
-                                str(e)
-                            )
-
-                    matched_rows = list(
-                        matched_rows_by_key.values()
-                    )[:100]
-
-                    print(
-                        "LOCAL CHAT DEBUG: matched chunks:",
-                        len(matched_rows)
+                if (
+                    matched_rows
+                    and not is_file_listing_query(clean_query)
+                ):
+                    matched_rows = (
+                        expand_retrieved_rows_to_full_relevant_documents(
+                            query=retrieval_query_input,
+                            matched_rows=matched_rows,
+                            yacht_id=yacht_id,
+                            security_level=security_level,
+                            answer_depth=answer_depth
+                        )
                     )
 
-                    if (
+                    matched_rows = deduplicate_context_rows(
                         matched_rows
-                        and not is_file_listing_query(clean_query)
-                    ):
-                        matched_rows = (
-                            expand_retrieved_rows_to_full_relevant_documents(
-                                query=retrieval_query_input,
-                                matched_rows=matched_rows,
-                                yacht_id=yacht_id,
-                                security_level=security_level,
-                                answer_depth=answer_depth
-                            )
-                        )
+                    )
 
-                        matched_rows = deduplicate_context_rows(
-                            matched_rows
-                        )
-
-                        # Always use original rows as final context.
-                        context = build_context_from_asset_results(
-                            matched_rows
-                        )
-
-                        print(
-                            "FULL CONTEXT DEBUG final expanded rows:",
-                            len(matched_rows)
-                        )
-
-                        print(
-                            "FULL CONTEXT DEBUG final context preview:",
-                            context[:1000]
-                        )
-
-                    elif matched_rows:
-                        context = build_context_from_asset_results(
-                            matched_rows
-                        )
-
-                    else:
-                        context = ""
-
-            else:
-                matched_rows = []
-                context = ""
+                context = build_context_from_asset_results(
+                    matched_rows
+                )
 
     except Exception as e:
         print(
@@ -10981,47 +11101,63 @@ Rules:
         context = ""
 
     print(
-        "LOCAL CHAT DEBUG FINAL matched_rows:",
-        len(matched_rows or [])
+        "LOCAL CHAT FINAL RETRIEVAL DEBUG:",
+        {
+            "matched_rows": len(matched_rows or []),
+            "context_length": len(context or ""),
+            "uploaded_asset_id": resolved_uploaded_asset_id,
+            "financial_query": financial_query
+        }
     )
 
-    print(
-        "LOCAL CHAT DEBUG FINAL context length:",
-        len(context or "")
-    )
-
-    print(
-        "LOCAL CHAT DEBUG FINAL resolved_uploaded_asset_id:",
-        resolved_uploaded_asset_id
-    )
-
-    # ---------------------------------------------------------
+    # =========================================================
     # EXPLICITLY UPLOADED CHAT FILE ANSWER
-    # ---------------------------------------------------------
+    # =========================================================
     if resolved_uploaded_asset_id:
         if not context:
             answer = FALLBACK_NO_DATA_ANSWER
             sources = []
 
         else:
-            financial_result = (
-                answer_financial_total_from_context(
-                    query=clean_query,
-                    context=context,
-                    matched_rows=matched_rows
-                )
-            )
+            financial_result = None
+
+            if financial_query:
+                try:
+                    financial_result = (
+                        answer_financial_total_from_context(
+                            query=clean_query,
+                            context=context,
+                            matched_rows=matched_rows
+                        )
+                    )
+
+                except Exception as e:
+                    print(
+                        "UPLOADED FINANCIAL ANSWER ERROR:",
+                        type(e).__name__,
+                        str(e)
+                    )
+
+                    financial_result = None
 
             numeric_result = None
 
             if financial_result is None:
-                numeric_result = (
-                    answer_numeric_comparison_from_context(
-                        query=clean_query,
-                        context=context,
-                        matched_rows=matched_rows
+                try:
+                    numeric_result = (
+                        answer_numeric_comparison_from_context(
+                            query=clean_query,
+                            context=context,
+                            matched_rows=matched_rows
+                        )
                     )
-                )
+
+                except Exception as e:
+                    print(
+                        "UPLOADED NUMERIC ANSWER ERROR:",
+                        type(e).__name__,
+                        str(e)
+                    )
 
             if financial_result is not None:
                 answer = str(
@@ -11068,7 +11204,7 @@ Rules:
         if not isinstance(sources, list):
             sources = []
 
-        if answer.strip() == FALLBACK_NO_DATA_ANSWER:
+        if answer == FALLBACK_NO_DATA_ANSWER:
             sources = []
 
         save_assistant_response(
@@ -11083,36 +11219,61 @@ Rules:
             "mode": "uploaded_chat_asset"
         }
 
-    # ---------------------------------------------------------
+    # =========================================================
     # YACHT DOCUMENTATION ANSWER
-    # ---------------------------------------------------------
+    # =========================================================
     if not context:
         answer = FALLBACK_NO_DATA_ANSWER
         sources = []
 
     else:
-        # -----------------------------------------------------
-        # DETERMINISTIC FINANCIAL TOTAL
-        # -----------------------------------------------------
-        financial_result = answer_financial_total_from_context(
-            query=clean_query,
-            context=context,
-            matched_rows=matched_rows
-        )
+        financial_result = None
 
-        # -----------------------------------------------------
+        # =====================================================
+        # DETERMINISTIC FINANCIAL CALCULATION
+        # =====================================================
+        if financial_query:
+            try:
+                financial_result = (
+                    answer_financial_total_from_context(
+                        query=clean_query,
+                        context=context,
+                        matched_rows=matched_rows
+                    )
+                )
+
+            except Exception as e:
+                print(
+                    "FINANCIAL ANSWER ERROR:",
+                    type(e).__name__,
+                    str(e)
+                )
+
+                financial_result = None
+
+        # =====================================================
         # DETERMINISTIC NUMERIC COMPARISON
-        # -----------------------------------------------------
+        # =====================================================
         numeric_result = None
 
         if financial_result is None:
-            numeric_result = (
-                answer_numeric_comparison_from_context(
-                    query=clean_query,
-                    context=context,
-                    matched_rows=matched_rows
+            try:
+                numeric_result = (
+                    answer_numeric_comparison_from_context(
+                        query=clean_query,
+                        context=context,
+                        matched_rows=matched_rows
+                    )
                 )
-            )
+
+            except Exception as e:
+                print(
+                    "NUMERIC COMPARISON ANSWER ERROR:",
+                    type(e).__name__,
+                    str(e)
+                )
+
+                numeric_result = None
 
         if financial_result is not None:
             answer = str(
@@ -11136,9 +11297,9 @@ Rules:
                 or []
             )
 
-        # -----------------------------------------------------
+        # =====================================================
         # FILE LISTING
-        # -----------------------------------------------------
+        # =====================================================
         elif is_file_listing_query(clean_query):
             listing_result = answer_file_listing_directly(
                 query=clean_query,
@@ -11155,12 +11316,9 @@ Rules:
                 or []
             )
 
-            if answer == FALLBACK_NO_DATA_ANSWER:
-                sources = []
-
-        # -----------------------------------------------------
+        # =====================================================
         # NORMAL DOCUMENT QUESTION
-        # -----------------------------------------------------
+        # =====================================================
         else:
             try:
                 raw_answer = ask_llm(
@@ -11170,10 +11328,10 @@ You are BridgeOS, a private document-based assistant.
 
 Always respond in British English.
 
-You may answer only when the supplied document context directly supports
-the user's exact question.
+Answer only when the supplied document context directly supports the
+user's exact question.
 
-Return ONLY valid JSON in exactly this shape:
+Return ONLY valid JSON in exactly this structure:
 
 {{
   "answer": "clear answer grounded only in the documents",
@@ -11194,20 +11352,21 @@ Or return:
   "used_sources": []
 }}
 
-Hard rules:
-- Use only the document context below.
-- Do not use general knowledge.
+Rules:
+- Use only the supplied document context.
+- Do not use outside knowledge.
 - Do not fill gaps.
 - Do not estimate.
-- Do not invent names, dates, amounts, totals, prices, statuses or facts.
+- Do not invent names, dates, values, amounts, totals, prices,
+  statuses, requirements or events.
 - Do not answer from loosely related context.
-- If the exact answer is not supported, return the fallback answer.
-- If a value is missing, state that it was not found.
-- For tables and lists, inspect all supplied rows.
+- If the exact answer is unsupported, return the fallback.
+- If a requested value is absent, say it was not found.
+- Inspect all supplied table and list rows.
 - Do not perform unsupported calculations.
 - Do not include a source unless it directly supports the answer.
-- Evidence quotes must be copied from the context.
-- Do not mention document names inside the answer.
+- Evidence quotes must be copied from the supplied context.
+- Do not place document names inside the answer.
 - Return JSON only.
 
 Requested answer depth:
@@ -11257,10 +11416,7 @@ Document context:
                     or []
                 )
 
-                if not isinstance(
-                    raw_used_sources,
-                    list
-                ):
+                if not isinstance(raw_used_sources, list):
                     raw_used_sources = []
 
                 if not answer:
@@ -11281,7 +11437,7 @@ Document context:
 
                 except Exception as e:
                     print(
-                        "SOURCE VERIFICATION HELPER ERROR:",
+                        "SOURCE VERIFICATION ERROR:",
                         type(e).__name__,
                         str(e)
                     )
@@ -11294,18 +11450,10 @@ Document context:
                     )
 
                 else:
-                    print(
-                        "LOCAL CHAT SOURCE QUOTE VERIFICATION FAILED: "
-                        "using selected source rows"
-                    )
-
                     selected_rows = []
 
                     for used_source in raw_used_sources:
-                        if not isinstance(
-                            used_source,
-                            dict
-                        ):
+                        if not isinstance(used_source, dict):
                             continue
 
                         try:
@@ -11314,6 +11462,7 @@ Document context:
                                     "source_number"
                                 )
                             )
+
                         except Exception:
                             continue
 
@@ -11333,8 +11482,6 @@ Document context:
                                     selected_row
                                 )
 
-                    # Do not throw away a grounded answer because OCR,
-                    # punctuation or line spacing changed the evidence quote.
                     if selected_rows:
                         sources = build_sources_from_asset_results(
                             selected_rows
@@ -11353,16 +11500,17 @@ Document context:
                 answer = FALLBACK_NO_DATA_ANSWER
                 sources = []
 
-    # ---------------------------------------------------------
+    # =========================================================
     # FINAL NORMALISATION
-    # ---------------------------------------------------------
-    if not answer:
-        answer = FALLBACK_NO_DATA_ANSWER
+    # =========================================================
+    answer = str(
+        answer or FALLBACK_NO_DATA_ANSWER
+    ).strip()
 
     if not isinstance(sources, list):
         sources = []
 
-    if answer.strip() == FALLBACK_NO_DATA_ANSWER:
+    if answer == FALLBACK_NO_DATA_ANSWER:
         sources = []
 
     save_assistant_response(
