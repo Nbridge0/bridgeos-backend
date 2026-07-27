@@ -8688,9 +8688,14 @@ def build_invoice_text_by_asset(
     matched_rows: list[dict]
 ) -> dict[str, dict]:
     """
-    Combines all retrieved chunks by asset.
+    Combines financial text and searchable text by asset.
 
-    A repeated invoice chunk is not treated as a separate invoice.
+    financial_text:
+    Used only to identify and calculate the final invoice total.
+
+    search_text:
+    Used to check whether the document contains the user's requested
+    subject, such as beef, fuel, vegetables, repairs, etc.
     """
 
     assets = {}
@@ -8701,13 +8706,19 @@ def build_invoice_text_by_asset(
         if not asset_id:
             continue
 
-        content = str(
+        financial_content = str(
             row.get("content")
             or row.get("text")
             or ""
         ).strip()
 
-        if not content:
+        search_content = str(
+            row.get("search_text")
+            or financial_content
+            or ""
+        ).strip()
+
+        if not financial_content:
             continue
 
         if asset_id not in assets:
@@ -8716,17 +8727,42 @@ def build_invoice_text_by_asset(
                 "file_name": get_row_document_name(row),
                 "rows": [],
                 "contents": [],
+                "search_contents": []
             }
 
-        content_key = normalise_for_source_check(content)
+        financial_key = normalise_for_source_check(
+            financial_content
+        )
 
-        existing_keys = {
+        existing_financial_keys = {
             normalise_for_source_check(item)
             for item in assets[asset_id]["contents"]
         }
 
-        if content_key and content_key not in existing_keys:
-            assets[asset_id]["contents"].append(content)
+        if (
+            financial_key
+            and financial_key not in existing_financial_keys
+        ):
+            assets[asset_id]["contents"].append(
+                financial_content
+            )
+
+        search_key = normalise_for_source_check(
+            search_content
+        )
+
+        existing_search_keys = {
+            normalise_for_source_check(item)
+            for item in assets[asset_id]["search_contents"]
+        }
+
+        if (
+            search_key
+            and search_key not in existing_search_keys
+        ):
+            assets[asset_id]["search_contents"].append(
+                search_content
+            )
 
         assets[asset_id]["rows"].append(row)
 
@@ -9017,10 +9053,18 @@ def answer_financial_total_from_context(
             asset_data.get("contents") or []
         ).strip()
 
+        search_document_text = "\n\n".join(
+            asset_data.get("search_contents")
+            or asset_data.get("contents")
+            or []
+        ).strip()
+
         if not document_text:
             continue
 
-        normalised_document = normalise_search_text(document_text)
+        normalised_document = normalise_search_text(
+            search_document_text
+        )
         normalised_file_name = normalise_search_text(
             asset_data.get("file_name") or ""
         )
@@ -9612,88 +9656,126 @@ Rules:
                                 or ""
                             ).strip()
 
-                            # Do not combine extracted text, OCR and summary.
-                            # They frequently contain duplicate or conflicting representations
-                            # of the same invoice amount.
-                            if ocr_text and len(ocr_text) >= 80:
-                                combined_document_text = ocr_text
-                            elif extracted_text:
-                                combined_document_text = extracted_text
-                            else:
-                                combined_document_text = summary
-
-                            if not combined_document_text:
-                                continue
-
-                            # Only include documents containing a safely
-                            # detectable labelled final total.
-                            total_candidates = (
-                                extract_invoice_total_candidates(
-                                    document_text=combined_document_text
-                                )
+                            file_name = (
+                                asset.get("original_file_name")
+                                or asset.get("file_name")
+                                or ""
                             )
 
-                            if not total_candidates:
-                                continue
+                            # Search all available text for the requested subject,
+                            # such as beef, fuel, vegetables, repairs, etc.
+                            searchable_document_text = "\n\n".join([
+                                f"File name: {file_name}",
+                                extracted_text,
+                                ocr_text,
+                                summary
+                            ]).strip()
 
-                            selected_total, rejection_reason = (
-                                choose_one_invoice_total(
-                                    candidates=total_candidates
+                            # Choose one representation only for reading the final total.
+                            financial_document_text = ""
+                            selected_total = None
+
+                            candidate_texts = []
+
+                            if extracted_text:
+                                candidate_texts.append({
+                                    "type": "extracted_text",
+                                    "text": extracted_text
+                                })
+
+                            if ocr_text:
+                                candidate_texts.append({
+                                    "type": "ocr_text",
+                                    "text": ocr_text
+                                })
+
+                            if summary:
+                                candidate_texts.append({
+                                    "type": "summary",
+                                    "text": summary
+                                })
+
+                            for candidate_source in candidate_texts:
+                                candidate_text = candidate_source["text"]
+
+                                total_candidates = extract_invoice_total_candidates(
+                                    document_text=candidate_text
                                 )
+
+                                if not total_candidates:
+                                    continue
+
+                                candidate_total, rejection_reason = (
+                                    choose_one_invoice_total(
+                                        candidates=total_candidates
+                                    )
+                                )
+
+                                if candidate_total:
+                                    financial_document_text = candidate_text
+                                    selected_total = candidate_total
+
+                                    print(
+                                        "FINANCIAL TEXT SELECTED:",
+                                        {
+                                            "file_name": file_name,
+                                            "source_type": candidate_source["type"],
+                                            "amount": str(
+                                                candidate_total.get("amount")
+                                            ),
+                                            "currency": candidate_total.get(
+                                                "currency"
+                                        )
+                                    }
+                                )
+
+                                break
+
+                            print(
+                                "FINANCIAL TEXT CANDIDATE REJECTED:",
+                                {
+                                    "file_name": file_name,
+                                    "source_type": candidate_source["type"],
+                                    "reason": rejection_reason
+                                }
                             )
 
-                            if not selected_total:
-                                print(
-                                    "FINANCIAL DOCUMENT SKIPPED:",
-                                    asset.get("original_file_name")
-                                    or asset.get("file_name"),
-                                    rejection_reason
-                                )
-                                continue
+                        if not financial_document_text or not selected_total:
+                            print(
+                                "FINANCIAL DOCUMENT SKIPPED:",
+                                {
+                                    "file_name": file_name,
+                                    "reason": "No unique labelled final total"
+                                }
+                            )
+                            continue
 
-                            direct_financial_rows.append({
-                                "asset_id": asset.get("id"),
-                                "yacht_id": asset.get("yacht_id"),
-                                "chat_id": asset.get("chat_id"),
-                                "security_level": asset.get(
-                                    "security_level"
-                                ),
-                                "content": combined_document_text,
-                                "content_type": "financial_document",
-                                "chunk_index": 0,
-                                "detected_date": None,
-                                "detected_year": None,
-                                "tags": [],
-                                "file_name": asset.get("file_name"),
-                                "original_file_name": asset.get(
-                                    "original_file_name"
-                                ),
-                                "file_type": asset.get("file_type"),
-                                "mime_type": asset.get("mime_type")
-                            })
+                        direct_financial_rows.append({
+                            "asset_id": asset.get("id"),
+                            "yacht_id": asset.get("yacht_id"),
+                            "chat_id": asset.get("chat_id"),
+                            "security_level": asset.get(
+                                "security_level"
+                            ),
 
-                        matched_rows = deduplicate_context_rows(
-                            direct_financial_rows
-                        )
+                            # Used for deterministic total calculation.
+                            "content": financial_document_text,
 
-                        context = build_context_from_asset_results(
-                            matched_rows
-                        )
+                            # Used for subject matching, such as "beef".
+                            "search_text": searchable_document_text,
 
-                        print(
-                            "FINANCIAL DIRECT RETRIEVAL DEBUG:",
-                            len(matched_rows)
-                        )
-
-                    except Exception as e:
-                        print(
-                            "FINANCIAL DIRECT RETRIEVAL ERROR:",
-                            type(e).__name__,
-                            str(e)
-                        )
-
-                        matched_rows = []
-                        context = ""
+                            "content_type": "financial_document",
+                            "chunk_index": 0,
+                            "detected_date": None,
+                            "detected_year": None,
+                            "tags": [],
+                            "file_name": asset.get("file_name"),
+                            "original_file_name": asset.get(
+                                "original_file_name"
+                            ),
+                            "file_type": asset.get("file_type"),
+                            "mime_type": asset.get("mime_type")
+                        })
 
                 # -------------------------------------------------
                 # NORMAL DOCUMENT RETRIEVAL
