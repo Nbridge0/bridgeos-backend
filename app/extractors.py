@@ -75,135 +75,255 @@ def extract_pdf_form_fields(reader) -> str:
     return "\n".join(lines).strip()
 
 
-def extract_pdf_text(file, filename: str = "document.pdf") -> str:
+def extract_pdf_text(
+    file,
+    filename: str = "document.pdf"
+) -> str:
     """
-    Extract text from digital PDFs, PDF form fields, and scanned PDFs.
+    Extracts digital PDF text, form fields, and OCR text.
 
-    Digital invoices usually work with pypdf.
-    Scanned invoices need OCR fallback.
+    OCR is run when:
+    - no digital text exists;
+    - extracted text is very short; or
+    - the document appears financial but contains too few numbers.
     """
+
     parts = []
 
     try:
         file.seek(0)
         reader = PdfReader(file)
 
-        for page_index, page in enumerate(reader.pages):
+        for page_index, page in enumerate(
+            reader.pages
+        ):
             try:
-                page_text = page.extract_text() or ""
-                page_text = page_text.strip()
+                page_text = str(
+                    page.extract_text() or ""
+                ).strip()
 
                 if page_text:
-                    parts.append(f"PDF page {page_index + 1} text:\n{page_text}")
+                    parts.append(
+                        f"PDF page {page_index + 1}:\n"
+                        f"{page_text}"
+                    )
 
-            except Exception as e:
-                print("PDF PAGE TEXT ERROR:", page_index + 1, type(e).__name__, str(e))
+            except Exception as error:
+                print(
+                    "PDF PAGE TEXT ERROR:",
+                    page_index + 1,
+                    type(error).__name__,
+                    str(error)
+                )
 
         try:
-            form_fields = extract_pdf_form_fields(reader)
+            form_fields = extract_pdf_form_fields(
+                reader
+            )
 
             if form_fields:
-                parts.append("PDF form fields:\n" + form_fields)
+                parts.append(form_fields)
 
-        except Exception as e:
-            print("PDF FORM FIELD ERROR:", type(e).__name__, str(e))
+        except Exception as error:
+            print(
+                "PDF FORM FIELD ERROR:",
+                type(error).__name__,
+                str(error)
+            )
 
-    except Exception as e:
-        print("PDF TEXT ERROR:", type(e).__name__, str(e))
+    except Exception as error:
+        print(
+            "PDF TEXT ERROR:",
+            type(error).__name__,
+            str(error)
+        )
 
-    extracted_text = "\n\n".join(parts).strip()
+    digital_text = "\n\n".join(parts).strip()
 
-    digit_count = sum(char.isdigit() for char in extracted_text)
-    text_is_weak = len(extracted_text) < 120
-    numbers_are_weak = digit_count < 5
+    lower_text = digital_text.lower()
 
-    should_run_ocr = text_is_weak or numbers_are_weak
+    financial_markers = [
+        "invoice",
+        "receipt",
+        "subtotal",
+        "total",
+        "amount",
+        "price",
+        "unit price",
+        "vat",
+        "tax",
+        "balance",
+        "paid",
+        "payment",
+        "quantity",
+        "qty",
+        "currency",
+        "usd",
+        "eur",
+        "gbp",
+        "$",
+        "€",
+        "£"
+    ]
+
+    looks_financial = any(
+        marker in lower_text
+        for marker in financial_markers
+    )
+
+    digit_count = sum(
+        character.isdigit()
+        for character in digital_text
+    )
+
+    should_run_ocr = (
+        not digital_text
+        or len(digital_text) < 300
+        or (
+            looks_financial
+            and digit_count < 10
+        )
+    )
 
     if should_run_ocr:
         try:
             file.seek(0)
+
             ocr_text = extract_ocr_from_pdf_pages(
                 file=file,
                 filename=filename,
+                max_pages=30
             )
 
-            if ocr_text:
-                if extracted_text:
-                    extracted_text += "\n\nScanned PDF OCR text:\n" + ocr_text
-                else:
-                    extracted_text = "Scanned PDF OCR text:\n" + ocr_text
+            ocr_text = str(
+                ocr_text or ""
+            ).strip()
 
-        except Exception as e:
-            print("PDF OCR FALLBACK ERROR:", type(e).__name__, str(e))
+            if (
+                ocr_text
+                and ocr_text != "NO_READABLE_TEXT"
+            ):
+                parts.append(
+                    "Scanned PDF OCR text:\n"
+                    + ocr_text
+                )
+
+        except Exception as error:
+            print(
+                "PDF OCR FALLBACK ERROR:",
+                type(error).__name__,
+                str(error)
+            )
 
     try:
         file.seek(0)
     except Exception:
         pass
 
-    return extracted_text.strip()
+    final_text = "\n\n".join(parts).strip()
+
+    print(
+        "PDF EXTRACTION FINAL:",
+        {
+            "filename": filename,
+            "characters": len(final_text),
+            "digital_characters": len(digital_text),
+            "digit_count": sum(
+                character.isdigit()
+                for character in final_text
+            ),
+            "ocr_attempted": should_run_ocr,
+            "preview": final_text[:500]
+        }
+    )
+
+    return final_text
 
 def extract_docx_text(file) -> str:
     """
-    Extracts text from:
-    - normal DOCX paragraphs
-    - tables
-    - headers
-    - footers
-    - text boxes and other XML text nodes
+    Extracts paragraphs, tables, headers, footers,
+    text boxes, and other Word XML text.
+
+    Repeated amounts are preserved because repeated values
+    are meaningful in invoices and financial tables.
     """
 
     file.seek(0)
     document = Document(file)
 
     parts = []
-    seen = set()
 
-    def add_text(value: str):
-        clean = " ".join(str(value or "").split()).strip()
+    def add_text(value):
+        clean = " ".join(
+            str(value or "").split()
+        ).strip()
 
-        if not clean:
-            return
+        if clean:
+            parts.append(clean)
 
-        if clean in seen:
-            return
-
-        seen.add(clean)
-        parts.append(clean)
-
-    # Normal document paragraphs
     for paragraph in document.paragraphs:
         add_text(paragraph.text)
 
-    # Tables, including nested tables
     def extract_table(table):
         for row in table.rows:
             row_values = []
 
             for cell in row.cells:
-                cell_parts = []
+                cell_values = []
 
                 for paragraph in cell.paragraphs:
-                    text = " ".join((paragraph.text or "").split()).strip()
+                    clean = " ".join(
+                        str(
+                            paragraph.text or ""
+                        ).split()
+                    ).strip()
 
-                    if text:
-                        cell_parts.append(text)
+                    if clean:
+                        cell_values.append(clean)
 
                 for nested_table in cell.tables:
-                    extract_table(nested_table)
+                    nested_rows = []
 
-                cell_text = " | ".join(cell_parts).strip()
+                    for nested_row in nested_table.rows:
+                        nested_cells = []
+
+                        for nested_cell in nested_row.cells:
+                            nested_text = " ".join(
+                                str(
+                                    nested_cell.text or ""
+                                ).split()
+                            ).strip()
+
+                            if nested_text:
+                                nested_cells.append(
+                                    nested_text
+                                )
+
+                        if nested_cells:
+                            nested_rows.append(
+                                " | ".join(nested_cells)
+                            )
+
+                    if nested_rows:
+                        cell_values.extend(
+                            nested_rows
+                        )
+
+                cell_text = " ".join(
+                    cell_values
+                ).strip()
 
                 if cell_text:
                     row_values.append(cell_text)
 
             if row_values:
-                add_text(" | ".join(row_values))
+                add_text(
+                    " | ".join(row_values)
+                )
 
     for table in document.tables:
         extract_table(table)
 
-    # Headers and footers
     for section in document.sections:
         for paragraph in section.header.paragraphs:
             add_text(paragraph.text)
@@ -217,41 +337,28 @@ def extract_docx_text(file) -> str:
         for table in section.footer.tables:
             extract_table(table)
 
-    # Text boxes, shapes and XML text nodes that python-docx does not
-    # expose through document.paragraphs.
     try:
-        namespace = {
-            "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-        }
-
-        xml_text_nodes = document.element.body.xpath(
-            ".//w:t",
-            namespaces=namespace
+        xml_nodes = document.element.body.xpath(
+            ".//w:t"
         )
 
-        for node in xml_text_nodes:
-            add_text(node.text)
+        xml_text = " ".join(
+            str(node.text or "").strip()
+            for node in xml_nodes
+            if str(node.text or "").strip()
+        ).strip()
 
-    except TypeError:
-        # Some lxml/python-docx versions already know the namespaces.
-        try:
-            xml_text_nodes = document.element.body.xpath(".//w:t")
-
-            for node in xml_text_nodes:
-                add_text(node.text)
-
-        except Exception as e:
-            print(
-                "DOCX XML TEXT EXTRACTION ERROR:",
-                type(e).__name__,
-                str(e)
+        if xml_text:
+            add_text(
+                "Additional Word XML text: "
+                + xml_text
             )
 
-    except Exception as e:
+    except Exception as error:
         print(
             "DOCX XML TEXT EXTRACTION ERROR:",
-            type(e).__name__,
-            str(e)
+            type(error).__name__,
+            str(error)
         )
 
     try:
@@ -259,7 +366,17 @@ def extract_docx_text(file) -> str:
     except Exception:
         pass
 
-    return "\n".join(parts).strip()
+    final_text = "\n".join(parts).strip()
+
+    print(
+        "DOCX EXTRACTION FINAL:",
+        {
+            "characters": len(final_text),
+            "preview": final_text[:500]
+        }
+    )
+
+    return final_text
     
 def extract_text_by_file_type(file, filename: str, file_type: str) -> str:
     file_type = str(file_type or "").strip().lower()

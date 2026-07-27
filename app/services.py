@@ -5020,6 +5020,24 @@ def process_uploaded_asset(
         # =====================================================
         # BUILD COMPLETE SEARCHABLE TEXT
         # =====================================================
+        actual_document_content = "\n\n".join(
+            part.strip()
+            for part in [
+                extracted_text,
+                visual_description,
+                ocr_text
+            ]
+            if str(part or "").strip()
+            and str(part or "").strip() != "NO_READABLE_TEXT"
+        ).strip()
+
+        if not actual_document_content:
+            raise ValueError(
+                f"No readable content was extracted from {filename}. "
+                f"file_type={file_type}. "
+                "The file must not be marked as processed."
+            )
+        
         combined_parts = [
             f"File name: {filename}",
             f"File type: {file_type}"
@@ -5257,13 +5275,34 @@ def create_asset_chunks(
     security_level: int = 1
 ):
     """
-    Creates searchable chunks for asset metadata, text, OCR, and image captions.
+    Creates searchable chunks for actual extracted document content.
+
+    A metadata chunk is included, but metadata alone is not enough
+    to treat the asset as searchable.
     """
 
     tags = tags or []
-    rows = []
 
-        # Remove stale chunks when an asset is reprocessed.
+    clean_extracted_text = str(extracted_text or "").strip()
+    clean_visual_description = str(
+        visual_description or ""
+    ).strip()
+    clean_ocr_text = str(ocr_text or "").strip()
+
+    if clean_ocr_text == "NO_READABLE_TEXT":
+        clean_ocr_text = ""
+
+    actual_content_exists = bool(
+        clean_extracted_text
+        or clean_visual_description
+        or clean_ocr_text
+    )
+
+    if not actual_content_exists:
+        raise ValueError(
+            f"No actual searchable content exists for asset {asset_id}"
+        )
+
     try:
         supabase.table("asset_chunks") \
             .delete() \
@@ -5271,12 +5310,37 @@ def create_asset_chunks(
             .eq("yacht_id", yacht_id) \
             .execute()
 
-    except Exception as e:
+    except Exception as error:
         print(
             "OLD ASSET CHUNK DELETE ERROR:",
-            type(e).__name__,
-            str(e)
+            type(error).__name__,
+            str(error)
         )
+
+    rows = []
+
+    def create_embedding_safely(content: str):
+        try:
+            vector = embed(content)
+
+            if not isinstance(vector, list):
+                return None
+
+            if not vector:
+                return None
+
+            if not any(float(value or 0) != 0 for value in vector):
+                return None
+
+            return vector
+
+        except Exception as error:
+            print(
+                "CHUNK EMBEDDING ERROR:",
+                type(error).__name__,
+                str(error)
+            )
+            return None
 
     metadata_content = f"""
 File name: {filename}
@@ -5293,20 +5357,97 @@ Tags: {", ".join(tags)}
         "content": metadata_content,
         "content_type": "metadata",
         "chunk_index": 0,
-        "detected_date": detected_date.isoformat() if detected_date else None,
+        "detected_date": (
+            detected_date.isoformat()
+            if detected_date
+            else None
+        ),
         "detected_year": detected_year,
         "tags": tags,
-        "embedding": embed(metadata_content)
+        "embedding": create_embedding_safely(
+            metadata_content
+        )
     })
 
-    if visual_description:
-        content = f"""
-Image visual description:
-{visual_description}
+    next_chunk_index = 1
 
+    if clean_extracted_text:
+        text_chunks = chunk_text(
+            clean_extracted_text,
+            chunk_size=1800,
+            overlap=300
+        )
+
+        for chunk in text_chunks:
+            chunk_content = f"""
 File name: {filename}
-Detected year: {detected_year or ""}
-Tags: {", ".join(tags)}
+Document text:
+{chunk}
+""".strip()
+
+            rows.append({
+                "asset_id": asset_id,
+                "yacht_id": yacht_id,
+                "chat_id": chat_id,
+                "security_level": security_level,
+                "content": chunk_content,
+                "content_type": "document_text",
+                "chunk_index": next_chunk_index,
+                "detected_date": (
+                    detected_date.isoformat()
+                    if detected_date
+                    else None
+                ),
+                "detected_year": detected_year,
+                "tags": tags,
+                "embedding": create_embedding_safely(
+                    chunk_content
+                )
+            })
+
+            next_chunk_index += 1
+
+    if clean_ocr_text:
+        ocr_chunks = chunk_text(
+            clean_ocr_text,
+            chunk_size=1800,
+            overlap=300
+        )
+
+        for chunk in ocr_chunks:
+            chunk_content = f"""
+File name: {filename}
+OCR document text:
+{chunk}
+""".strip()
+
+            rows.append({
+                "asset_id": asset_id,
+                "yacht_id": yacht_id,
+                "chat_id": chat_id,
+                "security_level": security_level,
+                "content": chunk_content,
+                "content_type": "ocr",
+                "chunk_index": next_chunk_index,
+                "detected_date": (
+                    detected_date.isoformat()
+                    if detected_date
+                    else None
+                ),
+                "detected_year": detected_year,
+                "tags": tags,
+                "embedding": create_embedding_safely(
+                    chunk_content
+                )
+            })
+
+            next_chunk_index += 1
+
+    if clean_visual_description:
+        visual_content = f"""
+File name: {filename}
+Image visual description:
+{clean_visual_description}
 """.strip()
 
         rows.append({
@@ -5314,71 +5455,84 @@ Tags: {", ".join(tags)}
             "yacht_id": yacht_id,
             "chat_id": chat_id,
             "security_level": security_level,
-            "content": content,
+            "content": visual_content,
             "content_type": "image_caption",
-            "chunk_index": 0,
-            "detected_date": detected_date.isoformat() if detected_date else None,
+            "chunk_index": next_chunk_index,
+            "detected_date": (
+                detected_date.isoformat()
+                if detected_date
+                else None
+            ),
             "detected_year": detected_year,
             "tags": tags,
-            "embedding": embed(content)
+            "embedding": create_embedding_safely(
+                visual_content
+            )
         })
 
-    if ocr_text:
-        for index, chunk in enumerate(chunk_text(ocr_text)):
-            rows.append({
-                "asset_id": asset_id,
-                "yacht_id": yacht_id,
-                "chat_id": chat_id,
-                "security_level": security_level,
-                "content": chunk,
-                "content_type": "ocr",
-                "chunk_index": index,
-                "detected_date": detected_date.isoformat() if detected_date else None,
-                "detected_year": detected_year,
-                "tags": tags,
-                "embedding": embed(chunk)
-            })
+    actual_content_rows = [
+        row
+        for row in rows
+        if row.get("content_type") != "metadata"
+    ]
 
-    if extracted_text:
-        for index, chunk in enumerate(chunk_text(extracted_text)):
-            rows.append({
-                "asset_id": asset_id,
-                "yacht_id": yacht_id,
-                "chat_id": chat_id,
-                "security_level": security_level,
-                "content": chunk,
-                "content_type": "text",
-                "chunk_index": index,
-                "detected_date": detected_date.isoformat() if detected_date else None,
-                "detected_year": detected_year,
-                "tags": tags,
-                "embedding": embed(chunk)
-            })
-
-    if not rows:
+    if not actual_content_rows:
         raise ValueError(
-            f"No searchable chunks were created for asset {asset_id}"
+            f"Only metadata was generated for asset {asset_id}. "
+            "No document text or OCR chunks were created."
         )
 
     for start in range(0, len(rows), 200):
         batch = rows[start:start + 200]
 
-        result = supabase.table("asset_chunks") \
-            .insert(batch) \
+        result = (
+            supabase.table("asset_chunks")
+            .insert(batch)
             .execute()
+        )
 
         if not result.data:
             raise RuntimeError(
-                f"Supabase returned no inserted chunks for asset {asset_id}"
+                f"Supabase returned no inserted chunks "
+                f"for asset {asset_id}"
             )
+
+    verification = (
+        supabase.table("asset_chunks")
+        .select("id, content_type")
+        .eq("asset_id", asset_id)
+        .eq("yacht_id", yacht_id)
+        .execute()
+    )
+
+    inserted_rows = verification.data or []
+
+    inserted_actual_content_rows = [
+        row
+        for row in inserted_rows
+        if row.get("content_type") != "metadata"
+    ]
+
+    if not inserted_actual_content_rows:
+        raise RuntimeError(
+            f"No real document chunks were found after inserting "
+            f"asset {asset_id}"
+        )
 
     print(
         "ASSET CHUNKS CREATED:",
         {
             "asset_id": asset_id,
-            "chunk_count": len(rows),
-            "text_characters": len(extracted_text or ""),
-            "ocr_characters": len(ocr_text or "")
+            "total_chunk_count": len(inserted_rows),
+            "actual_content_chunk_count": len(
+                inserted_actual_content_rows
+            ),
+            "text_characters": len(
+                clean_extracted_text
+            ),
+            "ocr_characters": len(
+                clean_ocr_text
+            )
         }
     )
 
