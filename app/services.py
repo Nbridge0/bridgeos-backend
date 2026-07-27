@@ -6045,141 +6045,69 @@ def answer_from_uploaded_chat_asset(
     matched_rows: list[dict]
 ):
     """
-    Answers questions about a file/photo/document uploaded inside the current chat.
+    Answers questions about a file, image or document uploaded
+    inside the current chat.
 
-    This function must behave like an assistant, not like an image-caption tool.
+    Documents provide all facts.
+    OpenAI may only make verified evidence cohesive.
     """
 
-    clean_context = (context or "").strip()
-    clean_query = (query or "").strip()
+    clean_query = clean_text_for_postgres(
+        str(query or "")
+    ).strip()
 
-    if not clean_context:
+    clean_context = clean_text_for_postgres(
+        str(context or "")
+    ).strip()
+
+    clean_rows = deduplicate_context_rows(
+        matched_rows or []
+    )
+
+    if not clean_query:
+        return {
+            "answer": "Please enter a question.",
+            "sources": []
+        }
+
+    if not clean_context or not clean_rows:
         return {
             "answer": (
-                "I received the uploaded file, but I could not read or analyse its contents yet. "
-                "Please try uploading it again, or check the backend processing_error for this asset."
+                "I received the uploaded file, but I could not find "
+                "readable information in it that answers the question."
             ),
             "sources": []
         }
 
-    try:
-        answer = ask_llm(
+    strict_result = (
+        answer_only_from_verified_document_evidence(
             query=clean_query,
-            context=f"""
-You are BridgeOS.
-
-The user is asking about a file/image/document they uploaded in this chat.
-
-Your job:
-Answer the user's latest question directly, like a practical assistant.
-
-Hard rules:
-- Do NOT behave like an image captioning model.
-- Do NOT start with "Based on the uploaded image" unless absolutely necessary.
-- Do NOT repeat the same visual description again and again.
-- Do NOT simply restate the uploaded context.
-- Do NOT give one-word answers.
-- Do NOT say only "good", "bad", "yes", or "no".
-- Do NOT invent facts.
-- Use only the uploaded file context.
-- Use British English.
-- Plain text only.
-
-For image questions:
-- Answer the actual question.
-- If the question asks what type/kind it is, give the broad visible category and evidence.
-- If the question asks whether it is good or recommended, explain that this cannot be confirmed from the image alone.
-- You may comment on visible design/use-case only.
-- You must NOT judge true condition, value, safety, seaworthiness, mechanical state, maintenance, survey status, or whether to buy unless those facts are visible/readable in the context.
-- If a buyer asks whether to buy it, say what the image suggests visually, then list what must be checked before buying.
-
-For invoice/document questions:
-- Extract visible fields from the uploaded context.
-- If it is an invoice, receipt, quote, purchase order, statement, or bill, look for supplier, invoice number, date, line items, quantities, unit prices, subtotal, VAT/tax, total, and currency.
-- If the user asks for a calculation, calculate only from visible numbers.
-- Show the arithmetic briefly.
-- If numbers are missing, say exactly which numbers are missing.
-- Do not invent missing values.
-
-For WhatsApp chat exports:
-- Analyse the upload as a conversation.
-- You may summarise the conversation, participants, dates, repeated topics, decisions, tasks, concerns, sentiment, and notable messages.
-- If the user asks who said something, use the sender names from the chat.
-- If the user asks for tasks or decisions, only include tasks or decisions clearly supported by the chat text.
-- If the user asks for tone or sentiment, explain it as an interpretation based on the messages.
-- Do not invent missing messages, deleted messages, private context, or intent that is not supported by the chat.
-
-Style:
-- Be direct.
-- Be useful.
-- Prefer 2 to 5 short paragraphs or bullets.
-- Do not over-explain.
-- Do not include source names inside the answer.
-
-User question:
-{clean_query}
-
-Uploaded file context:
-{clean_context}
-
-Now answer the user's question directly.
-""".strip()
+            matched_rows=clean_rows
         )
+    )
 
-        answer = str(answer or "").strip()
+    if not isinstance(strict_result, dict):
+        return {
+            "answer": FALLBACK_NO_DATA_ANSWER,
+            "sources": []
+        }
 
-    except Exception as e:
-        print("UPLOADED CHAT ASSET LLM ERROR:", type(e).__name__, str(e))
-        answer = ""
+    answer = clean_text_for_postgres(
+        str(
+            strict_result.get("answer")
+            or ""
+        )
+    ).strip()
 
-    if is_weak_uploaded_answer(answer, clean_query):
-        try:
-            answer = ask_llm(
-                query=clean_query,
-                context=f"""
-Rewrite the answer below because it is weak, repetitive, or caption-like.
-
-User wants a direct practical answer, not a generic image description.
-
-Rules:
-- Do not start with "Based on the uploaded image".
-- Do not repeat the whole image description.
-- Answer the user's question directly.
-- If asked whether the boat is good/recommended, explain visible positives and what cannot be judged from the image.
-- If asked whether to buy, say you cannot recommend buying from an image alone and list checks needed.
-- If the uploaded file is a WhatsApp chat export, answer as a conversation analyst: summarise, identify participants, tasks, decisions, topics, concerns, dates, or tone when supported by the chat text.
-- Use only the uploaded context.
-- Use British English.
-- Plain text only.
-
-User question:
-{clean_query}
-
-Weak answer:
-{answer}
-
-Uploaded context:
-{clean_context}
-
-Better answer:
-""".strip()
-            )
-
-            answer = str(answer or "").strip()
-
-        except Exception as e:
-            print("UPLOADED CHAT ASSET REWRITE ERROR:", type(e).__name__, str(e))
+    sources = strict_result.get(
+        "sources"
+    )
 
     if not answer:
-        answer = (
-            "I can see the uploaded file context, but I could not generate a reliable answer from it. "
-            "Please try again or check whether the file was processed successfully."
-        )
+        answer = FALLBACK_NO_DATA_ANSWER
 
-    sources = []
-
-    if matched_rows:
-        sources = build_sources_from_asset_results([matched_rows[0]])
+    if not isinstance(sources, list):
+        sources = []
 
     return {
         "answer": answer,
@@ -8033,6 +7961,574 @@ def source_quote_exists_in_row(row, quote):
 
     return len(matched_words) / max(len(quote_words), 1) >= 0.75
 
+def extract_protected_answer_tokens(
+    value: str
+) -> set[str]:
+    """
+    Extracts values OpenAI must never invent or silently change.
+
+    Protected values include:
+    - monetary amounts;
+    - currencies;
+    - percentages;
+    - dates;
+    - times;
+    - general numbers;
+    - reference-style identifiers.
+    """
+
+    text = clean_text_for_postgres(
+        str(value or "")
+    )
+
+    patterns = [
+        # Currency code or currency symbol followed by a number.
+        (
+            r"(?:USD|EUR|GBP|AED|SAR|QAR|CAD|AUD|"
+            r"US\$|CA\$|AU\$|\$|€|£)"
+            r"\s*-?\d[\d,\.\s]*"
+        ),
+
+        # Number followed by currency code.
+        (
+            r"-?\d[\d,\.\s]*"
+            r"\s*(?:USD|EUR|GBP|AED|SAR|QAR|CAD|AUD)"
+        ),
+
+        # Percentages.
+        r"-?\d+(?:[.,]\d+)?\s*%",
+
+        # Numeric dates.
+        r"\b\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4}\b",
+
+        # Times.
+        r"\b\d{1,2}:\d{2}(?::\d{2})?\b",
+
+        # Identifiers such as INV-2026-14 or PO/1188.
+        r"\b[A-Za-z]{2,}[-_/]\d[A-Za-z0-9\-_/]*\b",
+
+        # General numbers.
+        r"\b-?\d+(?:[.,]\d+)*\b",
+    ]
+
+    output = set()
+
+    for pattern in patterns:
+        matches = re.findall(
+            pattern,
+            text,
+            flags=re.IGNORECASE
+        )
+
+        for match in matches:
+            clean_match = " ".join(
+                str(match or "").lower().split()
+            ).strip()
+
+            if clean_match:
+                output.add(
+                    clean_match
+                )
+
+    return output
+
+def validate_protected_tokens_against_evidence(
+    answer: str,
+    evidence_quotes: list[str]
+) -> bool:
+    """
+    Rejects an answer when it contains a protected value that does not
+    appear in the verified exact quotations.
+
+    This provides a deterministic check for numbers, dates, currencies,
+    percentages and identifiers.
+    """
+
+    clean_answer = clean_text_for_postgres(
+        str(answer or "")
+    ).strip()
+
+    clean_quotes = [
+        clean_text_for_postgres(
+            str(quote or "")
+        ).strip()
+        for quote in evidence_quotes or []
+        if str(quote or "").strip()
+    ]
+
+    if not clean_answer or not clean_quotes:
+        return False
+
+    answer_tokens = extract_protected_answer_tokens(
+        clean_answer
+    )
+
+    if not answer_tokens:
+        return True
+
+    evidence_text = " ".join(
+        clean_quotes
+    ).lower()
+
+    evidence_text = " ".join(
+        evidence_text.split()
+    )
+
+    for token in answer_tokens:
+        normalised_token = " ".join(
+            token.lower().split()
+        )
+
+        if normalised_token not in evidence_text:
+            print(
+                "UNSUPPORTED ANSWER TOKEN:",
+                {
+                    "token": token,
+                    "answer": clean_answer[:1000]
+                }
+            )
+
+            return False
+
+    return True
+
+def answer_only_from_verified_document_evidence(
+    query: str,
+    matched_rows: list[dict]
+) -> dict:
+    """
+    Produces a cohesive answer from one or more retrieved documents.
+
+    The documents provide every fact.
+
+    OpenAI is allowed only to:
+    - identify relevant facts;
+    - combine facts from several sources;
+    - remove repetition;
+    - make the language cohesive;
+    - match the format to the question.
+
+    OpenAI is not allowed to add facts.
+    """
+
+    clean_query = clean_text_for_postgres(
+        str(query or "")
+    ).strip()
+
+    clean_rows = deduplicate_context_rows(
+        matched_rows or []
+    )
+
+    if not clean_query or not clean_rows:
+        return {
+            "answer": FALLBACK_NO_DATA_ANSWER,
+            "sources": []
+        }
+
+    numbered_context = (
+        build_numbered_context_from_asset_results(
+            clean_rows
+        )
+    )
+
+    numbered_context = clean_text_for_postgres(
+        str(numbered_context or "")
+    ).strip()
+
+    if not numbered_context:
+        return {
+            "answer": FALLBACK_NO_DATA_ANSWER,
+            "sources": []
+        }
+
+    try:
+        raw_response = ask_llm(
+            query=clean_query,
+            context=f"""
+You are a strict document evidence composer.
+
+The numbered document sources below are the ONLY allowed source of facts.
+
+Your role is limited to:
+
+1. Identify the exact information needed to answer the user's question.
+2. Find all relevant pieces across every numbered source.
+3. Combine facts when different documents contain different parts
+   of the answer.
+4. Remove unnecessary repetition.
+5. Organise the facts cohesively.
+6. Match the format to the question.
+
+You must NOT contribute factual knowledge.
+
+Return ONLY valid JSON in this exact form:
+
+{{
+  "answer": "the cohesive final answer",
+  "claims": [
+    {{
+      "claim": "one factual statement used in the answer",
+      "source_number": 1,
+      "evidence_quote": "an exact quotation copied from that source"
+    }}
+  ]
+}}
+
+ABSOLUTE RULES:
+
+- Every factual statement in "answer" must be represented in "claims".
+- Every claim must have one valid source_number.
+- Every evidence_quote must be copied exactly from that source.
+- Do not paraphrase the evidence_quote.
+- A claim may make the quotation grammatically cohesive, but it must
+  not add any factual detail absent from the quotation.
+- Search all sources before answering.
+- Do not stop after the first relevant source.
+- Use multiple sources when they contain different requested facts.
+- Never use general knowledge.
+- Never guess missing details.
+- Never infer a cause, reason, intent, responsibility, approval,
+  relationship, completion status or conclusion unless directly stated.
+- Preserve names exactly.
+- Preserve dates exactly.
+- Preserve times exactly.
+- Preserve quantities exactly.
+- Preserve amounts exactly.
+- Preserve currencies exactly.
+- Preserve percentages exactly.
+- Preserve document identifiers exactly.
+- Do not silently correct document values.
+- Do not calculate new values unless an exact deterministic calculation
+  result is already explicitly included in the source context.
+- Do not add source names inside the answer text.
+
+Match the answer structure to the question:
+
+- A direct factual question gets a direct answer.
+- A list request gets a list.
+- A comparison gets a clear comparison.
+- A procedure gets ordered steps.
+- A summary gets a cohesive summary.
+- A who/when/where question directly provides those fields.
+- A yes/no question gives yes or no only when the evidence explicitly
+  establishes it.
+
+If some requested information is present and another requested part
+is absent:
+- answer with the supported information;
+- explicitly state which requested part was not found;
+- do not guess the missing part.
+
+If the sources contain none of the requested information, return:
+
+{{
+  "answer": "{FALLBACK_NO_DATA_ANSWER}",
+  "claims": []
+}}
+
+User question:
+{clean_query}
+
+Numbered document sources:
+{numbered_context}
+""".strip()
+        )
+
+    except Exception as error:
+        print(
+            "STRICT DOCUMENT ANSWER REQUEST ERROR:",
+            type(error).__name__,
+            str(error)
+        )
+
+        return {
+            "answer": FALLBACK_NO_DATA_ANSWER,
+            "sources": []
+        }
+
+    parsed_response = parse_llm_json_response(
+        raw_response
+    )
+
+    if not isinstance(parsed_response, dict):
+        print(
+            "STRICT DOCUMENT ANSWER INVALID JSON:",
+            str(raw_response or "")[:1000]
+        )
+
+        return {
+            "answer": FALLBACK_NO_DATA_ANSWER,
+            "sources": []
+        }
+
+    answer = clean_text_for_postgres(
+        str(
+            parsed_response.get("answer")
+            or ""
+        )
+    ).strip()
+
+    claims = parsed_response.get(
+        "claims"
+    )
+
+    if (
+        not answer
+        or answer == FALLBACK_NO_DATA_ANSWER
+        or not isinstance(claims, list)
+        or not claims
+    ):
+        return {
+            "answer": FALLBACK_NO_DATA_ANSWER,
+            "sources": []
+        }
+
+    verified_rows = []
+    verified_quotes = []
+    seen_row_keys = set()
+
+    for claim_index, claim_data in enumerate(
+        claims,
+        start=1
+    ):
+        if not isinstance(claim_data, dict):
+            print(
+                "STRICT CLAIM IS NOT AN OBJECT:",
+                claim_index
+            )
+
+            return {
+                "answer": FALLBACK_NO_DATA_ANSWER,
+                "sources": []
+            }
+
+        claim_text = clean_text_for_postgres(
+            str(
+                claim_data.get("claim")
+                or ""
+            )
+        ).strip()
+
+        evidence_quote = clean_text_for_postgres(
+            str(
+                claim_data.get("evidence_quote")
+                or claim_data.get("quote")
+                or ""
+            )
+        ).strip()
+
+        try:
+            source_number = int(
+                claim_data.get("source_number")
+            )
+        except Exception:
+            print(
+                "STRICT CLAIM HAS INVALID SOURCE:",
+                claim_index
+            )
+
+            return {
+                "answer": FALLBACK_NO_DATA_ANSWER,
+                "sources": []
+            }
+
+        source_index = source_number - 1
+
+        if (
+            not claim_text
+            or not evidence_quote
+            or source_index < 0
+            or source_index >= len(clean_rows)
+        ):
+            print(
+                "STRICT CLAIM IS INCOMPLETE:",
+                claim_index
+            )
+
+            return {
+                "answer": FALLBACK_NO_DATA_ANSWER,
+                "sources": []
+            }
+
+        selected_row = clean_rows[
+            source_index
+        ]
+
+        if not source_quote_exists_in_row(
+            selected_row,
+            evidence_quote
+        ):
+            print(
+                "STRICT CLAIM QUOTE NOT FOUND:",
+                {
+                    "claim_index": claim_index,
+                    "source_number": source_number,
+                    "quote": evidence_quote[:500]
+                }
+            )
+
+            return {
+                "answer": FALLBACK_NO_DATA_ANSWER,
+                "sources": []
+            }
+
+        # Ensure protected values in the individual claim are present
+        # in that claim's exact quotation.
+        if not validate_protected_tokens_against_evidence(
+            answer=claim_text,
+            evidence_quotes=[evidence_quote]
+        ):
+            print(
+                "STRICT CLAIM ADDED A PROTECTED VALUE:",
+                claim_index
+            )
+
+            return {
+                "answer": FALLBACK_NO_DATA_ANSWER,
+                "sources": []
+            }
+
+        verified_quotes.append(
+            evidence_quote
+        )
+
+        row_key = (
+            selected_row.get("asset_id"),
+            selected_row.get("chunk_index"),
+            selected_row.get("content_type")
+        )
+
+        if row_key not in seen_row_keys:
+            seen_row_keys.add(
+                row_key
+            )
+
+            verified_rows.append(
+                selected_row
+            )
+
+    # Deterministically reject unsupported numbers, dates,
+    # amounts, percentages and identifiers in the final answer.
+    if not validate_protected_tokens_against_evidence(
+        answer=answer,
+        evidence_quotes=verified_quotes
+    ):
+        return {
+            "answer": FALLBACK_NO_DATA_ANSWER,
+            "sources": []
+        }
+
+    # Final semantic validation using only the already verified quotes.
+    try:
+        validation_response = ask_llm(
+            query=clean_query,
+            context=f"""
+You are validating whether a proposed answer contains only facts from
+verified exact document quotations.
+
+Return ONLY valid JSON:
+
+{{
+  "supported": true
+}}
+
+or:
+
+{{
+  "supported": false
+}}
+
+Set "supported" to true only when every factual statement in the
+proposed answer is explicitly supported by the verified quotations.
+
+Connecting grammar, reordering and removing repetition are allowed.
+
+Set "supported" to false if the answer introduces any unsupported:
+
+- person;
+- organisation;
+- date;
+- time;
+- number;
+- quantity;
+- amount;
+- currency;
+- percentage;
+- identifier;
+- event;
+- action;
+- status;
+- condition;
+- cause;
+- reason;
+- conclusion;
+- recommendation;
+- relationship;
+- responsibility;
+- approval;
+- intent.
+
+Set "supported" to false when the answer claims a requested fact was
+not found but that statement is contradicted by the quotations.
+
+Do not explain.
+Do not rewrite the answer.
+Return JSON only.
+
+User question:
+{clean_query}
+
+Proposed answer:
+{answer}
+
+Verified exact quotations:
+{json.dumps(
+    verified_quotes,
+    ensure_ascii=False,
+    indent=2
+)}
+""".strip()
+        )
+
+        validation_data = parse_llm_json_response(
+            validation_response
+        )
+
+        if (
+            not isinstance(validation_data, dict)
+            or validation_data.get("supported") is not True
+        ):
+            print(
+                "STRICT FINAL ANSWER FAILED VALIDATION:",
+                validation_response
+            )
+
+            return {
+                "answer": FALLBACK_NO_DATA_ANSWER,
+                "sources": []
+            }
+
+    except Exception as error:
+        print(
+            "STRICT FINAL ANSWER VALIDATION ERROR:",
+            type(error).__name__,
+            str(error)
+        )
+
+        return {
+            "answer": FALLBACK_NO_DATA_ANSWER,
+            "sources": []
+        }
+
+    return {
+        "answer": answer,
+        "sources": build_sources_from_asset_results(
+            verified_rows
+        )
+    }
+
+
+
 def verified_source_rows_from_llm_result(parsed, matched_rows):
     if not parsed or not isinstance(parsed, dict):
         return []
@@ -8944,7 +9440,6 @@ Document part {batch_index} of {len(batches)}:
     )
 
 
-
 def expand_retrieved_rows_to_full_relevant_documents(
     query: str,
     matched_rows: list[dict],
@@ -8953,80 +9448,233 @@ def expand_retrieved_rows_to_full_relevant_documents(
     answer_depth: str = "focused",
     max_assets: int | None = None,
     max_rows_per_asset: int | None = None,
-    max_context_chars: int = 120000
+    max_context_chars: int = 180000
 ) -> list[dict]:
     """
-    Expands retrieved chunks according to the requested answer depth.
+    Expands initially retrieved chunks into complete relevant document context.
+
+    Behaviour:
 
     focused:
-        Load the strongest relevant document with a bounded context.
+        The final answer should be concise, but up to five documents
+        may contribute different parts of the answer.
 
     comprehensive:
-        Load all chunks from several relevant documents.
+        Inspect up to ten relevant documents and preserve broad context.
 
     document:
-        Load all chunks from the strongest relevant document.
+        Inspect the strongest complete document.
+
+    This function does not answer the question.
+    It only loads accessible source material.
     """
 
     if not matched_rows:
         return []
 
+    clean_query = clean_text_for_postgres(
+        str(query or "")
+    ).strip()
+
+    clean_answer_depth = str(
+        answer_depth or "focused"
+    ).strip().lower()
+
+    if clean_answer_depth not in {
+        "focused",
+        "comprehensive",
+        "document"
+    }:
+        clean_answer_depth = "focused"
+
+    try:
+        clean_security_level = int(
+            security_level
+        )
+    except Exception:
+        clean_security_level = 4
+
     if max_assets is None:
-        if answer_depth == "comprehensive":
-            max_assets = 5
-        else:
+        if clean_answer_depth == "comprehensive":
+            max_assets = 10
+
+        elif clean_answer_depth == "document":
             max_assets = 1
 
+        else:
+            # A direct question can still require facts from several files.
+            max_assets = 5
+
+    max_assets = max(
+        1,
+        min(
+            int(max_assets),
+            20
+        )
+    )
+
     if max_rows_per_asset is None:
-        if answer_depth in {"comprehensive", "document"}:
+        if clean_answer_depth in {
+            "comprehensive",
+            "document"
+        }:
             max_rows_per_asset = 5000
         else:
-            max_rows_per_asset = 800
+            max_rows_per_asset = 1500
+
+    max_rows_per_asset = max(
+        1,
+        int(max_rows_per_asset)
+    )
 
     selected_asset_ids = choose_relevant_asset_ids_for_query(
-        query=query,
+        query=clean_query,
         matched_rows=matched_rows,
         max_assets=max_assets
     )
 
-    print(
-        "FULL CONTEXT DEBUG:",
-        {
-            "answer_depth": answer_depth,
-            "selected_asset_ids": selected_asset_ids
-        }
-    )
-
-    expanded_rows = []
-
-    for asset_id in selected_asset_ids:
-        full_rows = get_full_asset_rows_for_context(
-            yacht_id=yacht_id,
-            asset_id=asset_id,
-            security_level=security_level,
-            max_rows=max_rows_per_asset
+    if not selected_asset_ids:
+        selected_asset_ids = ordered_unique_asset_ids_from_rows(
+            matched_rows,
+            max_assets=max_assets
         )
 
-        if full_rows:
-            expanded_rows.extend(full_rows)
+    if not selected_asset_ids:
+        return deduplicate_context_rows(
+            matched_rows
+        )
+
+    expanded_rows = []
+    total_characters = 0
+
+    for asset_id in selected_asset_ids:
+        if not asset_id:
+            continue
+
+        try:
+            chunk_response = (
+                supabase.table("asset_chunks")
+                .select(
+                    "id, asset_id, yacht_id, chat_id, "
+                    "security_level, content, content_type, "
+                    "chunk_index, detected_date, detected_year, "
+                    "tags, assets(file_name, original_file_name)"
+                )
+                .eq("asset_id", asset_id)
+                .eq("yacht_id", yacht_id)
+                .order("chunk_index")
+                .limit(max_rows_per_asset)
+                .execute()
+            )
+
+            asset_rows = chunk_response.data or []
+
+        except Exception as error:
+            print(
+                "FULL DOCUMENT EXPANSION ERROR:",
+                {
+                    "asset_id": asset_id,
+                    "error_type": type(error).__name__,
+                    "error": str(error)
+                }
+            )
+
+            asset_rows = []
+
+        if not asset_rows:
+            asset_rows = [
+                row
+                for row in matched_rows
+                if row.get("asset_id") == asset_id
+            ]
+
+        for row in asset_rows:
+            if not isinstance(row, dict):
+                continue
+
+            row_yacht_id = row.get("yacht_id")
+
+            if (
+                row_yacht_id
+                and str(row_yacht_id) != str(yacht_id)
+            ):
+                continue
+
+            row_security_level = row.get(
+                "security_level"
+            )
+
+            if (
+                clean_security_level != 1
+                and row_security_level is not None
+            ):
+                try:
+                    if int(row_security_level) < clean_security_level:
+                        continue
+                except Exception:
+                    continue
+
+            row_content = clean_text_for_postgres(
+                str(
+                    row.get("content")
+                    or row.get("text")
+                    or ""
+                )
+            ).strip()
+
+            if not row_content:
+                continue
+
+            remaining_characters = (
+                max_context_chars
+                - total_characters
+            )
+
+            if remaining_characters <= 0:
+                break
+
+            if len(row_content) > remaining_characters:
+                row_content = row_content[
+                    :remaining_characters
+                ]
+
+            clean_row = dict(row)
+            clean_row["content"] = row_content
+
+            nested_asset = row.get("assets")
+
+            if isinstance(nested_asset, dict):
+                clean_row["file_name"] = (
+                    clean_row.get("file_name")
+                    or nested_asset.get("file_name")
+                )
+
+                clean_row["original_file_name"] = (
+                    clean_row.get("original_file_name")
+                    or nested_asset.get(
+                        "original_file_name"
+                    )
+                )
+
+            expanded_rows.append(
+                clean_row
+            )
+
+            total_characters += len(
+                row_content
+            )
+
+        if total_characters >= max_context_chars:
+            break
 
     if not expanded_rows:
-        return matched_rows
+        return deduplicate_context_rows(
+            matched_rows
+        )
 
-    preserve_all_rows = answer_depth in {
-        "comprehensive",
-        "document"
-    }
-
-    expanded_rows = trim_rows_for_context_limit(
-        rows=expanded_rows,
-        max_chars=max_context_chars,
-        preserve_all_rows=preserve_all_rows
+    return deduplicate_context_rows(
+        expanded_rows
     )
-
-    print("FULL CONTEXT DEBUG expanded_rows:", len(expanded_rows))
-
-    return expanded_rows or matched_rows
     
 # ------------------------
 # GENERIC NUMERIC TABLE / LIST COMPARISON
@@ -9292,17 +9940,24 @@ def answer_numeric_comparison_from_context(
 
 def classify_answer_depth(query: str) -> str:
     """
-    Determines how much document context the user is requesting.
+    Determines how much source information must be inspected.
 
     Returns:
-    - "focused": answer the specific question from the most relevant section
-    - "comprehensive": include all relevant information about the requested subject
-    - "document": inspect the entire relevant document
+    - focused:
+      A narrow question, but several documents may still contribute.
+    - comprehensive:
+      The user requests all relevant information about a subject.
+    - document:
+      The user asks to inspect one complete document.
 
-    This classifier contains no document topics or subject names.
+    Important:
+    "focused" does NOT mean one document.
+    It only means the final answer should be concise.
     """
 
-    clean_query = str(query or "").strip()
+    clean_query = clean_text_for_postgres(
+        str(query or "")
+    ).strip()
 
     if not clean_query:
         return "focused"
@@ -9311,7 +9966,7 @@ def classify_answer_depth(query: str) -> str:
         raw = ask_llm(
             query=clean_query,
             context="""
-Classify how much source information the user is requesting.
+Classify the amount of source information the user is requesting.
 
 Return exactly one of these words:
 
@@ -9322,37 +9977,44 @@ document
 Definitions:
 
 focused:
-The user asks a specific question and needs the directly relevant answer.
+The user asks a specific question and wants a direct answer.
+The answer may still require combining facts from several documents.
 
 comprehensive:
-The user asks for all information, every detail, everything available,
-a complete explanation, a full list, all entries, all steps, all requirements,
-all actions, all findings, or otherwise requests exhaustive information
-about a subject.
+The user asks for all information, every relevant detail, a full list,
+all entries, all steps, all requirements, all actions, all findings,
+or a complete explanation about a subject.
 
 document:
-The user asks to summarise, analyse, extract, review, or explain the entire
-file or document.
+The user explicitly asks to summarise, review, analyse, explain,
+or extract information from one complete file or document.
 
 Rules:
-- Classify intent only.
-- Do not answer the question.
-- Do not identify the subject.
-- Do not add facts.
+- Classify only the requested answer depth.
+- Do not answer the user's question.
+- Do not decide how many documents contain the answer.
+- Do not assume a focused answer comes from only one document.
+- Do not identify or invent document names.
 - Return one word only.
 """.strip()
         )
 
-        value = str(raw or "").strip().lower()
+        value = str(
+            raw or ""
+        ).strip().lower()
 
-        if value in {"focused", "comprehensive", "document"}:
+        if value in {
+            "focused",
+            "comprehensive",
+            "document"
+        }:
             return value
 
-    except Exception as e:
+    except Exception as error:
         print(
             "ANSWER DEPTH CLASSIFIER ERROR:",
-            type(e).__name__,
-            str(e)
+            type(error).__name__,
+            str(error)
         )
 
     return "focused"
