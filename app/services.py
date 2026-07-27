@@ -8327,15 +8327,13 @@ def create_voice_note_and_answer(
             "storage_path": asset.get("storage_path")
         }
     
-
 def answer_financial_total_from_context(
     query: str,
     context: str,
     matched_rows: list[dict]
 ):
     """
-    Extracts financial values from document context and calculates the total
-    in Python rather than allowing the LLM to invent or miscalculate it.
+    Extracts supported financial values and calculates the total in Python.
     """
 
     clean_query = str(query or "").strip().lower()
@@ -8386,11 +8384,10 @@ Rules:
 - Do not calculate the total.
 - Do not estimate.
 - Do not invent missing amounts.
-- Do not include subtotals when the corresponding final total is also included,
-  unless the user explicitly asks for subtotals.
+- Do not include a subtotal if the final total for the same invoice is present.
 - Do not combine different currencies.
-- If currencies differ, return the currency as "MIXED".
-- Amount must be a JSON number without currency symbols.
+- If currencies differ, return "MIXED" as the currency.
+- Amount must be a JSON number.
 - Evidence must be copied from the supplied context.
 - If no supported amounts exist, return:
   {{"currency": "", "amounts": []}}
@@ -8406,14 +8403,21 @@ Document context:
         parsed = parse_llm_json_response(raw)
 
     except Exception as e:
-        print("FINANCIAL EXTRACTION ERROR:", type(e).__name__, str(e))
+        print(
+            "FINANCIAL EXTRACTION ERROR:",
+            type(e).__name__,
+            str(e)
+        )
         return None
 
     if not parsed or not isinstance(parsed, dict):
         return None
 
-    currency = str(parsed.get("currency") or "").strip()
+    currency = str(parsed.get("currency") or "").strip().upper()
     amount_rows = parsed.get("amounts") or []
+
+    if not isinstance(amount_rows, list):
+        return None
 
     verified_amounts = []
 
@@ -8429,27 +8433,33 @@ Document context:
         except (TypeError, ValueError):
             continue
 
-        if amount < 0:
+        if amount < 0 or not evidence:
             continue
 
-        if not evidence:
-            continue
-
-        evidence_normalised = " ".join(evidence.lower().split())
+        evidence_normalised = " ".join(
+            evidence.lower().split()
+        )
 
         supporting_row = None
 
         for row in matched_rows or []:
             row_text = " ".join(
-                str(row.get("content") or "").lower().split()
+                str(
+                    row.get("content")
+                    or row.get("text")
+                    or ""
+                ).lower().split()
             )
 
-            if evidence_normalised and evidence_normalised in row_text:
+            if evidence_normalised in row_text:
                 supporting_row = row
                 break
 
         if not supporting_row:
-            print("FINANCIAL EVIDENCE NOT VERIFIED:", evidence[:150])
+            print(
+                "FINANCIAL EVIDENCE NOT VERIFIED:",
+                evidence[:150]
+            )
             continue
 
         verified_amounts.append({
@@ -8462,18 +8472,27 @@ Document context:
     if not verified_amounts:
         return None
 
-    if currency.upper() == "MIXED":
+    source_rows = [
+        item["source_row"]
+        for item in verified_amounts
+    ]
+
+    sources = build_sources_from_asset_results(source_rows)
+
+    if currency == "MIXED":
         return {
             "answer": (
-                "The documents contain amounts in different currencies, so I cannot "
-                "produce one accurate combined total without a conversion rate."
+                "The documents contain amounts in different currencies, "
+                "so I cannot produce one accurate combined total without "
+                "a specified currency-conversion rate."
             ),
-            "sources": build_sources_from_asset_results(
-                [item["source_row"] for item in verified_amounts]
-            )
+            "sources": sources
         }
 
-    total = sum(item["amount"] for item in verified_amounts)
+    total = sum(
+        item["amount"]
+        for item in verified_amounts
+    )
 
     symbol_lookup = {
         "USD": "$",
@@ -8481,8 +8500,7 @@ Document context:
         "GBP": "£"
     }
 
-    clean_currency = currency.upper()
-    currency_symbol = symbol_lookup.get(clean_currency, "")
+    currency_symbol = symbol_lookup.get(currency, "")
 
     lines = []
 
@@ -8491,39 +8509,42 @@ Document context:
 
         if currency_symbol:
             amount_text = f"{currency_symbol}{formatted_amount}"
-        elif clean_currency:
-            amount_text = f"{formatted_amount} {clean_currency}"
+        elif currency:
+            amount_text = f"{formatted_amount} {currency}"
         else:
             amount_text = formatted_amount
 
-        lines.append(f"- {item['label']}: {amount_text}")
+        lines.append(
+            f"- {item['label']}: {amount_text}"
+        )
 
     formatted_total = f"{total:,.2f}"
 
     if currency_symbol:
         total_text = f"{currency_symbol}{formatted_total}"
-    elif clean_currency:
-        total_text = f"{formatted_total} {clean_currency}"
+    elif currency:
+        total_text = f"{formatted_total} {currency}"
     else:
         total_text = formatted_total
+
+    calculation = " + ".join(
+        f"{item['amount']:,.2f}"
+        for item in verified_amounts
+    )
 
     answer = "\n".join([
         f"The supported total is {total_text}.",
         "",
         *lines,
         "",
-        "Calculation: "
-        + " + ".join(f"{item['amount']:,.2f}" for item in verified_amounts)
-        + f" = {formatted_total}"
+        f"Calculation: {calculation} = {formatted_total}"
     ])
 
     return {
         "answer": answer,
-        "sources": build_sources_from_asset_results(
-            [item["source_row"] for item in verified_amounts]
-        )
+        "sources": sources
     }
-    
+
 
 def chat(
     query: str,
