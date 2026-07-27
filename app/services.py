@@ -8326,6 +8326,8 @@ def create_voice_note_and_answer(
             "mime_type": asset.get("mime_type"),
             "storage_path": asset.get("storage_path")
         }
+
+    }
     
 def answer_financial_total_from_context(
     query: str,
