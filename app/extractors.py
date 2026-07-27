@@ -144,29 +144,159 @@ def extract_pdf_text(file, filename: str = "document.pdf") -> str:
     return extracted_text.strip()
 
 def extract_docx_text(file) -> str:
-    file.seek(0)
+    """
+    Extracts text from:
+    - normal DOCX paragraphs
+    - tables
+    - headers
+    - footers
+    - text boxes and other XML text nodes
+    """
 
+    file.seek(0)
     document = Document(file)
 
     parts = []
+    seen = set()
 
+    def add_text(value: str):
+        clean = " ".join(str(value or "").split()).strip()
+
+        if not clean:
+            return
+
+        if clean in seen:
+            return
+
+        seen.add(clean)
+        parts.append(clean)
+
+    # Normal document paragraphs
     for paragraph in document.paragraphs:
-        text = paragraph.text or ""
+        add_text(paragraph.text)
 
-        if text.strip():
-            parts.append(text.strip())
+    # Tables, including nested tables
+    def extract_table(table):
+        for row in table.rows:
+            row_values = []
 
-    return "\n\n".join(parts).strip()
+            for cell in row.cells:
+                cell_parts = []
 
+                for paragraph in cell.paragraphs:
+                    text = " ".join((paragraph.text or "").split()).strip()
 
+                    if text:
+                        cell_parts.append(text)
+
+                for nested_table in cell.tables:
+                    extract_table(nested_table)
+
+                cell_text = " | ".join(cell_parts).strip()
+
+                if cell_text:
+                    row_values.append(cell_text)
+
+            if row_values:
+                add_text(" | ".join(row_values))
+
+    for table in document.tables:
+        extract_table(table)
+
+    # Headers and footers
+    for section in document.sections:
+        for paragraph in section.header.paragraphs:
+            add_text(paragraph.text)
+
+        for table in section.header.tables:
+            extract_table(table)
+
+        for paragraph in section.footer.paragraphs:
+            add_text(paragraph.text)
+
+        for table in section.footer.tables:
+            extract_table(table)
+
+    # Text boxes, shapes and XML text nodes that python-docx does not
+    # expose through document.paragraphs.
+    try:
+        namespace = {
+            "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        }
+
+        xml_text_nodes = document.element.body.xpath(
+            ".//w:t",
+            namespaces=namespace
+        )
+
+        for node in xml_text_nodes:
+            add_text(node.text)
+
+    except TypeError:
+        # Some lxml/python-docx versions already know the namespaces.
+        try:
+            xml_text_nodes = document.element.body.xpath(".//w:t")
+
+            for node in xml_text_nodes:
+                add_text(node.text)
+
+        except Exception as e:
+            print(
+                "DOCX XML TEXT EXTRACTION ERROR:",
+                type(e).__name__,
+                str(e)
+            )
+
+    except Exception as e:
+        print(
+            "DOCX XML TEXT EXTRACTION ERROR:",
+            type(e).__name__,
+            str(e)
+        )
+
+    try:
+        file.seek(0)
+    except Exception:
+        pass
+
+    return "\n".join(parts).strip()
+    
 def extract_text_by_file_type(file, filename: str, file_type: str) -> str:
-    if file_type == "text":
-        return extract_plain_text(file, filename)
+    file_type = str(file_type or "").strip().lower()
 
-    if file_type == "pdf":
-        return extract_pdf_text(file, filename)
+    try:
+        file.seek(0)
 
-    if file_type == "docx":
-        return extract_docx_text(file)
+        if file_type == "text":
+            extracted = extract_plain_text(file, filename)
 
-    return ""
+        elif file_type == "pdf":
+            extracted = extract_pdf_text(file, filename)
+
+        elif file_type == "docx":
+            extracted = extract_docx_text(file)
+
+        else:
+            raise ValueError(
+                f"Unsupported extractable file type: {file_type}"
+            )
+
+        extracted = str(extracted or "").strip()
+
+        print(
+            "TEXT EXTRACTION DEBUG:",
+            {
+                "filename": filename,
+                "file_type": file_type,
+                "characters": len(extracted),
+                "preview": extracted[:300]
+            }
+        )
+
+        return extracted
+
+    finally:
+        try:
+            file.seek(0)
+        except Exception:
+            pass

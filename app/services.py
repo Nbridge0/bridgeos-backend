@@ -42,6 +42,8 @@ import jwt as pyjwt
 import io
 import re
 import zipfile
+import ast
+import operator
 from urllib.parse import quote
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -4723,6 +4725,27 @@ def process_uploaded_asset(
             else:
                 file_type = original_file_type
 
+            if file_type in ["text", "pdf", "docx"]:
+                extracted_text = str(extracted_text or "").strip()
+
+                print(
+                    "DOCUMENT EXTRACTION RESULT:",
+                    {
+                        "asset_id": asset_id,
+                        "filename": filename,
+                        "file_type": file_type,
+                        "characters": len(extracted_text),
+                        "preview": extracted_text[:500]
+                    }
+                )
+
+                if not extracted_text:
+                    raise ValueError(
+                        f"No readable text was extracted from {filename}. "
+                        f"The document may be empty, damaged, encrypted, "
+                        f"scanned, or stored in unsupported embedded objects."
+                    )
+
         if file_type == "pdf":
             should_run_pdf_ocr = False
 
@@ -4878,6 +4901,21 @@ def create_asset_chunks(
     tags = tags or []
     rows = []
 
+        # Remove stale chunks when an asset is reprocessed.
+    try:
+        supabase.table("asset_chunks") \
+            .delete() \
+            .eq("asset_id", asset_id) \
+            .eq("yacht_id", yacht_id) \
+            .execute()
+
+    except Exception as e:
+        print(
+            "OLD ASSET CHUNK DELETE ERROR:",
+            type(e).__name__,
+            str(e)
+        )
+
     metadata_content = f"""
 File name: {filename}
 File type: {file_type}
@@ -4955,8 +4993,32 @@ Tags: {", ".join(tags)}
                 "embedding": embed(chunk)
             })
 
-    if rows:
-        supabase.table("asset_chunks").insert(rows).execute()
+    if not rows:
+        raise ValueError(
+            f"No searchable chunks were created for asset {asset_id}"
+        )
+
+    for start in range(0, len(rows), 200):
+        batch = rows[start:start + 200]
+
+        result = supabase.table("asset_chunks") \
+            .insert(batch) \
+            .execute()
+
+        if not result.data:
+            raise RuntimeError(
+                f"Supabase returned no inserted chunks for asset {asset_id}"
+            )
+
+    print(
+        "ASSET CHUNKS CREATED:",
+        {
+            "asset_id": asset_id,
+            "chunk_count": len(rows),
+            "text_characters": len(extracted_text or ""),
+            "ocr_characters": len(ocr_text or "")
+        }
+    )
 
 def build_context_from_asset_results(results: list[dict]) -> str:
     """
@@ -5787,30 +5849,6 @@ def list_my_documents(crew: dict):
 # ------------------------
 # DOCUMENT TEXT CHUNKING
 # ------------------------
-
-def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 150):
-    """
-    Splits document text into overlapping chunks.
-    """
-
-    if not text:
-        return []
-
-    chunks = []
-    start = 0
-    text_length = len(text)
-
-    while start < text_length:
-        end = start + chunk_size
-        chunk = text[start:end].strip()
-
-        if chunk:
-            chunks.append(chunk)
-
-        start += chunk_size - overlap
-
-    return chunks
-
 
 def save_document_chunks(document_id: str, yacht_id: str, text: str):
     """
@@ -7852,45 +7890,52 @@ def parse_numeric_comparison_query(query: str):
         match = re.search(pattern, q)
 
         if match:
+            try:
+                threshold = Decimal(match.group(1))
+            except InvalidOperation:
+                return None
+
             return {
                 "operator": operator,
-                "threshold": float(match.group(1))
+                "threshold": threshold
             }
 
     return None
 
 
-def compare_numeric_value(value: float, operator: str, threshold: float) -> bool:
-    if operator == "lt":
+def compare_numeric_value(
+    value: Decimal,
+    comparison_operator: str,
+    threshold: Decimal
+) -> bool:
+    if comparison_operator == "lt":
         return value < threshold
 
-    if operator == "lte":
+    if comparison_operator == "lte":
         return value <= threshold
 
-    if operator == "gt":
+    if comparison_operator == "gt":
         return value > threshold
 
-    if operator == "gte":
+    if comparison_operator == "gte":
         return value >= threshold
 
-    if operator == "eq":
+    if comparison_operator == "eq":
         return value == threshold
 
     return False
 
-
 def format_number_for_answer(value):
     try:
-        number = float(value)
+        number = Decimal(str(value))
 
-        if number.is_integer():
-            return str(int(number))
+        if number == number.to_integral_value():
+            return str(number.quantize(Decimal("1")))
 
-        return str(number)
+        return format(number.normalize(), "f")
 
     except Exception:
         return str(value)
-
 
 def extract_numeric_rows_with_llm(
     query: str,
@@ -7972,9 +8017,11 @@ Document context:
 
         for value in numeric_values:
             try:
-                clean_numbers.append(float(value))
-            except Exception:
+                clean_value = Decimal(str(value))
+            except InvalidOperation:
                 continue
+
+            clean_numbers.append(clean_value)
 
         if not clean_numbers:
             continue
