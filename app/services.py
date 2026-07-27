@@ -4603,6 +4603,132 @@ def get_pending_document_for_download(
 
     return res.data[0]
 
+def transcribe_audio(
+    file,
+    filename: str,
+    mime_type: str | None = None
+) -> str:
+    """
+    Sends a voice note to the RunPod speech-to-text endpoint.
+
+    Expected RunPod response:
+    {
+        "text": "transcribed message"
+    }
+
+    It also accepts:
+    {
+        "transcript": "transcribed message"
+    }
+    """
+
+    if not RUNPOD_BASE_URL:
+        raise HTTPException(
+            status_code=500,
+            detail="RUNPOD_BASE_URL is missing"
+        )
+
+    if not BRIDGEOS_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="BRIDGEOS_API_KEY is missing"
+        )
+
+    try:
+        file.seek(0)
+        audio_bytes = file.read()
+        file.seek(0)
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not read voice note: {str(e)}"
+        )
+
+    if not audio_bytes:
+        raise HTTPException(
+            status_code=400,
+            detail="The voice note is empty"
+        )
+
+    # Maximum 25 MB.
+    if len(audio_bytes) > 25 * 1024 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail="Voice note must be smaller than 25 MB"
+        )
+
+    url = f"{RUNPOD_BASE_URL.rstrip('/')}/api/bridgeos/transcribe"
+
+    try:
+        response = requests.post(
+            url,
+            files={
+                "file": (
+                    filename or "voice-note.webm",
+                    audio_bytes,
+                    mime_type or "audio/webm"
+                )
+            },
+            headers={
+                "x-api-key": BRIDGEOS_API_KEY
+            },
+            timeout=180
+        )
+
+        print("VOICE TRANSCRIPTION DEBUG URL:", url)
+        print("VOICE TRANSCRIPTION DEBUG STATUS:", response.status_code)
+        print("VOICE TRANSCRIPTION DEBUG RESPONSE:", response.text[:500])
+
+    except requests.exceptions.Timeout:
+        raise HTTPException(
+            status_code=504,
+            detail="Voice transcription timed out"
+        )
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Could not connect to the voice transcription service: "
+                f"{type(e).__name__}: {str(e)}"
+            )
+        )
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Voice transcription returned {response.status_code}: "
+                f"{response.text[:500]}"
+            )
+        )
+
+    try:
+        data = response.json()
+    except Exception:
+        raise HTTPException(
+            status_code=502,
+            detail="Voice transcription returned invalid JSON"
+        )
+
+    transcript = (
+        data.get("text")
+        or data.get("transcript")
+        or data.get("response")
+        or data.get("result", {}).get("text")
+        or ""
+    )
+
+    transcript = clean_text_for_postgres(str(transcript or ""))
+
+    if not transcript:
+        raise HTTPException(
+            status_code=422,
+            detail="No speech could be detected in the voice note"
+        )
+
+    return transcript
+
 def upload_asset(
     file,
     filename: str,
@@ -4855,6 +4981,20 @@ def process_uploaded_asset(
 
             extracted_text = clean_text_for_postgres(extracted_text)
             file_type = "whatsapp_chat"
+
+        elif file_type == "audio":
+            file.seek(0)
+
+            extracted_text = transcribe_audio(
+                file=file,
+                filename=filename,
+                mime_type=None
+            )
+
+    extracted_text = clean_text_for_postgres(extracted_text)
+
+    if not extracted_text:
+        raise ValueError("The audio file did not contain detectable speech")
 
         elif file_type in ["text", "pdf", "docx"]:
             original_file_type = file_type
@@ -8346,6 +8486,149 @@ Rules:
         )
 
     return "focused"
+
+def create_voice_note_and_answer(
+    file,
+    filename: str,
+    mime_type: str | None,
+    crew: dict,
+    chat_id: str
+):
+    """
+    Saves the original voice recording, transcribes it, saves the transcript
+    as the user message, and generates the normal BridgeOS response.
+    """
+
+    verify_chat_access(
+        chat_id=chat_id,
+        crew_id=crew["id"],
+        yacht_id=crew["yacht_id"]
+    )
+
+    allowed_mime_types = {
+        "audio/webm",
+        "audio/wav",
+        "audio/x-wav",
+        "audio/mpeg",
+        "audio/mp3",
+        "audio/mp4",
+        "audio/m4a",
+        "audio/ogg",
+        "audio/aac",
+        "video/mp4"
+    }
+
+    clean_mime_type = (mime_type or "").lower().split(";")[0].strip()
+
+    if clean_mime_type and clean_mime_type not in allowed_mime_types:
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported voice-note format: {clean_mime_type}"
+        )
+
+    try:
+        file.seek(0)
+        audio_bytes = file.read()
+        file.seek(0)
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not read voice note: {str(e)}"
+        )
+
+    if not audio_bytes:
+        raise HTTPException(
+            status_code=400,
+            detail="Voice note is empty"
+        )
+
+    if len(audio_bytes) > 25 * 1024 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail="Voice note must be smaller than 25 MB"
+        )
+
+    voice_filename = safe_filename(
+        filename or f"voice-note-{uuid.uuid4()}.webm"
+    )
+
+    # This uses the existing asset pipeline:
+    # - Supabase Storage
+    # - assets table
+    # - transcription
+    # - asset_chunks
+    upload_result = upload_asset(
+        file=io.BytesIO(audio_bytes),
+        filename=voice_filename,
+        mime_type=mime_type or "audio/webm",
+        yacht_id=crew["yacht_id"],
+        uploaded_by=crew["id"],
+        chat_id=chat_id,
+        security_level=int(crew["security_level"]),
+        folder_name=None,
+        folder_security_level=None
+    )
+
+    asset = upload_result.get("asset") or {}
+
+    asset_id = asset.get("id")
+
+    if not asset_id:
+        raise HTTPException(
+            status_code=500,
+            detail="Voice note was uploaded but no asset ID was returned"
+        )
+
+    transcript = clean_text_for_postgres(
+        asset.get("extracted_text") or ""
+    )
+
+    # In case the returned upload row was the original pre-update row,
+    # retrieve the processed asset again.
+    if not transcript:
+        asset_res = supabase.table("assets") \
+            .select("id, extracted_text, file_name, mime_type, storage_path") \
+            .eq("id", asset_id) \
+            .eq("yacht_id", crew["yacht_id"]) \
+            .single() \
+            .execute()
+
+        processed_asset = asset_res.data or {}
+        transcript = clean_text_for_postgres(
+            processed_asset.get("extracted_text") or ""
+        )
+
+        if processed_asset:
+            asset = processed_asset
+
+    if not transcript:
+        raise HTTPException(
+            status_code=422,
+            detail="The voice note was saved, but no speech was detected"
+        )
+
+    # Reuse your existing chat function.
+    # This saves the transcript as the user message and saves the AI answer.
+    chat_result = chat(
+        query=transcript,
+        crew_id=crew["id"],
+        yacht_id=crew["yacht_id"],
+        security_level=crew["security_level"],
+        chat_id=chat_id,
+        uploaded_asset_id=asset_id
+    )
+
+    return {
+        **chat_result,
+        "transcript": transcript,
+        "voice_asset_id": asset_id,
+        "voice_asset": {
+            "id": asset_id,
+            "file_name": asset.get("file_name"),
+            "mime_type": asset.get("mime_type"),
+            "storage_path": asset.get("storage_path")
+        }
+    }
 
 def chat(
     query: str,

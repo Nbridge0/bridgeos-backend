@@ -1500,6 +1500,46 @@ async def connect_whatsapp_api(
         }
     }
 
+@app.post("/voice-notes")
+async def voice_note_api(
+    request: Request,
+    file: UploadFile = File(...),
+    chat_id: str = Form(...),
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    crew = services.get_crew(user["sub"])
+
+    if not crew:
+        raise HTTPException(
+            status_code=403,
+            detail="No access"
+        )
+
+    if not chat_id:
+        raise HTTPException(
+            status_code=422,
+            detail="Missing chat_id"
+        )
+
+    services.verify_chat_access(
+        chat_id=chat_id,
+        crew_id=crew["id"],
+        yacht_id=crew["yacht_id"]
+    )
+
+    filename = file.filename or "voice-note.webm"
+    mime_type = file.content_type or "audio/webm"
+
+    return services.create_voice_note_and_answer(
+        file=file.file,
+        filename=filename,
+        mime_type=mime_type,
+        crew=crew,
+        chat_id=chat_id
+    )
+
 @app.post("/chat")
 async def chat_api(
     body: ChatRequest,
