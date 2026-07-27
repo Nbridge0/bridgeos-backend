@@ -77,6 +77,8 @@ storage_admin = create_client(
     SUPABASE_SERVICE_KEY
 )
 
+FINANCIAL_EXTRACTION_CACHE: dict[str, list[dict]] = {}
+
 # ------------------------
 # WHATSAPP EXPORT UPLOADS
 # ------------------------
@@ -4792,14 +4794,10 @@ def process_uploaded_asset(
                 pdf_ocr_text = clean_text_for_postgres(pdf_ocr_text)
 
                 if pdf_ocr_text:
-                    if extracted_text:
-                        extracted_text = clean_text_for_postgres(
-                            f"{extracted_text}\n\nPDF OCR fallback text:\n{pdf_ocr_text}"
-                        )
-                    else:
-                        extracted_text = pdf_ocr_text
-
                     ocr_text = pdf_ocr_text
+
+                    if not extracted_text:
+                        extracted_text = pdf_ocr_text
 
         if file_type == "image":
             file.seek(0)
@@ -9069,105 +9067,217 @@ def extract_spending_subject(query: str) -> str:
     )
 
     return subject
-    
-    
+
+def decimal_text_variants(
+    value: Decimal | None
+) -> set[str]:
+    if value is None:
+        return set()
+
+    decimal_value = Decimal(str(value))
+
+    variants = {
+        str(decimal_value),
+        format(decimal_value, "f"),
+        format(decimal_value.normalize(), "f"),
+    }
+
+    if decimal_value == decimal_value.to_integral_value():
+        integer_text = str(
+            decimal_value.quantize(Decimal("1"))
+        )
+
+        variants.add(integer_text)
+        variants.add(integer_text + ".0")
+        variants.add(integer_text + ".00")
+    else:
+        variants.add(f"{decimal_value:.2f}")
+
+    return {
+        normalise_search_text(item)
+        for item in variants
+        if str(item or "").strip()
+    }
+
+
+def document_contains_decimal(
+    document_text: str,
+    value: Decimal | None
+) -> bool:
+    if value is None:
+        return True
+
+    normalised_document = normalise_search_text(
+        document_text
+    )
+
+    return any(
+        variant in normalised_document
+        for variant in decimal_text_variants(value)
+    )
+
+
+def evidence_is_supported_exactly(
+    evidence: str,
+    document_text: str
+) -> bool:
+    normalised_evidence = normalise_search_text(
+        evidence
+    )
+
+    normalised_document = normalise_search_text(
+        document_text
+    )
+
+    if not normalised_evidence or not normalised_document:
+        return False
+
+    if normalised_evidence in normalised_document:
+        return True
+
+    evidence_words = [
+        word
+        for word in normalised_evidence.split()
+        if len(word) >= 2
+    ]
+
+    if len(evidence_words) < 3:
+        return False
+
+    matched_word_count = sum(
+        1
+        for word in evidence_words
+        if word in normalised_document
+    )
+
+    return (
+        matched_word_count
+        / len(evidence_words)
+    ) >= 0.90
+
+
+def financial_extraction_cache_key(
+    asset_id: str,
+    subject: str,
+    document_text: str
+) -> str:
+    raw_value = "\n".join([
+        str(asset_id or ""),
+        normalise_search_text(subject),
+        document_text,
+    ])
+
+    return hashlib.sha256(
+        raw_value.encode("utf-8")
+    ).hexdigest()
+
 def extract_subject_line_items_with_llm(
     query: str,
     subject: str,
-    context: str
+    context: str,
+    asset_id: str | None = None
 ) -> list[dict]:
     """
-    Extracts every financial row associated with the requested subject.
+    Extracts financial rows for one subject from one document only.
 
-    The LLM identifies table structure only.
-    Python validates and performs all arithmetic.
+    The LLM identifies the row structure.
+    Python verifies the evidence and performs all arithmetic.
     """
 
-    if not str(subject or "").strip():
+    clean_subject = str(subject or "").strip()
+    document_text = str(context or "").strip()
+
+    if not clean_subject or not document_text:
         return []
 
-    if not str(context or "").strip():
+    cache_key = financial_extraction_cache_key(
+        asset_id=str(asset_id or ""),
+        subject=clean_subject,
+        document_text=document_text
+    )
+
+    if cache_key in FINANCIAL_EXTRACTION_CACHE:
+        return [
+            dict(item)
+            for item in FINANCIAL_EXTRACTION_CACHE[
+                cache_key
+            ]
+        ]
+
+    subject_terms = [
+        term
+        for term in normalise_search_text(
+            clean_subject
+        ).split()
+        if len(term) >= 2
+    ]
+
+    normalised_document = normalise_search_text(
+        document_text
+    )
+
+    if subject_terms and not all(
+        term in normalised_document
+        for term in subject_terms
+    ):
+        FINANCIAL_EXTRACTION_CACHE[cache_key] = []
         return []
 
     try:
         raw = ask_llm(
             query=query,
             context=f"""
-You are a strict financial table row extractor.
+You are a strict financial-row extraction engine.
 
-The user is requesting the monetary amount associated with this subject:
+You are receiving exactly one document.
 
-{subject}
+Requested subject:
+{clean_subject}
 
-Inspect every supplied source and extract every distinct row that directly
-matches the requested subject.
-
-Return ONLY valid JSON in this exact structure:
+Return only valid JSON:
 
 {{
   "items": [
     {{
       "description": "exact row description",
-      "unit_price": "exact single-unit price or empty string",
+      "unit_price": "exact unit price or empty string",
       "quantity": "exact quantity or empty string",
-      "line_total": "exact full row total or empty string",
-      "currency": "currency code or symbol, or empty string",
-      "evidence": "complete exact row including description and values",
-      "source_number": 1
+      "line_total": "exact row total or empty string",
+      "currency": "currency symbol or code, or empty string",
+      "evidence": "exact complete matching row copied from the document"
     }}
   ]
 }}
 
-Table interpretation rules:
-- Read the table headers before interpreting row values.
-- unit_price is the monetary price for one unit.
-- quantity is the number or measure purchased.
-- line_total is the full monetary amount for the complete row.
-- If headers are Price, QTY, Total and a row is:
-  Item | 40 | 10 | 400
-  then:
-  unit_price = 40
-  quantity = 10
-  line_total = 400
-- Never put unit_price into line_total.
-- Never put quantity into line_total.
-- Never use an invoice number, date, page number, product code,
-  reference number or weight as a monetary total.
-- Copy an explicit line total when one is shown.
-- If line total is absent but unit price and quantity are present,
-  leave line_total empty. Do not calculate it.
-- Include matching rows from every supplied source.
-- Do not include unrelated rows.
-- Do not use invoice subtotal, tax, VAT, delivery, discount or grand total.
-- Do not calculate or add values.
-- Do not invent values.
-- Return {{"items": []}} if no reliable rows exist.
+Rules:
+- Use only the supplied document.
+- Extract every row directly matching the requested subject.
+- Copy evidence from the document without paraphrasing.
+- Read table headings before assigning values.
+- Do not calculate.
+- Do not infer missing values.
+- Do not use invoice numbers, dates, references or product codes.
+- Do not use subtotal, tax, VAT, discount, delivery or grand total.
+- Omit unclear rows.
+- Return {{"items": []}} when no reliable row exists.
 - Return JSON only.
 
-User request:
-{query}
-
-Document sources:
-{context}
+Document:
+{document_text}
 """.strip()
         )
 
     except Exception as e:
         print(
-            "SUBJECT LINE ITEM EXTRACTION ERROR:",
+            "SINGLE DOCUMENT FINANCIAL EXTRACTION ERROR:",
             type(e).__name__,
             str(e)
         )
         return []
 
-    print(
-        "SUBJECT LINE ITEM RAW RESPONSE:",
-        str(raw or "")[:5000]
-    )
-
     parsed = parse_llm_json_response(raw)
 
-    if not parsed or not isinstance(parsed, dict):
+    if not isinstance(parsed, dict):
         return []
 
     raw_items = parsed.get("items") or []
@@ -9175,86 +9285,89 @@ Document sources:
     if not isinstance(raw_items, list):
         return []
 
-    clean_items = []
+    verified_items = []
+    seen_items = set()
 
-    subject_terms = [
-        term
-        for term in normalise_search_text(subject).split()
-        if len(term) >= 2
-    ]
-
-    for item in raw_items:
-        if not isinstance(item, dict):
+    for raw_item in raw_items:
+        if not isinstance(raw_item, dict):
             continue
 
         description = str(
-            item.get("description") or ""
+            raw_item.get("description") or ""
         ).strip()
 
         evidence = str(
-            item.get("evidence") or ""
+            raw_item.get("evidence") or ""
         ).strip()
-
-        raw_unit_price = str(
-            item.get("unit_price") or ""
-        ).strip()
-
-        raw_quantity = str(
-            item.get("quantity") or ""
-        ).strip()
-
-        raw_line_total = str(
-            item.get("line_total") or ""
-        ).strip()
-
-        currency = normalise_currency(
-            item.get("currency")
-        )
-
-        try:
-            source_number = int(
-                item.get("source_number")
-            )
-        except Exception:
-            source_number = None
 
         if not description or not evidence:
             continue
 
-        searchable_row = normalise_search_text(
+        searchable_item = normalise_search_text(
             f"{description} {evidence}"
         )
 
-        # The extracted row must actually contain the requested subject.
         if subject_terms and not all(
-            term in searchable_row
+            term in searchable_item
             for term in subject_terms
         ):
             continue
 
+        if not evidence_is_supported_exactly(
+            evidence=evidence,
+            document_text=document_text
+        ):
+            print(
+                "FINANCIAL ROW REJECTED: evidence not found",
+                {
+                    "asset_id": asset_id,
+                    "subject": clean_subject,
+                    "evidence": evidence
+                }
+            )
+            continue
+
         unit_price = parse_decimal_money(
-            raw_unit_price
+            str(raw_item.get("unit_price") or "")
         )
 
         quantity = parse_general_decimal(
-            raw_quantity
+            str(raw_item.get("quantity") or "")
         )
 
         explicit_line_total = parse_decimal_money(
-            raw_line_total
+            str(raw_item.get("line_total") or "")
         )
 
-        if unit_price is not None and unit_price < Decimal("0"):
-            unit_price = None
+        if unit_price is not None and unit_price < 0:
+            continue
 
-        if quantity is not None and quantity < Decimal("0"):
-            quantity = None
+        if quantity is not None and quantity < 0:
+            continue
 
         if (
             explicit_line_total is not None
-            and explicit_line_total < Decimal("0")
+            and explicit_line_total < 0
         ):
-            explicit_line_total = None
+            continue
+
+        if not document_contains_decimal(
+            document_text,
+            unit_price
+        ):
+            continue
+
+        if not document_contains_decimal(
+            document_text,
+            quantity
+        ):
+            continue
+
+        if not document_contains_decimal(
+            document_text,
+            explicit_line_total
+        ):
+            continue
 
         calculated_total = None
 
@@ -9269,84 +9382,88 @@ Document sources:
                 rounding=ROUND_HALF_UP
             )
 
-        # Validate the explicit total against price x quantity when
-        # all three values are present.
         if (
-            explicit_line_total is not None
-            and calculated_total is not None
-            and explicit_line_total != calculated_total
+            calculated_total is not None
+            and explicit_line_total is not None
         ):
-            print(
-                "SUBJECT ROW TOTAL MISMATCH:",
-                {
-                    "description": description,
-                    "unit_price": str(unit_price),
-                    "quantity": str(quantity),
-                    "explicit_line_total": str(
-                        explicit_line_total
-                    ),
-                    "calculated_total": str(
-                        calculated_total
-                    ),
-                    "evidence": evidence
-                }
+            if calculated_total != explicit_line_total:
+                print(
+                    "FINANCIAL ROW REJECTED: total mismatch",
+                    {
+                        "asset_id": asset_id,
+                        "description": description,
+                        "unit_price": str(unit_price),
+                        "quantity": str(quantity),
+                        "calculated_total": str(
+                            calculated_total
+                        ),
+                        "line_total": str(
+                            explicit_line_total
+                        )
+                    }
+                )
+                continue
+
+            final_amount = calculated_total
+            amount_method = (
+                "verified_quantity_times_unit_price"
             )
 
-            # Prefer deterministic arithmetic from the identified columns.
+        elif calculated_total is not None:
             final_amount = calculated_total
-            amount_method = "quantity_times_unit_price"
+            amount_method = (
+                "quantity_times_unit_price"
+            )
 
         elif explicit_line_total is not None:
             final_amount = explicit_line_total
             amount_method = "explicit_line_total"
 
-        elif calculated_total is not None:
-            final_amount = calculated_total
-            amount_method = "quantity_times_unit_price"
-
         else:
-            print(
-                "SUBJECT ROW REJECTED: insufficient values",
-                {
-                    "description": description,
-                    "unit_price": raw_unit_price,
-                    "quantity": raw_quantity,
-                    "line_total": raw_line_total,
-                    "evidence": evidence
-                }
-            )
             continue
 
-        # Explicitly block the old failure where the price or quantity
-        # was returned as the complete spend amount.
-        if (
-            quantity is not None
-            and unit_price is not None
-            and quantity != Decimal("1")
-            and final_amount in {quantity, unit_price}
-        ):
-            final_amount = (
-                quantity * unit_price
-            ).quantize(
-                Decimal("0.01"),
-                rounding=ROUND_HALF_UP
+        currency = normalise_currency(
+            raw_item.get("currency")
+        )
+
+        if not currency:
+            currency = determine_currency_from_document(
+                document_text
             )
 
-            amount_method = "quantity_times_unit_price"
+        item_key = (
+            normalise_search_text(description),
+            unit_price,
+            quantity,
+            final_amount,
+            normalise_search_text(evidence)
+        )
 
-        clean_items.append({
+        if item_key in seen_items:
+            continue
+
+        seen_items.add(item_key)
+
+        verified_items.append({
             "description": description,
             "unit_price": unit_price,
             "quantity": quantity,
-            "explicit_line_total": explicit_line_total,
+            "explicit_line_total": (
+                explicit_line_total
+            ),
             "amount": final_amount,
             "currency": currency,
             "evidence": evidence,
-            "source_number": source_number,
+            "asset_id": asset_id,
             "amount_method": amount_method
         })
 
-    return clean_items
+    FINANCIAL_EXTRACTION_CACHE[cache_key] = [
+        dict(item)
+        for item in verified_items
+    ]
+
+    return verified_items
 
 def is_financial_total_query(query: str) -> bool:
     """
@@ -9700,485 +9817,334 @@ def resolve_subject_item_source(
 def answer_subject_spending_from_context(
     query: str,
     context: str,
-    matched_rows: list[dict]
+    matched_rows: list[dict],
+    subjects: list[str] | None = None
 ):
     """
-    Calculates spending for any requested subject across multiple documents.
+    Calculates one or more requested subjects.
 
-    Critical guarantees:
-    - Every document is processed independently.
-    - A row can only belong to the document from which it was extracted.
-    - Identical rows in separate invoices are counted separately.
-    - OCR/extracted-text duplicates from the same asset are not double-counted.
-    - Only documents that contributed a verified row become sources.
-    - Different known currencies are never combined.
-    - Decimal performs all arithmetic.
+    Every source document is processed independently.
     """
 
-    subject = extract_spending_subject(
-        query
-    )
+    if subjects is None:
+        subjects = extract_spending_subjects(
+            query
+        ) or []
 
-    if not subject:
+    clean_subjects = []
+    seen_subjects = set()
+
+    for subject in subjects:
+        clean_subject = str(subject or "").strip()
+        subject_key = normalise_search_text(
+            clean_subject
+        )
+
+        if not clean_subject or not subject_key:
+            continue
+
+        if subject_key in seen_subjects:
+            continue
+
+        seen_subjects.add(subject_key)
+        clean_subjects.append(clean_subject)
+
+    if not clean_subjects:
+        single_subject = extract_spending_subject(
+            query
+        )
+
+        if single_subject:
+            clean_subjects = [single_subject]
+
+    if not clean_subjects:
         return None
 
-    if not matched_rows:
-        return {
-            "answer": (
-                f"I found no verifiable financial row for {subject}."
-            ),
-            "sources": []
-        }
-
-    subject_terms = [
-        term
-        for term in normalise_search_text(
-            subject
-        ).split()
-        if len(term) >= 2
-    ]
-
-    # ---------------------------------------------------------
-    # GROUP ROWS BY ASSET
-    # ---------------------------------------------------------
-    #
-    # Even if matched_rows accidentally contains multiple rows for an
-    # asset, only one complete document representation is processed.
     assets_by_id = {}
 
-    for row in matched_rows:
+    for row in matched_rows or []:
         asset_id = row.get("asset_id")
 
         if not asset_id:
             continue
 
-        row_text = str(
+        document_text = str(
             row.get("search_text")
             or row.get("content")
             or row.get("text")
             or ""
         ).strip()
 
-        if not row_text:
+        if not document_text:
             continue
-
-        file_name = (
-            row.get("original_file_name")
-            or row.get("file_name")
-            or "Untitled document"
-        )
 
         if asset_id not in assets_by_id:
             assets_by_id[asset_id] = {
                 "asset_id": asset_id,
-                "file_name": file_name,
+                "file_name": (
+                    row.get("original_file_name")
+                    or row.get("file_name")
+                    or "Untitled document"
+                ),
                 "row": row,
                 "texts": []
             }
 
-        normalised_row_text = normalise_for_source_check(
-            row_text
-        )
-
-        existing_texts = {
-            normalise_for_source_check(text)
-            for text in assets_by_id[asset_id]["texts"]
-        }
-
-        if (
-            normalised_row_text
-            and normalised_row_text not in existing_texts
-        ):
-            assets_by_id[asset_id]["texts"].append(
-                row_text
-            )
-
-    verified_items = []
-
-    # ---------------------------------------------------------
-    # PROCESS EACH DOCUMENT INDEPENDENTLY
-    # ---------------------------------------------------------
-    for asset_id, asset_data in assets_by_id.items():
-        file_name = asset_data["file_name"]
-
-        document_text = "\n\n".join(
-            asset_data.get("texts") or []
-        ).strip()
-
-        if not document_text:
-            continue
-
-        normalised_document = normalise_search_text(
+        normalised_text = normalise_search_text(
             document_text
         )
 
-        # The document must contain the actual requested subject.
-        if subject_terms and not all(
-            term in normalised_document
-            for term in subject_terms
-        ):
-            print(
-                "SUBJECT DOCUMENT EXCLUDED:",
-                {
-                    "asset_id": asset_id,
-                    "file_name": file_name,
-                    "subject": subject,
-                    "reason": "Subject not found in document"
-                }
-            )
-            continue
-
-        one_document_row = {
-            **asset_data["row"],
-            "asset_id": asset_id,
-            "file_name": (
-                asset_data["row"].get("file_name")
-                or file_name
-            ),
-            "original_file_name": file_name,
-            "content": document_text,
-            "search_text": document_text
+        existing_texts = {
+            normalise_search_text(text)
+            for text in assets_by_id[
+                asset_id
+            ]["texts"]
         }
 
-        one_document_context = (
-            build_context_from_asset_results(
-                [one_document_row]
-            )
-        )
+        if normalised_text not in existing_texts:
+            assets_by_id[
+                asset_id
+            ]["texts"].append(document_text)
 
-        try:
-            document_items = (
-                extract_subject_line_items_with_llm(
-                    query=query,
-                    subject=subject,
-                    context=one_document_context
-                )
-            )
+    subject_results = []
+    contributing_rows = []
+    contributing_asset_ids = set()
 
-        except Exception as e:
-            print(
-                "SINGLE DOCUMENT LINE ITEM EXTRACTION ERROR:",
-                {
-                    "asset_id": asset_id,
-                    "file_name": file_name,
-                    "error_type": type(e).__name__,
-                    "error": str(e)
-                }
-            )
+    for subject in clean_subjects:
+        subject_terms = [
+            term
+            for term in normalise_search_text(
+                subject
+            ).split()
+            if len(term) >= 2
+        ]
 
-            document_items = []
+        verified_items = []
 
-        print(
-            "SINGLE DOCUMENT FINANCIAL ITEMS:",
-            {
-                "asset_id": asset_id,
-                "file_name": file_name,
-                "subject": subject,
-                "items": [
-                    {
-                        "description": item.get("description"),
-                        "unit_price": str(
-                            item.get("unit_price")
-                        ),
-                        "quantity": str(
-                            item.get("quantity")
-                        ),
-                        "explicit_line_total": str(
-                            item.get("explicit_line_total")
-                        ),
-                        "amount": str(
-                            item.get("amount")
-                        ),
-                        "evidence": item.get("evidence")
-                    }
-                    for item in document_items
-                ]
-            }
-        )
+        for asset_id, asset_data in assets_by_id.items():
+            document_text = "\n\n".join(
+                asset_data["texts"]
+            ).strip()
 
-        document_currency = (
-            determine_currency_from_document(
+            if not document_text:
+                continue
+
+            normalised_document = normalise_search_text(
                 document_text
-            )
-        )
-
-        # -----------------------------------------------------
-        # VERIFY EVERY ITEM AGAINST THIS EXACT DOCUMENT
-        # -----------------------------------------------------
-        for item in document_items:
-            description = str(
-                item.get("description")
-                or ""
-            ).strip()
-
-            evidence = str(
-                item.get("evidence")
-                or ""
-            ).strip()
-
-            item_amount = item.get("amount")
-            unit_price = item.get("unit_price")
-            quantity = item.get("quantity")
-            explicit_line_total = item.get(
-                "explicit_line_total"
-            )
-
-            if not description or not evidence:
-                continue
-
-            if not isinstance(item_amount, Decimal):
-                continue
-
-            if item_amount < Decimal("0.00"):
-                continue
-
-            normalised_description = normalise_search_text(
-                description
-            )
-
-            normalised_evidence = normalise_search_text(
-                evidence
-            )
-
-            # Both the extracted description and evidence must actually
-            # relate to the requested subject.
-            combined_item_text = (
-                normalised_description
-                + " "
-                + normalised_evidence
             )
 
             if subject_terms and not all(
-                term in combined_item_text
+                term in normalised_document
                 for term in subject_terms
             ):
-                print(
-                    "SUBJECT ITEM EXCLUDED: subject mismatch",
-                    {
-                        "file_name": file_name,
-                        "subject": subject,
-                        "description": description,
-                        "evidence": evidence
-                    }
-                )
                 continue
 
-            # The item evidence must exist in this document.
-            evidence_supported = (
-                normalised_evidence
-                and normalised_evidence in normalised_document
-            )
-
-            if not evidence_supported:
-                evidence_words = [
-                    word
-                    for word in normalised_evidence.split()
-                    if len(word) >= 2
-                ]
-
-                matched_evidence_words = [
-                    word
-                    for word in evidence_words
-                    if word in normalised_document
-                ]
-
-                evidence_overlap = (
-                    len(matched_evidence_words)
-                    / max(len(evidence_words), 1)
-                )
-
-                evidence_supported = (
-                    evidence_overlap >= 0.80
-                )
-
-            if not evidence_supported:
-                print(
-                    "SUBJECT ITEM EXCLUDED: evidence not in source",
-                    {
-                        "file_name": file_name,
-                        "description": description,
-                        "evidence": evidence
-                    }
-                )
-                continue
-
-            # -------------------------------------------------
-            # DETERMINISTIC ARITHMETIC
-            # -------------------------------------------------
-            calculated_amount = None
-
-            if (
-                isinstance(unit_price, Decimal)
-                and isinstance(quantity, Decimal)
-            ):
-                calculated_amount = (
-                    unit_price * quantity
-                ).quantize(
-                    Decimal("0.01"),
-                    rounding=ROUND_HALF_UP
-                )
-
-            if calculated_amount is not None:
-                final_amount = calculated_amount
-                amount_method = (
-                    "quantity_times_unit_price"
-                )
-
-            elif isinstance(
-                explicit_line_total,
-                Decimal
-            ):
-                final_amount = (
-                    explicit_line_total.quantize(
-                        Decimal("0.01"),
-                        rounding=ROUND_HALF_UP
+            try:
+                document_items = (
+                    extract_subject_line_items_with_llm(
+                        query=query,
+                        subject=subject,
+                        context=document_text,
+                        asset_id=asset_id
                     )
                 )
+            except Exception as e:
+                print(
+                    "DOCUMENT FINANCIAL EXTRACTION ERROR:",
+                    asset_id,
+                    type(e).__name__,
+                    str(e)
+                )
+                document_items = []
 
-                amount_method = "explicit_line_total"
-
-            else:
+            if not document_items:
                 continue
 
-            verified_items.append({
+            source_row = {
+                **asset_data["row"],
                 "asset_id": asset_id,
-                "file_name": file_name,
-                "source_row": one_document_row,
-                "description": description,
-                "unit_price": unit_price,
-                "quantity": quantity,
-                "explicit_line_total": (
-                    explicit_line_total
-                ),
-                "amount": final_amount,
-                "currency": document_currency,
-                "evidence": evidence,
-                "amount_method": amount_method
-            })
-
-    # ---------------------------------------------------------
-    # DEDUPLICATE ONLY WITHIN THE SAME ASSET
-    # ---------------------------------------------------------
-    #
-    # The asset_id is deliberately part of the key.
-    # Therefore the same product row in two invoices is counted twice.
-    unique_items = []
-    seen_items = set()
-
-    for item in verified_items:
-        key = (
-            item.get("asset_id"),
-            normalise_search_text(
-                item.get("description")
-                or ""
-            ),
-            item.get("unit_price"),
-            item.get("quantity"),
-            item.get("amount"),
-            normalise_search_text(
-                item.get("evidence")
-                or ""
-            )
-        )
-
-        if key in seen_items:
-            continue
-
-        seen_items.add(key)
-        unique_items.append(item)
-
-    verified_items = unique_items
-
-    print(
-        "FINAL VERIFIED SUBJECT ITEMS:",
-        [
-            {
-                "asset_id": item.get("asset_id"),
-                "file_name": item.get("file_name"),
-                "description": item.get("description"),
-                "unit_price": str(
-                    item.get("unit_price")
-                ),
-                "quantity": str(
-                    item.get("quantity")
-                ),
-                "amount": str(
-                    item.get("amount")
-                ),
-                "currency": item.get("currency")
+                "content": document_text,
+                "search_text": document_text,
+                "original_file_name": (
+                    asset_data["file_name"]
+                )
             }
-            for item in verified_items
-        ]
-    )
 
-    if not verified_items:
+            for item in document_items:
+                verified_items.append({
+                    **item,
+                    "asset_id": asset_id,
+                    "file_name": asset_data[
+                        "file_name"
+                    ],
+                    "source_row": source_row
+                })
+
+            if asset_id not in contributing_asset_ids:
+                contributing_asset_ids.add(asset_id)
+                contributing_rows.append(source_row)
+
+        unique_items = []
+        seen_items = set()
+
+        for item in verified_items:
+            item_key = (
+                item.get("asset_id"),
+                normalise_search_text(
+                    item.get("description") or ""
+                ),
+                item.get("unit_price"),
+                item.get("quantity"),
+                item.get("amount"),
+                normalise_search_text(
+                    item.get("evidence") or ""
+                )
+            )
+
+            if item_key in seen_items:
+                continue
+
+            seen_items.add(item_key)
+            unique_items.append(item)
+
+        total = None
+        currencies = set()
+
+        if unique_items:
+            total = sum(
+                (
+                    item["amount"]
+                    for item in unique_items
+                ),
+                Decimal("0.00")
+            ).quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP
+            )
+
+            currencies = {
+                item.get("currency")
+                for item in unique_items
+                if item.get("currency")
+            }
+
+        subject_results.append({
+            "subject": subject,
+            "items": unique_items,
+            "total": total,
+            "currencies": currencies
+        })
+
+    successful_results = [
+        result
+        for result in subject_results
+        if result["items"]
+    ]
+
+    missing_subjects = [
+        result["subject"]
+        for result in subject_results
+        if not result["items"]
+    ]
+
+    if not successful_results:
+        requested_text = ", ".join(clean_subjects)
+
         return {
             "answer": (
-                f"I found no verifiable financial row for {subject}."
+                "I found no verifiable financial row for "
+                f"{requested_text}."
             ),
             "sources": []
         }
 
-    # ---------------------------------------------------------
-    # BUILD SOURCES ONLY FROM CONTRIBUTING DOCUMENTS
-    # ---------------------------------------------------------
-    contributing_rows = []
-    contributing_asset_ids = set()
+    answer_lines = []
+    all_currencies = set()
 
-    for item in verified_items:
-        asset_id = item.get("asset_id")
-
-        if (
-            not asset_id
-            or asset_id in contributing_asset_ids
-        ):
-            continue
-
-        contributing_asset_ids.add(asset_id)
-        contributing_rows.append(
-            item["source_row"]
+    for result in successful_results:
+        all_currencies.update(
+            result["currencies"]
         )
 
-    sources = build_sources_from_asset_results(
-        contributing_rows
-    )
+        subject = result["subject"]
+        total = result["total"]
+        currencies = result["currencies"]
 
-    known_currencies = {
-        item.get("currency")
-        for item in verified_items
-        if item.get("currency")
-    }
+        currency = (
+            next(iter(currencies))
+            if len(currencies) == 1
+            else ""
+        )
 
-    has_unknown_currency = any(
-        not item.get("currency")
-        for item in verified_items
-    )
+        formatted_total = (
+            format_currency_amount(total, currency)
+            if currency
+            else format_number_for_answer(total)
+        )
 
-    # ---------------------------------------------------------
-    # CONFLICTING KNOWN CURRENCIES
-    # ---------------------------------------------------------
-    if len(known_currencies) > 1:
-        answer_lines = [
-            (
-                f"The verified {subject} rows use different "
-                "currencies, so they cannot be combined."
-            ),
-            ""
-        ]
+        answer_lines.append(
+            f"The verified total associated with {subject} "
+            f"is {formatted_total}."
+        )
 
-        for currency in sorted(
-            known_currencies
-        ):
-            currency_items = [
-                item
-                for item in verified_items
-                if item.get("currency") == currency
-            ]
+        for item in result["items"]:
+            item_currency = (
+                item.get("currency")
+                or currency
+            )
 
-            currency_total = sum(
-                (
+            amount_text = (
+                format_currency_amount(
+                    item["amount"],
+                    item_currency
+                )
+                if item_currency
+                else format_number_for_answer(
                     item["amount"]
-                    for item in currency_items
+                )
+            )
+
+            if (
+                item.get("unit_price") is not None
+                and item.get("quantity") is not None
+            ):
+                unit_text = (
+                    format_currency_amount(
+                        item["unit_price"],
+                        item_currency
+                    )
+                    if item_currency
+                    else format_number_for_answer(
+                        item["unit_price"]
+                    )
+                )
+
+                answer_lines.append(
+                    f"- {item['file_name']} — "
+                    f"{item['description']}: "
+                    f"{unit_text} × "
+                    f"{format_number_for_answer(item['quantity'])}"
+                    f" = {amount_text}"
+                )
+            else:
+                answer_lines.append(
+                    f"- {item['file_name']} — "
+                    f"{item['description']}: "
+                    f"{amount_text}"
+                )
+
+        answer_lines.append("")
+
+    if len(successful_results) > 1:
+        if len(all_currencies) == 1:
+            combined_currency = next(
+                iter(all_currencies)
+            )
+
+            combined_total = sum(
+                (
+                    result["total"]
+                    for result in successful_results
                 ),
                 Decimal("0.00")
             ).quantize(
@@ -10187,227 +10153,33 @@ def answer_subject_spending_from_context(
             )
 
             answer_lines.append(
-                f"{currency}: "
-                f"{format_currency_amount(currency_total, currency)}"
+                "Combined total: "
+                + format_currency_amount(
+                    combined_total,
+                    combined_currency
+                )
             )
 
-            for item in currency_items:
-                if (
-                    item.get("unit_price") is not None
-                    and item.get("quantity") is not None
-                ):
-                    answer_lines.append(
-                        f"- {item['file_name']} — "
-                        f"{item['description']}: "
-                        f"{format_number_for_answer(item['unit_price'])}"
-                        f" × "
-                        f"{format_number_for_answer(item['quantity'])}"
-                        f" = "
-                        f"{format_currency_amount(item['amount'], currency)}"
-                    )
-                else:
-                    answer_lines.append(
-                        f"- {item['file_name']} — "
-                        f"{item['description']}: "
-                        f"{format_currency_amount(item['amount'], currency)}"
-                    )
-
-        unknown_items = [
-            item
-            for item in verified_items
-            if not item.get("currency")
-        ]
-
-        if unknown_items:
-            answer_lines.extend([
-                "",
-                (
-                    "The following matching rows had no verifiable "
-                    "currency and were not combined with the "
-                    "currency totals:"
-                )
-            ])
-
-            for item in unknown_items:
-                answer_lines.append(
-                    f"- {item['file_name']} — "
-                    f"{item['description']}: "
-                    f"{format_number_for_answer(item['amount'])}"
-                )
-
-        return {
-            "answer": "\n".join(answer_lines),
-            "sources": sources
-        }
-
-    # ---------------------------------------------------------
-    # ONE CURRENCY OR NO CURRENCY
-    # ---------------------------------------------------------
-    single_currency = None
-
-    if len(known_currencies) == 1:
-        single_currency = next(
-            iter(known_currencies)
-        )
-
-    # Do not silently attach a known currency to unknown-currency rows.
-    if single_currency and has_unknown_currency:
-        answer_lines = [
-            (
-                f"I found matching {subject} rows, but some documents "
-                "do not show a verifiable currency, so one combined "
-                "currency total would not be reliable."
-            ),
-            ""
-        ]
-
-        for item in verified_items:
-            if item.get("currency"):
-                formatted_amount = (
-                    format_currency_amount(
-                        item["amount"],
-                        item["currency"]
-                    )
-                )
-            else:
-                formatted_amount = (
-                    format_number_for_answer(
-                        item["amount"]
-                    )
-                )
-
+        elif len(all_currencies) > 1:
             answer_lines.append(
-                f"- {item['file_name']} — "
-                f"{item['description']}: "
-                f"{formatted_amount}"
+                "A combined total was not calculated because "
+                "the verified rows use different currencies."
             )
 
-        return {
-            "answer": "\n".join(answer_lines),
-            "sources": sources
-        }
-
-    combined_total = sum(
-        (
-            item["amount"]
-            for item in verified_items
-        ),
-        Decimal("0.00")
-    ).quantize(
-        Decimal("0.01"),
-        rounding=ROUND_HALF_UP
-    )
-
-    if single_currency:
-        formatted_total = (
-            format_currency_amount(
-                combined_total,
-                single_currency
-            )
+    if missing_subjects:
+        answer_lines.append(
+            "No verified row was found for: "
+            + ", ".join(missing_subjects)
+            + "."
         )
-    else:
-        formatted_total = (
-            format_number_for_answer(
-                combined_total
-            )
-        )
-
-    answer_lines = [
-        (
-            f"The verified total associated with {subject} "
-            f"is {formatted_total}."
-        ),
-        ""
-    ]
-
-    calculation_parts = []
-
-    for item in verified_items:
-        unit_price = item.get("unit_price")
-        quantity = item.get("quantity")
-        amount = item["amount"]
-
-        if single_currency:
-            formatted_amount = (
-                format_currency_amount(
-                    amount,
-                    single_currency
-                )
-            )
-
-            formatted_unit_price = (
-                format_currency_amount(
-                    unit_price,
-                    single_currency
-                )
-                if unit_price is not None
-                else ""
-            )
-        else:
-            formatted_amount = (
-                format_number_for_answer(
-                    amount
-                )
-            )
-
-            formatted_unit_price = (
-                format_number_for_answer(
-                    unit_price
-                )
-                if unit_price is not None
-                else ""
-            )
-
-        if (
-            unit_price is not None
-            and quantity is not None
-        ):
-            answer_lines.append(
-                f"- {item['file_name']} — "
-                f"{item['description']}: "
-                f"{formatted_unit_price} × "
-                f"{format_number_for_answer(quantity)}"
-                f" = {formatted_amount}"
-            )
-        else:
-            answer_lines.append(
-                f"- {item['file_name']} — "
-                f"{item['description']}: "
-                f"{formatted_amount}"
-            )
-
-        calculation_parts.append(
-            format_number_for_answer(
-                amount
-            )
-        )
-
-    if len(verified_items) > 1:
-        answer_lines.extend([
-            "",
-            (
-                "Combined calculation: "
-                + " + ".join(calculation_parts)
-                + " = "
-                + format_number_for_answer(
-                    combined_total
-                )
-            )
-        ])
-
-    if not single_currency:
-        answer_lines.extend([
-            "",
-            (
-                "No verifiable currency was shown in the matching "
-                "rows, so the result is reported as a numeric amount."
-            )
-        ])
 
     return {
-        "answer": "\n".join(answer_lines),
-        "sources": sources
+        "answer": "\n".join(answer_lines).strip(),
+        "sources": build_sources_from_asset_results(
+            contributing_rows
+        )
     }
+    
 
 def extract_spending_subjects(query: str) -> list[str]:
     """
@@ -10689,7 +10461,8 @@ Rules:
 def answer_financial_total_from_context(
     query: str,
     context: str,
-    matched_rows: list[dict]
+    matched_rows: list[dict],
+    subjects: list[str] | None = None
 ):
     """
     Routes a financial request to either:
@@ -10711,23 +10484,26 @@ def answer_financial_total_from_context(
             "sources": []
         }
 
-    subjects = []
-
-    try:
-        subjects = extract_spending_subjects(query) or []
-    except Exception as e:
-        print(
-            "FINANCIAL SUBJECT ROUTING ERROR:",
-            type(e).__name__,
-            str(e)
-        )
+    if subjects is None:
+        try:
+            subjects = extract_spending_subjects(
+                query
+            ) or []
+        except Exception as e:
+            print(
+                "FINANCIAL SUBJECT ROUTING ERROR:",
+                type(e).__name__,
+                str(e)
+            )
+            subjects = []
 
     # A specific item/category/service/supplier was requested.
     if subjects:
         return answer_subject_spending_from_context(
             query=query,
             context=clean_context,
-            matched_rows=matched_rows
+            matched_rows=matched_rows,
+            subjects=subjects
         )
 
     # No specific subject means the user may be asking for complete
@@ -11313,7 +11089,8 @@ def chat(
                 return router(
                     query=clean_query,
                     context=financial_context,
-                    matched_rows=financial_rows
+                    matched_rows=financial_rows,
+                    subjects=requested_financial_subjects
                 )
 
             # Compatibility fallback when the router function has not
@@ -11326,7 +11103,8 @@ def chat(
                 return fallback_calculator(
                     query=clean_query,
                     context=financial_context,
-                    matched_rows=financial_rows
+                    matched_rows=financial_rows,
+                    subjects=requested_financial_subjects
                 )
 
             print(
@@ -12312,7 +12090,7 @@ Rules:
 
             numeric_result = None
 
-            if financial_result is None:
+            if not financial_query and financial_result is None:
                 numeric_result = (
                     safely_run_numeric_answer(
                         numeric_context=context,
@@ -12444,7 +12222,7 @@ Rules:
 
         numeric_result = None
 
-        if financial_result is None:
+        if not financial_query and financial_result is None:
             numeric_result = (
                 safely_run_numeric_answer(
                     numeric_context=context,
