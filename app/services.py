@@ -5020,28 +5020,34 @@ Tags: {", ".join(tags)}
         }
     )
 
-def build_context_from_asset_results(results: list[dict]) -> str:
+def build_context_from_asset_results(
+    results: list[dict]
+) -> str:
     """
-    Builds the private context sent to the LLM.
-
-    Important:
-    - Do not include file_url.
-    - Do not include storage_path.
-    - Only include text/chunks that already passed yacht/user access checks.
+    Builds private document context without exposing storage information.
     """
 
     parts = []
 
-    for index, row in enumerate(results, start=1):
+    for index, row in enumerate(results or [], start=1):
+        content = str(
+            row.get("search_text")
+            or row.get("content")
+            or ""
+        ).strip()
+
+        if not content:
+            continue
+
         part = f"""
 SOURCE {index}
-File name: {row.get("file_name")}
+File name: {row.get("original_file_name") or row.get("file_name")}
 File type: {row.get("file_type")}
 Content type: {row.get("content_type")}
 Detected year: {row.get("detected_year")}
 
 Content:
-{row.get("content")}
+{content}
 """.strip()
 
         parts.append(part)
@@ -8978,25 +8984,358 @@ def is_financial_total_query(query: str) -> bool:
         for phrase in phrases
     )
 
+def extract_spending_subject(query: str) -> str:
+    """
+    Extracts the requested spending subject.
+
+    Examples:
+    - How much did we spend on beef? -> beef
+    - What have we spent on fuel? -> fuel
+    - Total spending for vegetables -> vegetables
+    """
+
+    clean = " ".join(
+        str(query or "").strip().lower().split()
+    )
+
+    patterns = [
+        r"how much (?:did|have|has) we spend on (.+?)[?.!]*$",
+        r"how much (?:did|have|has) we spent on (.+?)[?.!]*$",
+        r"how much was spent on (.+?)[?.!]*$",
+        r"what (?:did|have|has) we spend on (.+?)[?.!]*$",
+        r"what (?:did|have|has) we spent on (.+?)[?.!]*$",
+        r"total spend(?:ing)? on (.+?)[?.!]*$",
+        r"total spend(?:ing)? for (.+?)[?.!]*$",
+        r"total cost of (.+?)[?.!]*$",
+        r"calculate (?:the )?total (?:spent|spending|cost) on (.+?)[?.!]*$",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, clean)
+
+        if match:
+            subject = match.group(1).strip(" .?!,;:")
+
+            if subject:
+                return subject
+
+    return ""
+
+def extract_subject_line_items_with_llm(
+    query: str,
+    subject: str,
+    context: str
+) -> list[dict]:
+    """
+    The LLM extracts matching invoice rows only.
+
+    Python performs all monetary parsing and addition.
+    """
+
+    if not subject or not context:
+        return []
+
+    try:
+        raw = ask_llm(
+            query=query,
+            context=f"""
+You are a strict invoice line-item extractor.
+
+Find every invoice, receipt, bill, purchase order or financial row that
+directly refers to the requested subject.
+
+Requested subject:
+{subject}
+
+Return ONLY valid JSON:
+
+{{
+  "items": [
+    {{
+      "description": "exact item description",
+      "line_total": "123.45",
+      "currency": "USD",
+      "evidence": "exact row copied from the document"
+    }}
+  ]
+}}
+
+Rules:
+- Include only rows directly matching the requested subject.
+- Match singular/plural and obvious wording variations.
+- Do not include unrelated rows.
+- line_total must be the final amount for that matching row.
+- Do not use unit price when a line total is present.
+- If quantity and unit price exist but no line total exists, calculate nothing.
+- Do not use invoice subtotal, VAT, tax, delivery or grand total.
+- Do not invent values.
+- Do not add the values.
+- Copy evidence exactly from the document.
+- Use the currency shown in the document.
+- If no matching rows exist, return {{"items": []}}.
+- Return JSON only.
+
+Document context:
+{context}
+""".strip()
+        )
+
+    except Exception as e:
+        print(
+            "SUBJECT LINE ITEM EXTRACTION ERROR:",
+            type(e).__name__,
+            str(e)
+        )
+        return []
+
+    parsed = parse_llm_json_response(raw)
+
+    if not parsed or not isinstance(parsed, dict):
+        return []
+
+    items = parsed.get("items") or []
+
+    if not isinstance(items, list):
+        return []
+
+    clean_items = []
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        description = str(
+            item.get("description") or ""
+        ).strip()
+
+        raw_total = str(
+            item.get("line_total") or ""
+        ).strip()
+
+        currency = normalise_currency(
+            item.get("currency")
+        )
+
+        evidence = str(
+            item.get("evidence") or ""
+        ).strip()
+
+        if not description or not raw_total or not evidence:
+            continue
+
+        amount = parse_decimal_money(raw_total)
+
+        if amount is None:
+            continue
+
+        if amount < Decimal("0.00"):
+            continue
+
+        # The extracted evidence must contain the requested subject.
+        normalised_subject = normalise_search_text(subject)
+        normalised_evidence = normalise_search_text(evidence)
+
+        subject_terms = [
+            term
+            for term in normalised_subject.split()
+            if len(term) >= 2
+        ]
+
+        if not subject_terms:
+            continue
+
+        if not all(
+            term in normalised_evidence
+            for term in subject_terms
+        ):
+            continue
+
+        # Verify the selected amount appears in the evidence row.
+        evidence_values = extract_money_values_from_line(
+            evidence
+        )
+
+        amount_found = any(
+            value.get("amount") == amount
+            for value in evidence_values
+        )
+
+        if not amount_found:
+            continue
+
+        clean_items.append({
+            "description": description,
+            "amount": amount,
+            "currency": currency,
+            "evidence": evidence
+        })
+
+    return clean_items
+
+def answer_subject_spending_from_context(
+    query: str,
+    context: str,
+    matched_rows: list[dict]
+):
+    """
+    Calculates spending for a specific requested subject.
+
+    Examples:
+    - beef
+    - fuel
+    - vegetables
+    - engine parts
+
+    The LLM extracts matching rows.
+    Decimal performs the addition.
+    """
+
+    subject = extract_spending_subject(query)
+
+    if not subject:
+        return None
+
+    if not context or not matched_rows:
+        return {
+            "answer": FALLBACK_NO_DATA_ANSWER,
+            "sources": []
+        }
+
+    extracted_items = extract_subject_line_items_with_llm(
+        query=query,
+        subject=subject,
+        context=context
+    )
+
+    print(
+        "SUBJECT SPENDING DEBUG:",
+        {
+            "subject": subject,
+            "items_found": len(extracted_items)
+        }
+    )
+
+    if not extracted_items:
+        return {
+            "answer": (
+                f"I found no verified line-item totals for "
+                f"{subject} in the available documents."
+            ),
+            "sources": []
+        }
+
+    currencies = {
+        item["currency"]
+        for item in extracted_items
+        if item.get("currency")
+    }
+
+    # Do not guess missing currency.
+    if any(
+        not item.get("currency")
+        for item in extracted_items
+    ):
+        return {
+            "answer": (
+                f"I found matching {subject} entries, but at least one "
+                f"entry has no verifiable currency, so I cannot produce "
+                f"an accurate total."
+            ),
+            "sources": []
+        }
+
+    sources = build_sources_from_asset_results(
+        matched_rows
+    )
+
+    # Never add different currencies together.
+    if len(currencies) > 1:
+        lines = [
+            (
+                f"The verified {subject} entries use different currencies, "
+                f"so they cannot be combined into one total."
+            ),
+            ""
+        ]
+
+        for currency in sorted(currencies):
+            currency_items = [
+                item
+                for item in extracted_items
+                if item["currency"] == currency
+            ]
+
+            currency_total = sum(
+                (
+                    item["amount"]
+                    for item in currency_items
+                ),
+                Decimal("0.00")
+            ).quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP
+            )
+
+            lines.append(
+                f"- {format_currency_amount(currency_total, currency)}"
+            )
+
+        return {
+            "answer": "\n".join(lines),
+            "sources": sources
+        }
+
+    currency = next(iter(currencies))
+
+    total = sum(
+        (
+            item["amount"]
+            for item in extracted_items
+        ),
+        Decimal("0.00")
+    ).quantize(
+        Decimal("0.01"),
+        rounding=ROUND_HALF_UP
+    )
+
+    calculation = " + ".join(
+        f"{item['amount']:.2f}"
+        for item in extracted_items
+    )
+
+    lines = [
+        (
+            f"The verified amount spent on {subject} is "
+            f"{format_currency_amount(total, currency)}."
+        ),
+        "",
+        f"Calculation: {calculation} = {total:.2f}"
+    ]
+
+    return {
+        "answer": "\n".join(lines),
+        "sources": sources
+    }
+
+
+
 
 def answer_financial_total_from_context(
     query: str,
     context: str,
     matched_rows: list[dict]
 ):
-    """
-    Calculates invoice totals deterministically.
-
-    Important:
-    - The LLM does not calculate anything.
-    - One final total is selected per document.
-    - Subtotals, VAT, tax, discounts and line-item prices are excluded.
-    - Decimal is used instead of float.
-    - Different currencies are never combined.
-    """
-
     if not is_financial_total_query(query):
         return None
+
+    subject_result = answer_subject_spending_from_context(
+        query=query,
+        context=context,
+        matched_rows=matched_rows
+    )
+
+    if subject_result is not None:
+        return subject_result
 
     if not matched_rows:
         return {
@@ -9004,13 +9343,6 @@ def answer_financial_total_from_context(
             "sources": []
         }
 
-    assets = build_invoice_text_by_asset(matched_rows)
-
-    if not assets:
-        return {
-            "answer": FALLBACK_NO_DATA_ANSWER,
-            "sources": []
-        }
 
     # Remove generic calculation words so that a request such as
     # "how much did we spend on fuel" can focus on "fuel".
