@@ -12278,12 +12278,16 @@ def chat(
     Secure BridgeOS document chat.
 
     Financial behaviour:
-    - Searches every accessible processed document.
-    - Filters out unrelated documents before calculation.
+    - Searches every accessible processed financial document.
+    - Does not exclude a financial document merely because the requested
+      subject is written differently, pluralised, abbreviated or affected
+      by OCR.
+    - Sends every qualifying financial document to the semantic line-item
+      extractor.
     - Keeps each contributing invoice separate.
-    - Combines invoices only when the currency is compatible.
-    - Never exposes unrelated candidate documents as sources.
-    - Does not hard-code products, suppliers, questions or amounts.
+    - Combines matching values when their currencies are compatible.
+    - Never exposes unrelated documents as final sources.
+    - Does not hard-code products, suppliers, filenames, questions or amounts.
     """
 
     clean_query = clean_text_for_postgres(
@@ -12291,9 +12295,7 @@ def chat(
     ).strip()
 
     try:
-        security_level = int(
-            security_level
-        )
+        security_level = int(security_level)
     except Exception:
         security_level = 4
 
@@ -12325,9 +12327,7 @@ def chat(
             if not isinstance(source, dict):
                 continue
 
-            asset_id = source.get(
-                "asset_id"
-            )
+            asset_id = source.get("asset_id")
 
             if not asset_id:
                 continue
@@ -12335,15 +12335,11 @@ def chat(
             if asset_id in seen_asset_ids:
                 continue
 
-            seen_asset_ids.add(
-                asset_id
-            )
+            seen_asset_ids.add(asset_id)
 
             file_name = (
                 source.get("title")
-                or source.get(
-                    "original_file_name"
-                )
+                or source.get("original_file_name")
                 or source.get("file_name")
                 or "Untitled document"
             )
@@ -12366,10 +12362,7 @@ def chat(
 
         safe_sources = (
             final_sources
-            if isinstance(
-                final_sources,
-                list
-            )
+            if isinstance(final_sources, list)
             else []
         )
 
@@ -12391,14 +12384,16 @@ def chat(
             )
 
         try:
-            supabase.table("chats") \
+            (
+                supabase.table("chats")
                 .update({
                     "updated_at": "now()"
-                }) \
-                .eq("id", chat_id) \
-                .eq("crew_id", crew_id) \
-                .eq("yacht_id", yacht_id) \
+                })
+                .eq("id", chat_id)
+                .eq("crew_id", crew_id)
+                .eq("yacht_id", yacht_id)
                 .execute()
+            )
 
         except Exception as error:
             print(
@@ -12418,18 +12413,13 @@ def chat(
         ).strip()
 
         if not safe_answer:
-            safe_answer = (
-                FALLBACK_NO_DATA_ANSWER
-            )
+            safe_answer = FALLBACK_NO_DATA_ANSWER
 
         safe_sources = unique_source_cards(
             final_sources or []
         )
 
-        if (
-            safe_answer
-            == FALLBACK_NO_DATA_ANSWER
-        ):
+        if safe_answer == FALLBACK_NO_DATA_ANSWER:
             safe_sources = []
 
         save_assistant_response(
@@ -12440,9 +12430,7 @@ def chat(
         return {
             "answer": safe_answer,
             "sources": safe_sources,
-            "uploaded_asset_id": (
-                final_uploaded_asset_id
-            ),
+            "uploaded_asset_id": final_uploaded_asset_id,
             "mode": mode
         }
 
@@ -12453,6 +12441,14 @@ def chat(
     def subject_terms(
         subject: str
     ) -> list[str]:
+        """
+        Produces broad retrieval terms from the dynamically extracted subject.
+
+        These terms are used for diagnostics and tags only. They are not used
+        as the final gate that decides whether a financial document reaches
+        the semantic financial extractor.
+        """
+
         ignored_terms = {
             "the",
             "a",
@@ -12534,16 +12530,19 @@ def chat(
         file_name: str,
         document_text: str
     ) -> int:
-        normalised_file_name = (
-            normalise_search_text(
-                file_name
-            )
+        """
+        Scores whether a document looks like financial source material.
+
+        The score does not depend on a particular product, supplier,
+        requested question or amount.
+        """
+
+        normalised_file_name = normalise_search_text(
+            file_name
         )
 
-        normalised_document = (
-            normalise_search_text(
-                document_text
-            )
+        normalised_document = normalise_search_text(
+            document_text
         )
 
         score = 0
@@ -12579,7 +12578,8 @@ def chat(
         ]
 
         if any(
-            marker in normalised_file_name
+            normalise_search_text(marker)
+            in normalised_file_name
             for marker in file_markers
         ):
             score += 4
@@ -12592,7 +12592,8 @@ def chat(
                 score += 1
 
         has_price = any(
-            marker in normalised_document
+            normalise_search_text(marker)
+            in normalised_document
             for marker in [
                 "price",
                 "unit price",
@@ -12601,7 +12602,8 @@ def chat(
         )
 
         has_quantity = any(
-            marker in normalised_document
+            normalise_search_text(marker)
+            in normalised_document
             for marker in [
                 "quantity",
                 "qty"
@@ -12635,34 +12637,32 @@ def chat(
     def build_financial_document_text(
         asset: dict
     ) -> str:
+        """
+        Builds the complete readable financial text for one asset.
+
+        Normal extracted text and OCR are included when they are not duplicates.
+        """
+
         file_name = (
-            asset.get(
-                "original_file_name"
-            )
+            asset.get("original_file_name")
             or asset.get("file_name")
             or "Untitled document"
         )
 
-        extracted_text = (
-            clean_text_for_postgres(
-                asset.get("extracted_text")
-                or ""
-            ).strip()
-        )
+        extracted_text = clean_text_for_postgres(
+            asset.get("extracted_text")
+            or ""
+        ).strip()
 
-        ocr_text = (
-            clean_text_for_postgres(
-                asset.get("ocr_text")
-                or ""
-            ).strip()
-        )
+        ocr_text = clean_text_for_postgres(
+            asset.get("ocr_text")
+            or ""
+        ).strip()
 
-        summary = (
-            clean_text_for_postgres(
-                asset.get("summary")
-                or ""
-            ).strip()
-        )
+        summary = clean_text_for_postgres(
+            asset.get("summary")
+            or ""
+        ).strip()
 
         parts = [
             f"File name: {file_name}"
@@ -12675,16 +12675,12 @@ def chat(
             )
 
         if ocr_text:
-            normalised_extracted = (
-                normalise_search_text(
-                    extracted_text
-                )
+            normalised_extracted = normalise_search_text(
+                extracted_text
             )
 
-            normalised_ocr = (
-                normalise_search_text(
-                    ocr_text
-                )
+            normalised_ocr = normalise_search_text(
+                ocr_text
             )
 
             ocr_is_duplicate = bool(
@@ -12727,8 +12723,8 @@ def chat(
         if not financial_rows:
             return {
                 "answer": (
-                    "No readable matching financial "
-                    "documents reached the calculation step."
+                    "No readable financial documents reached "
+                    "the calculation step."
                 ),
                 "sources": []
             }
@@ -12738,9 +12734,8 @@ def chat(
         ).strip():
             return {
                 "answer": (
-                    "Matching financial documents were "
-                    "found, but their text could not be "
-                    "assembled for calculation."
+                    "Financial documents were found, but their text "
+                    "could not be assembled for calculation."
                 ),
                 "sources": []
             }
@@ -12754,9 +12749,7 @@ def chat(
                 ),
                 "documents": [
                     (
-                        row.get(
-                            "original_file_name"
-                        )
+                        row.get("original_file_name")
                         or row.get("file_name")
                         or "Untitled document"
                     )
@@ -12769,12 +12762,10 @@ def chat(
         )
 
         try:
-            result = (
-                answer_financial_total_from_context(
-                    query=clean_query,
-                    context=financial_context,
-                    matched_rows=financial_rows
-                )
+            result = answer_financial_total_from_context(
+                query=clean_query,
+                context=financial_context,
+                matched_rows=financial_rows
             )
 
         except Exception as error:
@@ -12784,14 +12775,10 @@ def chat(
                 str(error)
             )
 
-            # Do not show every candidate document
-            # when calculation fails.
             return {
                 "answer": (
-                    "Financial calculation failed inside "
-                    "the backend: "
-                    f"{type(error).__name__}: "
-                    f"{str(error)}"
+                    "Financial calculation failed inside the backend: "
+                    f"{type(error).__name__}: {str(error)}"
                 ),
                 "sources": []
             }
@@ -12806,7 +12793,8 @@ def chat(
             }
 
         answer = str(
-            result.get("answer") or ""
+            result.get("answer")
+            or ""
         ).strip()
 
         if not answer:
@@ -12845,9 +12833,11 @@ def chat(
         ] = uploaded_asset_id
 
     try:
-        supabase.table("messages") \
-            .insert(user_payload) \
+        (
+            supabase.table("messages")
+            .insert(user_payload)
             .execute()
+        )
 
     except Exception as error:
         print(
@@ -12862,9 +12852,11 @@ def chat(
                 None
             )
 
-            supabase.table("messages") \
-                .insert(user_payload) \
+            (
+                supabase.table("messages")
+                .insert(user_payload)
                 .execute()
+            )
 
         except Exception as second_error:
             print(
@@ -12873,23 +12865,22 @@ def chat(
                 str(second_error)
             )
 
-    if (
-        chat_row.get("title")
-        == "New Chat"
-    ):
+    if chat_row.get("title") == "New Chat":
         try:
-            supabase.table("chats") \
+            (
+                supabase.table("chats")
                 .update({
                     "title": (
                         clean_query[:60]
                         or "New Chat"
                     ),
                     "updated_at": "now()"
-                }) \
-                .eq("id", chat_id) \
-                .eq("crew_id", crew_id) \
-                .eq("yacht_id", yacht_id) \
+                })
+                .eq("id", chat_id)
+                .eq("crew_id", crew_id)
+                .eq("yacht_id", yacht_id)
                 .execute()
+            )
 
         except Exception as error:
             print(
@@ -12903,10 +12894,8 @@ def chat(
     # =========================================================
 
     try:
-        query_scope = (
-            classify_bridgeos_query_scope(
-                clean_query
-            )
+        query_scope = classify_bridgeos_query_scope(
+            clean_query
         )
 
     except Exception as error:
@@ -12919,10 +12908,8 @@ def chat(
         query_scope = "factual"
 
     try:
-        financial_query = (
-            is_financial_total_query(
-                clean_query
-            )
+        financial_query = is_financial_total_query(
+            clean_query
         )
 
     except Exception as error:
@@ -12939,10 +12926,8 @@ def chat(
 
     else:
         try:
-            answer_depth = (
-                classify_answer_depth(
-                    clean_query
-                )
+            answer_depth = classify_answer_depth(
+                clean_query
             )
 
         except Exception:
@@ -12972,26 +12957,6 @@ def chat(
 
             requested_financial_subjects = []
 
-        if not requested_financial_subjects:
-            try:
-                fallback_subject = (
-                    extract_spending_subject(
-                        clean_query
-                    )
-                )
-
-                if fallback_subject:
-                    requested_financial_subjects = [
-                        fallback_subject
-                    ]
-
-            except Exception as error:
-                print(
-                    "FINANCIAL SUBJECT FALLBACK ERROR:",
-                    type(error).__name__,
-                    str(error)
-                )
-
     deduplicated_subjects = []
     seen_subject_keys = set()
 
@@ -13000,10 +12965,8 @@ def chat(
             subject or ""
         ).strip()
 
-        subject_key = (
-            normalise_search_text(
-                subject
-            )
+        subject_key = normalise_search_text(
+            subject
         )
 
         if not subject_key:
@@ -13027,13 +12990,14 @@ def chat(
     requested_subject_groups = []
 
     for subject in requested_financial_subjects:
-        terms = subject_terms(subject)
+        terms = subject_terms(
+            subject
+        )
 
-        if terms:
-            requested_subject_groups.append({
-                "subject": subject,
-                "terms": terms
-            })
+        requested_subject_groups.append({
+            "subject": subject,
+            "terms": terms
+        })
 
     print(
         "CHAT CLASSIFICATION:",
@@ -13048,9 +13012,7 @@ def chat(
                 requested_subject_groups
             ),
             "answer_depth": answer_depth,
-            "uploaded_asset_id": (
-                uploaded_asset_id
-            )
+            "uploaded_asset_id": uploaded_asset_id
         }
     )
 
@@ -13090,9 +13052,7 @@ Rules:
                 str(error)
             )
 
-            answer = (
-                "Hello. How can I help?"
-            )
+            answer = "Hello. How can I help?"
 
         return finish(
             final_answer=answer,
@@ -13109,23 +13069,17 @@ Rules:
         try:
             matched_rows = (
                 get_uploaded_chat_asset_rows(
-                    uploaded_asset_id=(
-                        uploaded_asset_id
-                    ),
+                    uploaded_asset_id=uploaded_asset_id,
                     crew_id=crew_id,
                     yacht_id=yacht_id,
-                    security_level=(
-                        security_level
-                    ),
+                    security_level=security_level,
                     chat_id=chat_id
                 )
                 or []
             )
 
-            matched_rows = (
-                deduplicate_context_rows(
-                    matched_rows
-                )
+            matched_rows = deduplicate_context_rows(
+                matched_rows
             )
 
             context = (
@@ -13149,37 +13103,30 @@ Rules:
         if not context:
             return finish(
                 final_answer=(
-                    "I received the uploaded file, "
-                    "but I could not read enough "
-                    "content to answer reliably."
+                    "I received the uploaded file, but I could not "
+                    "read enough content to answer reliably."
                 ),
                 final_sources=[],
                 mode="uploaded_chat_asset",
-                final_uploaded_asset_id=(
-                    uploaded_asset_id
-                )
+                final_uploaded_asset_id=uploaded_asset_id
             )
 
         if financial_query:
             grouped_uploaded_rows = {}
 
             for row in matched_rows:
-                asset_id = row.get(
-                    "asset_id"
-                )
+                asset_id = row.get("asset_id")
 
                 if not asset_id:
                     continue
 
-                if (
-                    asset_id
-                    not in grouped_uploaded_rows
-                ):
+                if asset_id not in grouped_uploaded_rows:
                     grouped_uploaded_rows[
                         asset_id
                     ] = {
                         "base_row": row,
-                        "parts": []
+                        "parts": [],
+                        "seen_parts": set()
                     }
 
                 row_text = str(
@@ -13188,7 +13135,24 @@ Rules:
                     or ""
                 ).strip()
 
-                if row_text:
+                normalised_part = normalise_for_source_check(
+                    row_text
+                )
+
+                if (
+                    row_text
+                    and normalised_part
+                    and normalised_part
+                    not in grouped_uploaded_rows[
+                        asset_id
+                    ]["seen_parts"]
+                ):
+                    grouped_uploaded_rows[
+                        asset_id
+                    ]["seen_parts"].add(
+                        normalised_part
+                    )
+
                     grouped_uploaded_rows[
                         asset_id
                     ]["parts"].append(
@@ -13200,15 +13164,11 @@ Rules:
             for asset_id, grouped in (
                 grouped_uploaded_rows.items()
             ):
-                base_row = grouped[
-                    "base_row"
-                ]
+                base_row = grouped["base_row"]
 
-                document_text = (
-                    "\n\n".join(
-                        grouped["parts"]
-                    ).strip()
-                )
+                document_text = "\n\n".join(
+                    grouped["parts"]
+                ).strip()
 
                 if not document_text:
                     continue
@@ -13218,9 +13178,7 @@ Rules:
                     "asset_id": asset_id,
                     "content": document_text,
                     "search_text": document_text,
-                    "content_type": (
-                        "financial_document"
-                    ),
+                    "content_type": "financial_document",
                     "chunk_index": 0
                 })
 
@@ -13232,32 +13190,20 @@ Rules:
                 else ""
             )
 
-            financial_result = (
-                run_financial_answer(
-                    financial_context=(
-                        financial_context
-                    ),
-                    financial_rows=(
-                        financial_rows
-                    )
-                )
+            financial_result = run_financial_answer(
+                financial_context=financial_context,
+                financial_rows=financial_rows
             )
 
             return finish(
-                final_answer=(
-                    financial_result.get(
-                        "answer"
-                    )
+                final_answer=financial_result.get(
+                    "answer"
                 ),
-                final_sources=(
-                    financial_result.get(
-                        "sources"
-                    )
+                final_sources=financial_result.get(
+                    "sources"
                 ),
                 mode="uploaded_chat_asset",
-                final_uploaded_asset_id=(
-                    uploaded_asset_id
-                )
+                final_uploaded_asset_id=uploaded_asset_id
             )
 
         try:
@@ -13278,25 +13224,16 @@ Rules:
 
             numeric_result = None
 
-        if isinstance(
-            numeric_result,
-            dict
-        ):
+        if isinstance(numeric_result, dict):
             return finish(
-                final_answer=(
-                    numeric_result.get(
-                        "answer"
-                    )
+                final_answer=numeric_result.get(
+                    "answer"
                 ),
-                final_sources=(
-                    numeric_result.get(
-                        "sources"
-                    )
+                final_sources=numeric_result.get(
+                    "sources"
                 ),
                 mode="uploaded_chat_asset",
-                final_uploaded_asset_id=(
-                    uploaded_asset_id
-                )
+                final_uploaded_asset_id=uploaded_asset_id
             )
 
         try:
@@ -13317,32 +13254,21 @@ Rules:
 
             uploaded_result = None
 
-        if not isinstance(
-            uploaded_result,
-            dict
-        ):
+        if not isinstance(uploaded_result, dict):
             uploaded_result = {
-                "answer": (
-                    FALLBACK_NO_DATA_ANSWER
-                ),
+                "answer": FALLBACK_NO_DATA_ANSWER,
                 "sources": []
             }
 
         return finish(
-            final_answer=(
-                uploaded_result.get(
-                    "answer"
-                )
+            final_answer=uploaded_result.get(
+                "answer"
             ),
-            final_sources=(
-                uploaded_result.get(
-                    "sources"
-                )
+            final_sources=uploaded_result.get(
+                "sources"
             ),
             mode="uploaded_chat_asset",
-            final_uploaded_asset_id=(
-                uploaded_asset_id
-            )
+            final_uploaded_asset_id=uploaded_asset_id
         )
 
     # =========================================================
@@ -13354,9 +13280,7 @@ Rules:
             get_accessible_asset_ids(
                 crew_id=crew_id,
                 yacht_id=yacht_id,
-                security_level=(
-                    security_level
-                )
+                security_level=security_level
             )
             or []
         )
@@ -13372,9 +13296,7 @@ Rules:
 
     if not accessible_asset_ids:
         return finish(
-            final_answer=(
-                FALLBACK_NO_DATA_ANSWER
-            ),
+            final_answer=FALLBACK_NO_DATA_ANSWER,
             final_sources=[],
             mode="document_qa"
         )
@@ -13384,14 +13306,8 @@ Rules:
             supabase.table("assets")
             .select("id")
             .eq("yacht_id", yacht_id)
-            .in_(
-                "id",
-                accessible_asset_ids
-            )
-            .eq(
-                "processing_status",
-                "processed"
-            )
+            .in_("id", accessible_asset_ids)
+            .eq("processing_status", "processed")
             .execute()
         )
 
@@ -13415,9 +13331,7 @@ Rules:
 
     if not allowed_asset_ids:
         return finish(
-            final_answer=(
-                FALLBACK_NO_DATA_ANSWER
-            ),
+            final_answer=FALLBACK_NO_DATA_ANSWER,
             final_sources=[],
             mode="document_qa"
         )
@@ -13447,18 +13361,9 @@ Rules:
                     created_at
                 """)
                 .eq("yacht_id", yacht_id)
-                .in_(
-                    "id",
-                    allowed_asset_ids
-                )
-                .eq(
-                    "processing_status",
-                    "processed"
-                )
-                .order(
-                    "created_at",
-                    desc=False
-                )
+                .in_("id", allowed_asset_ids)
+                .eq("processing_status", "processed")
+                .order("created_at", desc=False)
                 .execute()
             )
 
@@ -13486,24 +13391,17 @@ Rules:
             if not asset_id:
                 continue
 
-            if (
-                asset_id
-                in seen_financial_assets
-            ):
+            if asset_id in seen_financial_assets:
                 continue
 
             file_name = (
-                asset.get(
-                    "original_file_name"
-                )
+                asset.get("original_file_name")
                 or asset.get("file_name")
                 or "Untitled document"
             )
 
-            document_text = (
-                build_financial_document_text(
-                    asset
-                )
+            document_text = build_financial_document_text(
+                asset
             )
 
             if not document_text:
@@ -13517,21 +13415,14 @@ Rules:
 
                 continue
 
-            normalised_document = (
-                normalise_search_text(
-                    document_text
-                )
+            normalised_document = normalise_search_text(
+                document_text
             )
 
             matched_subjects = []
 
-            for group in (
-                requested_subject_groups
-            ):
-                terms = (
-                    group.get("terms")
-                    or []
-                )
+            for group in requested_subject_groups:
+                terms = group.get("terms") or []
 
                 if not terms:
                     continue
@@ -13539,31 +13430,33 @@ Rules:
                 matched_term_count = sum(
                     1
                     for term in terms
-                    if (
-                        term
-                        in normalised_document
-                    )
+                    if term in normalised_document
                 )
 
-                # Require every meaningful subject term.
-                if (
-                    matched_term_count
-                    == len(terms)
-                ):
+                if matched_term_count > 0:
                     matched_subjects.append(
                         group.get("subject")
                         or ""
                     )
 
-            document_score = (
-                financial_document_score(
-                    file_name=file_name,
-                    document_text=(
-                        document_text
-                )
+            document_score = financial_document_score(
+                file_name=file_name,
+                document_text=document_text
             )
-        
 
+            # Every document that looks financial reaches the semantic
+            # line-item extractor.
+            #
+            # Do not require an exact requested-subject match here.
+            # A valid invoice may use:
+            # - plural or singular wording;
+            # - a longer description;
+            # - an abbreviation;
+            # - OCR-damaged spacing or spelling;
+            # - equivalent terminology.
+            #
+            # The semantic extractor later decides whether the document
+            # genuinely contains matching rows.
             include_document = (
                 document_score >= 2
             )
@@ -13574,12 +13467,8 @@ Rules:
                     "asset_id": asset_id,
                     "file_name": file_name,
                     "score": document_score,
-                    "matched_subjects": (
-                        matched_subjects
-                    ),
-                    "included": (
-                        include_document
-                    ),
+                    "matched_subjects": matched_subjects,
+                    "included": include_document,
                     "document_characters": len(
                         document_text
                     )
@@ -13595,22 +13484,14 @@ Rules:
 
             financial_rows.append({
                 "asset_id": asset_id,
-                "yacht_id": asset.get(
-                    "yacht_id"
-                ),
-                "chat_id": asset.get(
-                    "chat_id"
-                ),
-                "security_level": (
-                    asset.get(
-                        "security_level"
-                    )
+                "yacht_id": asset.get("yacht_id"),
+                "chat_id": asset.get("chat_id"),
+                "security_level": asset.get(
+                    "security_level"
                 ),
                 "content": document_text,
                 "search_text": document_text,
-                "content_type": (
-                    "financial_document"
-                ),
+                "content_type": "financial_document",
                 "chunk_index": 0,
                 "detected_date": None,
                 "detected_year": None,
@@ -13620,25 +13501,16 @@ Rules:
                         normalise_search_text(
                             subject
                         )
-                        for subject
-                        in matched_subjects
+                        for subject in matched_subjects
                         if subject
                     ]
                 ],
-                "file_name": asset.get(
-                    "file_name"
+                "file_name": asset.get("file_name"),
+                "original_file_name": asset.get(
+                    "original_file_name"
                 ),
-                "original_file_name": (
-                    asset.get(
-                        "original_file_name"
-                    )
-                ),
-                "file_type": asset.get(
-                    "file_type"
-                ),
-                "mime_type": asset.get(
-                    "mime_type"
-                )
+                "file_type": asset.get("file_type"),
+                "mime_type": asset.get("mime_type")
             })
 
         financial_context = (
@@ -13652,20 +13524,16 @@ Rules:
         print(
             "FINANCIAL RETRIEVAL RESULT:",
             {
-                "accessible_processed_assets": (
-                    len(all_loaded_assets)
+                "accessible_processed_assets": len(
+                    all_loaded_assets
                 ),
-                "matching_financial_documents": (
-                    len(financial_rows)
+                "matching_financial_documents": len(
+                    financial_rows
                 ),
                 "documents": [
                     (
-                        row.get(
-                            "original_file_name"
-                        )
-                        or row.get(
-                            "file_name"
-                        )
+                        row.get("original_file_name")
+                        or row.get("file_name")
                     )
                     for row in financial_rows
                 ],
@@ -13678,35 +13546,24 @@ Rules:
         if not financial_rows:
             return finish(
                 final_answer=(
-                    "I could not find a processed "
-                    "financial document containing "
-                    "the requested subject."
+                    "I could not find a processed financial "
+                    "document suitable for calculation."
                 ),
                 final_sources=[],
                 mode="document_qa"
             )
 
-        financial_result = (
-            run_financial_answer(
-                financial_context=(
-                    financial_context
-                ),
-                financial_rows=(
-                    financial_rows
-                )
-            )
+        financial_result = run_financial_answer(
+            financial_context=financial_context,
+            financial_rows=financial_rows
         )
 
         return finish(
-            final_answer=(
-                financial_result.get(
-                    "answer"
-                )
+            final_answer=financial_result.get(
+                "answer"
             ),
-            final_sources=(
-                financial_result.get(
-                    "sources"
-                )
+            final_sources=financial_result.get(
+                "sources"
             ),
             mode="document_qa"
         )
@@ -13716,11 +13573,9 @@ Rules:
     # =========================================================
 
     try:
-        followup_query = (
-            is_contextual_followup_query(
-                query=clean_query,
-                chat_id=chat_id
-            )
+        followup_query = is_contextual_followup_query(
+            query=clean_query,
+            chat_id=chat_id
         )
 
     except Exception as error:
@@ -13769,10 +13624,8 @@ Rules:
     matched_rows_by_key = {}
 
     try:
-        file_listing_query = (
-            is_file_listing_query(
-                clean_query
-            )
+        file_listing_query = is_file_listing_query(
+            clean_query
         )
 
     except Exception:
@@ -13784,9 +13637,7 @@ Rules:
                 get_asset_metadata_rows_for_listing(
                     query=clean_query,
                     yacht_id=yacht_id,
-                    allowed_asset_ids=(
-                        allowed_asset_ids
-                    ),
+                    allowed_asset_ids=allowed_asset_ids,
                     limit=50
                 )
                 or []
@@ -13799,9 +13650,7 @@ Rules:
                     row.get("content_type")
                 )
 
-                matched_rows_by_key[
-                    key
-                ] = row
+                matched_rows_by_key[key] = row
 
         except Exception as error:
             print(
@@ -13810,9 +13659,7 @@ Rules:
                 str(error)
             )
 
-    for retrieval_query in (
-        retrieval_queries
-    ):
+    for retrieval_query in retrieval_queries:
         retrieval_query = str(
             retrieval_query or ""
         ).strip()
@@ -13831,21 +13678,15 @@ Rules:
         except Exception:
             filters = {}
 
-        year_filter = filters.get(
-            "year"
-        )
+        year_filter = filters.get("year")
 
         try:
             keyword_rows = (
                 keyword_search_asset_chunks(
                     query=retrieval_query,
                     yacht_id=yacht_id,
-                    allowed_asset_ids=(
-                        allowed_asset_ids
-                    ),
-                    year_filter=(
-                        year_filter
-                    ),
+                    allowed_asset_ids=allowed_asset_ids,
+                    year_filter=year_filter,
                     limit=40
                 )
                 or []
@@ -13858,13 +13699,8 @@ Rules:
                     row.get("content_type")
                 )
 
-                if (
-                    key
-                    not in matched_rows_by_key
-                ):
-                    matched_rows_by_key[
-                        key
-                    ] = row
+                if key not in matched_rows_by_key:
+                    matched_rows_by_key[key] = row
 
         except Exception as error:
             print(
@@ -13878,24 +13714,25 @@ Rules:
                 retrieval_query
             )
 
-            if query_embedding:
+            embedding_is_usable = bool(
+                isinstance(query_embedding, list)
+                and query_embedding
+                and any(
+                    float(value or 0) != 0
+                    for value in query_embedding
+                )
+            )
+
+            if embedding_is_usable:
                 semantic_result = (
                     supabase.rpc(
                         "match_asset_chunks_secure",
                         {
-                            "query_embedding": (
-                                query_embedding
-                            ),
+                            "query_embedding": query_embedding,
                             "match_count": 40,
-                            "allowed_asset_ids": (
-                                allowed_asset_ids
-                            ),
-                            "yacht_filter": (
-                                yacht_id
-                            ),
-                            "year_filter": (
-                                year_filter
-                            )
+                            "allowed_asset_ids": allowed_asset_ids,
+                            "yacht_filter": yacht_id,
+                            "year_filter": year_filter
                         }
                     )
                     .execute()
@@ -13908,18 +13745,11 @@ Rules:
                     key = (
                         row.get("asset_id"),
                         row.get("chunk_index"),
-                        row.get(
-                            "content_type"
-                        )
+                        row.get("content_type")
                     )
 
-                    if (
-                        key
-                        not in matched_rows_by_key
-                    ):
-                        matched_rows_by_key[
-                            key
-                        ] = row
+                    if key not in matched_rows_by_key:
+                        matched_rows_by_key[key] = row
 
         except Exception as error:
             print(
@@ -13939,19 +13769,11 @@ Rules:
         try:
             matched_rows = (
                 expand_retrieved_rows_to_full_relevant_documents(
-                    query=(
-                        retrieval_query_input
-                    ),
-                    matched_rows=(
-                        matched_rows
-                    ),
+                    query=retrieval_query_input,
+                    matched_rows=matched_rows,
                     yacht_id=yacht_id,
-                    security_level=(
-                        security_level
-                    ),
-                    answer_depth=(
-                        answer_depth
-                    )
+                    security_level=security_level,
+                    answer_depth=answer_depth
                 )
                 or matched_rows
             )
@@ -13964,10 +13786,8 @@ Rules:
             )
 
         try:
-            matched_rows = (
-                deduplicate_context_rows(
-                    matched_rows
-                )
+            matched_rows = deduplicate_context_rows(
+                matched_rows
             )
 
         except Exception as error:
@@ -13987,20 +13807,16 @@ Rules:
 
     if not context:
         return finish(
-            final_answer=(
-                FALLBACK_NO_DATA_ANSWER
-            ),
+            final_answer=FALLBACK_NO_DATA_ANSWER,
             final_sources=[],
             mode="document_qa"
         )
 
     if file_listing_query:
         try:
-            listing_result = (
-                answer_file_listing_directly(
-                    query=clean_query,
-                    rows=matched_rows
-                )
+            listing_result = answer_file_listing_directly(
+                query=clean_query,
+                rows=matched_rows
             )
 
         except Exception as error:
@@ -14012,20 +13828,13 @@ Rules:
 
             listing_result = None
 
-        if isinstance(
-            listing_result,
-            dict
-        ):
+        if isinstance(listing_result, dict):
             return finish(
-                final_answer=(
-                    listing_result.get(
-                        "answer"
-                    )
+                final_answer=listing_result.get(
+                    "answer"
                 ),
-                final_sources=(
-                    listing_result.get(
-                        "sources"
-                    )
+                final_sources=listing_result.get(
+                    "sources"
                 ),
                 mode="document_qa"
             )
@@ -14048,20 +13857,13 @@ Rules:
 
         numeric_result = None
 
-    if isinstance(
-        numeric_result,
-        dict
-    ):
+    if isinstance(numeric_result, dict):
         return finish(
-            final_answer=(
-                numeric_result.get(
-                    "answer"
-                )
+            final_answer=numeric_result.get(
+                "answer"
             ),
-            final_sources=(
-                numeric_result.get(
-                    "sources"
-                )
+            final_sources=numeric_result.get(
+                "sources"
             ),
             mode="document_qa"
         )
@@ -14124,10 +13926,8 @@ Document context:
 """.strip()
         )
 
-        parsed = (
-            parse_llm_json_response(
-                raw_answer
-            )
+        parsed = parse_llm_json_response(
+            raw_answer
         )
 
     except Exception as error:
@@ -14141,9 +13941,7 @@ Document context:
 
     if not isinstance(parsed, dict):
         return finish(
-            final_answer=(
-                FALLBACK_NO_DATA_ANSWER
-            ),
+            final_answer=FALLBACK_NO_DATA_ANSWER,
             final_sources=[],
             mode="document_qa"
         )
@@ -14160,13 +13958,10 @@ Document context:
     if (
         not answer
         or not document_used
-        or answer
-        == FALLBACK_NO_DATA_ANSWER
+        or answer == FALLBACK_NO_DATA_ANSWER
     ):
         return finish(
-            final_answer=(
-                FALLBACK_NO_DATA_ANSWER
-            ),
+            final_answer=FALLBACK_NO_DATA_ANSWER,
             final_sources=[],
             mode="document_qa"
         )
@@ -14191,17 +13986,13 @@ Document context:
 
     if not verified_rows:
         return finish(
-            final_answer=(
-                FALLBACK_NO_DATA_ANSWER
-            ),
+            final_answer=FALLBACK_NO_DATA_ANSWER,
             final_sources=[],
             mode="document_qa"
         )
 
-    verified_sources = (
-        build_sources_from_asset_results(
-            verified_rows
-        )
+    verified_sources = build_sources_from_asset_results(
+        verified_rows
     )
 
     return finish(
