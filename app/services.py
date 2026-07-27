@@ -7563,7 +7563,6 @@ def get_full_asset_rows_for_context(
             """) \
             .eq("yacht_id", yacht_id) \
             .eq("asset_id", asset_id) \
-            .lte("security_level", security_level) \
             .order("chunk_index", desc=False) \
             .limit(max_rows) \
             .execute()
@@ -8344,15 +8343,26 @@ def answer_financial_total_from_context(
         "how much did we spend",
         "how much have we spent",
         "how much we spent",
+        "how much was spent",
+        "how much is spent",
         "what did we spend",
         "what have we spent",
+        "what was spent",
         "total spent",
         "total spend",
+        "total spending",
         "total cost",
+        "total costs",
         "total amount",
+        "total price",
         "grand total",
+        "invoice total",
+        "amount paid",
+        "amount due",
         "sum of",
-        "add up"
+        "add up",
+        "calculate the total",
+        "calculate total"
     ]
 
     if not any(phrase in clean_query for phrase in total_phrases):
@@ -8557,17 +8567,16 @@ def chat(
     uploaded_asset_id: str | None = None
 ):
     """
-    Secure BridgeOS chat.
+    Secure BridgeOS document chat.
 
-    Fixed behaviour:
-    - No hard-coded crew/document terms.
-    - Uploaded chat files/images/docs are answered from that exact uploaded asset.
-    - Standalone questions search with the exact user question.
-    - Follow-up questions use memory-aware rewriting only when needed.
-    - Normal document questions retrieve candidate chunks, then expand to the full best-matching document.
-    - Uses only one best document by default to avoid unrelated mixed answers.
-    - Does not reject valid table/list answers only because source rows do not repeat the question words.
-    - Still requires document context and sources where possible.
+    Behaviour:
+    - Uses only documents the current crew member can access.
+    - Uses an uploaded chat file only when its asset ID is explicitly supplied.
+    - Otherwise searches Yacht Documentation.
+    - Uses verified document evidence.
+    - Uses deterministic Python calculation for supported financial totals.
+    - Returns the normal no-data fallback instead of hallucinating.
+    - Database logging errors do not turn a valid answer into "Load failed".
     """
 
     chat_row = verify_chat_access(
@@ -8576,8 +8585,9 @@ def chat(
         yacht_id=yacht_id
     )
 
-    # Save user message.
-    # If messages.uploaded_asset_id does not exist yet, this safely falls back.
+    security_level = int(security_level)
+
+    # Save the user message.
     try:
         supabase.table("messages").insert({
             "chat_id": chat_id,
@@ -8590,31 +8600,56 @@ def chat(
         }).execute()
 
     except Exception as e:
-        print("USER MESSAGE INSERT WITH UPLOADED ASSET FAILED:", type(e).__name__, str(e))
+        print(
+            "USER MESSAGE INSERT WITH UPLOADED ASSET FAILED:",
+            type(e).__name__,
+            str(e)
+        )
 
-        supabase.table("messages").insert({
-            "chat_id": chat_id,
-            "yacht_id": yacht_id,
-            "crew_id": crew_id,
-            "role": "user",
-            "content": query,
-            "sources": []
-        }).execute()
+        try:
+            supabase.table("messages").insert({
+                "chat_id": chat_id,
+                "yacht_id": yacht_id,
+                "crew_id": crew_id,
+                "role": "user",
+                "content": query,
+                "sources": []
+            }).execute()
+
+        except Exception as second_error:
+            print(
+                "USER MESSAGE FALLBACK INSERT FAILED:",
+                type(second_error).__name__,
+                str(second_error)
+            )
 
     if chat_row.get("title") == "New Chat":
-        supabase.table("chats").update({
-            "title": query[:60],
-            "updated_at": "now()"
-        }).eq("id", chat_id).eq("crew_id", crew_id).eq("yacht_id", yacht_id).execute()
+        try:
+            supabase.table("chats").update({
+                "title": str(query or "")[:60] or "New Chat",
+                "updated_at": "now()"
+            }).eq(
+                "id", chat_id
+            ).eq(
+                "crew_id", crew_id
+            ).eq(
+                "yacht_id", yacht_id
+            ).execute()
+
+        except Exception as e:
+            print(
+                "CHAT TITLE UPDATE ERROR:",
+                type(e).__name__,
+                str(e)
+            )
 
     answer = ""
     sources = []
     matched_rows = []
     context = ""
-    retrieval_query_input = query
+    retrieval_query_input = str(query or "").strip()
 
     query_scope = classify_bridgeos_query_scope(query)
-
     answer_depth = classify_answer_depth(query)
 
     print("LOCAL CHAT DEBUG: answer_depth:", answer_depth)
@@ -8633,25 +8668,14 @@ def chat(
             yacht_id=yacht_id
         )
 
+    # Important:
+    # Use a chat-uploaded file only when the frontend explicitly sends its ID.
+    # Do not automatically select an old file from the chat.
     resolved_uploaded_asset_id = uploaded_asset_id
 
-    # If frontend fails to send uploaded_asset_id, try latest uploaded file in this chat.
-    # Do not do this for pure conversational messages.
-    if not resolved_uploaded_asset_id and query_scope != "conversational":
-        resolved_uploaded_asset_id = get_latest_chat_asset_id(
-            chat_id=chat_id,
-            crew_id=crew_id,
-            yacht_id=yacht_id,
-            security_level=security_level
-        )
-
-        if resolved_uploaded_asset_id:
-            print(
-                "LOCAL CHAT DEBUG: resolved latest uploaded chat asset:",
-                resolved_uploaded_asset_id
-            )
-
-    # Conversational/app-help messages are allowed without documents.
+    # ---------------------------------------------------------
+    # CONVERSATIONAL MODE
+    # ---------------------------------------------------------
     if query_scope == "conversational" and not resolved_uploaded_asset_id:
         try:
             raw_answer = ask_llm(
@@ -8659,39 +8683,69 @@ def chat(
                 context="""
 You are BridgeOS, a helpful private document assistant.
 
-The user message is conversational or about using the assistant.
+The user message is conversational or asks how to use the assistant.
 
 Rules:
 - Reply briefly and naturally.
-- You may explain that you can help search uploaded documents.
-- Do not answer factual, technical, operational, product, financial, legal, medical, recommendation, or external-knowledge questions.
+- You may explain that you can search uploaded documents.
+- Do not answer factual, technical, operational, financial, legal,
+  medical, recommendation, or outside-knowledge questions without documents.
 - Do not invent document data.
-- Do not claim you used a document.
+- Do not claim that a document was used.
 - Use British English.
 - Return plain text only.
 """.strip()
             )
 
-            answer = str(raw_answer or "").strip() or "Hello. How can I help?"
+            answer = str(raw_answer or "").strip()
 
         except Exception as e:
-            print("CONVERSATIONAL CHAT ERROR:", type(e).__name__, str(e))
+            print(
+                "CONVERSATIONAL CHAT ERROR:",
+                type(e).__name__,
+                str(e)
+            )
+            answer = ""
+
+        if not answer:
             answer = "Hello. How can I help?"
 
         sources = []
 
-        supabase.table("messages").insert({
-            "chat_id": chat_id,
-            "yacht_id": yacht_id,
-            "crew_id": crew_id,
-            "role": "assistant",
-            "content": answer,
-            "sources": sources
-        }).execute()
+        try:
+            supabase.table("messages").insert({
+                "chat_id": chat_id,
+                "yacht_id": yacht_id,
+                "crew_id": crew_id,
+                "role": "assistant",
+                "content": answer,
+                "sources": sources
+            }).execute()
 
-        supabase.table("chats").update({
-            "updated_at": "now()"
-        }).eq("id", chat_id).eq("crew_id", crew_id).eq("yacht_id", yacht_id).execute()
+        except Exception as e:
+            print(
+                "CONVERSATIONAL ANSWER SAVE ERROR:",
+                type(e).__name__,
+                str(e)
+            )
+
+        try:
+            supabase.table("chats").update({
+                "updated_at": "now()"
+            }).eq(
+                "id", chat_id
+            ).eq(
+                "crew_id", crew_id
+            ).eq(
+                "yacht_id", yacht_id
+            ).execute()
+
+        except Exception as e:
+            print(
+                "CONVERSATIONAL CHAT UPDATE ERROR:",
+                type(e).__name__,
+                str(e)
+            )
 
         return {
             "answer": answer,
@@ -8700,6 +8754,9 @@ Rules:
             "mode": "conversational"
         }
 
+    # ---------------------------------------------------------
+    # DOCUMENT RETRIEVAL
+    # ---------------------------------------------------------
     try:
         if resolved_uploaded_asset_id:
             print(
@@ -8727,12 +8784,16 @@ Rules:
                         )
                     )
 
-                    context = extracted_evidence
+                    context = extracted_evidence or ""
 
                     if evidence_rows:
                         matched_rows = evidence_rows
+
                 else:
-                    context = build_context_from_asset_results(matched_rows)
+                    context = build_context_from_asset_results(
+                        matched_rows
+                    )
+
             else:
                 context = ""
 
@@ -8742,6 +8803,8 @@ Rules:
                 yacht_id=yacht_id,
                 security_level=security_level
             )
+
+            allowed_asset_ids = []
 
             if accessible_asset_ids:
                 assets_res = supabase.table("assets") \
@@ -8757,58 +8820,84 @@ Rules:
                     if asset.get("id")
                 ]
 
-                if previous_source_asset_ids:
-                    allowed_asset_ids = [
-                        asset_id
-                        for asset_id in allowed_asset_ids
-                        if asset_id in previous_source_asset_ids
-                    ]
+            if previous_source_asset_ids:
+                restricted_ids = [
+                    asset_id
+                    for asset_id in allowed_asset_ids
+                    if asset_id in previous_source_asset_ids
+                ]
 
-                    print(
-                        "LOCAL CHAT DEBUG: restricted follow-up allowed_asset_ids:",
-                        allowed_asset_ids
-                    )
+                # Restrict to the prior source only when at least one matching
+                # prior source is still accessible.
+                if restricted_ids:
+                    allowed_asset_ids = restricted_ids
 
-                print("LOCAL CHAT DEBUG: allowed_asset_ids:", allowed_asset_ids)
+                print(
+                    "LOCAL CHAT DEBUG: follow-up allowed_asset_ids:",
+                    allowed_asset_ids
+                )
 
-                if allowed_asset_ids:
-                    # Standalone questions search with exact user wording.
-                    # Follow-up questions may use chat memory.
-                    if is_followup_query:
-                        retrieval_query_input = build_memory_aware_retrieval_input(
+            print(
+                "LOCAL CHAT DEBUG: allowed_asset_ids:",
+                allowed_asset_ids
+            )
+
+            if allowed_asset_ids:
+                if is_followup_query:
+                    retrieval_query_input = (
+                        build_memory_aware_retrieval_input(
                             query=query,
                             chat_id=chat_id
                         )
-                    else:
-                        retrieval_query_input = query
+                    )
+                else:
+                    retrieval_query_input = str(query or "").strip()
 
-                    print("LOCAL CHAT DEBUG: retrieval_query_input:", retrieval_query_input)
+                if not retrieval_query_input:
+                    retrieval_query_input = str(query or "").strip()
 
-                    retrieval_queries = build_retrieval_queries(retrieval_query_input)
-                    matched_rows_by_key = {}
+                print(
+                    "LOCAL CHAT DEBUG: retrieval_query_input:",
+                    retrieval_query_input
+                )
 
-                    if is_file_listing_query(query):
-                        listing_rows = get_asset_metadata_rows_for_listing(
-                            query=query,
-                            yacht_id=yacht_id,
-                            allowed_asset_ids=allowed_asset_ids,
-                            limit=50
+                retrieval_queries = build_retrieval_queries(
+                    retrieval_query_input
+                )
+
+                if not retrieval_queries:
+                    retrieval_queries = [retrieval_query_input]
+
+                matched_rows_by_key = {}
+
+                # File-listing questions should use asset metadata.
+                if is_file_listing_query(query):
+                    listing_rows = get_asset_metadata_rows_for_listing(
+                        query=query,
+                        yacht_id=yacht_id,
+                        allowed_asset_ids=allowed_asset_ids,
+                        limit=50
+                    )
+
+                    for row in listing_rows:
+                        key = (
+                            row.get("asset_id"),
+                            row.get("chunk_index"),
+                            row.get("content_type")
                         )
 
-                        for row in listing_rows:
-                            key = (
-                                row.get("asset_id"),
-                                row.get("chunk_index"),
-                                row.get("content_type")
-                            )
+                        if key not in matched_rows_by_key:
+                            matched_rows_by_key[key] = row
 
-                            if key not in matched_rows_by_key:
-                                matched_rows_by_key[key] = row
+                for retrieval_query in retrieval_queries:
+                    if not str(retrieval_query or "").strip():
+                        continue
 
-                    for retrieval_query in retrieval_queries:
-                        filters = extract_query_filters(retrieval_query)
-                        year_filter = filters.get("year")
+                    filters = extract_query_filters(retrieval_query)
+                    year_filter = filters.get("year")
 
+                    # Keyword search.
+                    try:
                         keyword_rows = keyword_search_asset_chunks(
                             query=retrieval_query,
                             yacht_id=yacht_id,
@@ -8827,122 +8916,223 @@ Rules:
                             if key not in matched_rows_by_key:
                                 matched_rows_by_key[key] = row
 
-                        try:
-                            semantic_results = supabase.rpc("match_asset_chunks_secure", {
+                    except Exception as e:
+                        print(
+                            "KEYWORD SEARCH ERROR:",
+                            type(e).__name__,
+                            str(e)
+                        )
+
+                    # Semantic search.
+                    try:
+                        semantic_results = supabase.rpc(
+                            "match_asset_chunks_secure",
+                            {
                                 "query_embedding": embed(retrieval_query),
                                 "match_count": 40,
                                 "allowed_asset_ids": allowed_asset_ids,
                                 "yacht_filter": yacht_id,
                                 "year_filter": year_filter
-                            }).execute()
+                            }
+                        ).execute()
 
-                            for row in semantic_results.data or []:
-                                key = (
-                                    row.get("asset_id"),
-                                    row.get("chunk_index"),
-                                    row.get("content_type")
-                                )
+                        for row in semantic_results.data or []:
+                            key = (
+                                row.get("asset_id"),
+                                row.get("chunk_index"),
+                                row.get("content_type")
+                            )
 
-                                if key not in matched_rows_by_key:
-                                    matched_rows_by_key[key] = row
+                            if key not in matched_rows_by_key:
+                                matched_rows_by_key[key] = row
 
-                        except Exception as e:
-                            print("SEMANTIC SEARCH ERROR:", type(e).__name__, str(e))
+                    except Exception as e:
+                        print(
+                            "SEMANTIC SEARCH ERROR:",
+                            type(e).__name__,
+                            str(e)
+                        )
 
-                    matched_rows = list(matched_rows_by_key.values())[:100]
+                matched_rows = list(
+                    matched_rows_by_key.values()
+                )[:100]
 
-                    print("LOCAL CHAT DEBUG: matched chunks:", len(matched_rows))
+                print(
+                    "LOCAL CHAT DEBUG: matched chunks:",
+                    len(matched_rows)
+                )
 
-                    if matched_rows and not is_file_listing_query(query):
-                        # Generic full-document expansion:
-                        # This is the important fix.
-                        # It expands from top retrieved chunks to the full best-matching document.
-                        # max_assets=1 prevents unrelated documents from being mixed in.
-                        matched_rows = expand_retrieved_rows_to_full_relevant_documents(
+                if matched_rows and not is_file_listing_query(query):
+                    matched_rows = (
+                        expand_retrieved_rows_to_full_relevant_documents(
                             query=retrieval_query_input,
                             matched_rows=matched_rows,
                             yacht_id=yacht_id,
                             security_level=security_level,
                             answer_depth=answer_depth
                         )
+                    )
 
-                        matched_rows = deduplicate_context_rows(matched_rows)
+                    matched_rows = deduplicate_context_rows(
+                        matched_rows
+                    )
 
-                        if answer_depth in {"comprehensive", "document"}:
-                            extracted_evidence, evidence_rows = (
-                                extract_relevant_information_from_batches(
-                                    query=query,
-                                    rows=matched_rows,
-                                    answer_depth=answer_depth
-                                )
+                    if answer_depth in {"comprehensive", "document"}:
+                        extracted_evidence, evidence_rows = (
+                            extract_relevant_information_from_batches(
+                                query=query,
+                                rows=matched_rows,
+                                answer_depth=answer_depth
                             )
+                        )
 
-                            if extracted_evidence:
-                                context = extracted_evidence
+                        if extracted_evidence:
+                            context = extracted_evidence
 
-                                if evidence_rows:
-                                    matched_rows = evidence_rows
-                            else:
-                                context = ""
+                            if evidence_rows:
+                                matched_rows = evidence_rows
                         else:
-                            context = build_context_from_asset_results(matched_rows)
-
-                        print(
-                            "FULL CONTEXT DEBUG final expanded matched_rows:",
-                            len(matched_rows)
-                        )
-                        print(
-                            "FULL CONTEXT DEBUG final context preview:",
-                            context[:1000]
-                        )
-                    elif matched_rows:
-                        context = build_context_from_asset_results(matched_rows)
+                            context = ""
 
                     else:
-                        context = ""
+                        context = build_context_from_asset_results(
+                            matched_rows
+                        )
+
+                    print(
+                        "FULL CONTEXT DEBUG final expanded rows:",
+                        len(matched_rows)
+                    )
+
+                    print(
+                        "FULL CONTEXT DEBUG final context preview:",
+                        context[:1000]
+                    )
+
+                elif matched_rows:
+                    context = build_context_from_asset_results(
+                        matched_rows
+                    )
+
+                else:
+                    context = ""
+
+            else:
+                matched_rows = []
+                context = ""
 
     except Exception as e:
-        print("LOCAL CHAT DOCUMENT SEARCH ERROR:", type(e).__name__, str(e))
+        print(
+            "LOCAL CHAT DOCUMENT SEARCH ERROR:",
+            type(e).__name__,
+            str(e)
+        )
+
         matched_rows = []
         context = ""
 
-    print("LOCAL CHAT DEBUG FINAL matched_rows:", len(matched_rows or []))
-    print("LOCAL CHAT DEBUG FINAL context length:", len(context or ""))
-    print("LOCAL CHAT DEBUG FINAL resolved_uploaded_asset_id:", resolved_uploaded_asset_id)
+    print(
+        "LOCAL CHAT DEBUG FINAL matched_rows:",
+        len(matched_rows or [])
+    )
 
-    # Uploaded chat files/images/docs use the uploaded-file answer path.
+    print(
+        "LOCAL CHAT DEBUG FINAL context length:",
+        len(context or "")
+    )
+
+    print(
+        "LOCAL CHAT DEBUG FINAL resolved_uploaded_asset_id:",
+        resolved_uploaded_asset_id
+    )
+
+    # ---------------------------------------------------------
+    # EXPLICITLY UPLOADED CHAT FILE
+    # ---------------------------------------------------------
     if resolved_uploaded_asset_id:
         if not context:
-            answer = (
-                "I received the uploaded file, but I could not read or analyse its contents yet. "
-                "Please try uploading it again, or check the backend processing_error for this asset."
-            )
+            answer = FALLBACK_NO_DATA_ANSWER
             sources = []
+
         else:
-            uploaded_result = answer_from_uploaded_chat_asset(
+            # Financial totals use evidence extraction plus Python arithmetic.
+            financial_result = answer_financial_total_from_context(
                 query=query,
                 context=context,
                 matched_rows=matched_rows
             )
 
-            answer = uploaded_result.get("answer") or FALLBACK_NO_DATA_ANSWER
-            sources = uploaded_result.get("sources") or []
+            if financial_result:
+                answer = (
+                    financial_result.get("answer")
+                    or FALLBACK_NO_DATA_ANSWER
+                )
+
+                sources = (
+                    financial_result.get("sources")
+                    or []
+                )
+
+            else:
+                uploaded_result = answer_from_uploaded_chat_asset(
+                    query=query,
+                    context=context,
+                    matched_rows=matched_rows
+                )
+
+                answer = (
+                    uploaded_result.get("answer")
+                    or FALLBACK_NO_DATA_ANSWER
+                )
+
+                sources = (
+                    uploaded_result.get("sources")
+                    or []
+                )
 
             if answer.strip() == FALLBACK_NO_DATA_ANSWER:
                 sources = []
 
-        supabase.table("messages").insert({
-            "chat_id": chat_id,
-            "yacht_id": yacht_id,
-            "crew_id": crew_id,
-            "role": "assistant",
-            "content": answer,
-            "sources": sources
-        }).execute()
+        if not answer:
+            answer = FALLBACK_NO_DATA_ANSWER
 
-        supabase.table("chats").update({
-            "updated_at": "now()"
-        }).eq("id", chat_id).eq("crew_id", crew_id).eq("yacht_id", yacht_id).execute()
+        if not isinstance(sources, list):
+            sources = []
+
+        try:
+            supabase.table("messages").insert({
+                "chat_id": chat_id,
+                "yacht_id": yacht_id,
+                "crew_id": crew_id,
+                "role": "assistant",
+                "content": answer,
+                "sources": sources
+            }).execute()
+
+        except Exception as e:
+            print(
+                "UPLOADED ANSWER SAVE ERROR:",
+                type(e).__name__,
+                str(e)
+            )
+
+        try:
+            supabase.table("chats").update({
+                "updated_at": "now()"
+            }).eq(
+                "id", chat_id
+            ).eq(
+                "crew_id", crew_id
+            ).eq(
+                "yacht_id", yacht_id
+            ).execute()
+
+        except Exception as e:
+            print(
+                "UPLOADED CHAT UPDATE ERROR:",
+                type(e).__name__,
+                str(e)
+            )
 
         return {
             "answer": answer,
@@ -8951,7 +9141,9 @@ Rules:
             "mode": "uploaded_chat_asset"
         }
 
-    # Factual question with no retrieved document context = fallback.
+    # ---------------------------------------------------------
+    # YACHT DOCUMENTATION ANSWER
+    # ---------------------------------------------------------
     if not context:
         answer = FALLBACK_NO_DATA_ANSWER
         sources = []
@@ -8964,8 +9156,15 @@ Rules:
         )
 
         if financial_result:
-            answer = financial_result["answer"]
-            sources = financial_result["sources"]
+            answer = (
+                financial_result.get("answer")
+                or FALLBACK_NO_DATA_ANSWER
+            )
+
+            sources = (
+                financial_result.get("sources")
+                or []
+            )
 
         elif is_file_listing_query(query):
             listing_result = answer_file_listing_directly(
@@ -8973,38 +9172,45 @@ Rules:
                 rows=matched_rows
             )
 
-            answer = listing_result.get("answer") or FALLBACK_NO_DATA_ANSWER
-            sources = listing_result.get("sources") or []
+            answer = (
+                listing_result.get("answer")
+                or FALLBACK_NO_DATA_ANSWER
+            )
+
+            sources = (
+                listing_result.get("sources")
+                or []
+            )
 
             if answer.strip() == FALLBACK_NO_DATA_ANSWER:
                 sources = []
 
         else:
-            raw_answer = ask_llm(
-                query=query,
-                context=f"""
+            try:
+                raw_answer = ask_llm(
+                    query=query,
+                    context=f"""
 You are BridgeOS, a private document-based assistant.
 
 Always respond in British English.
 
-You may answer ONLY if the document context directly answers the user's exact question.
+You may answer ONLY when the supplied document context directly supports
+the user's exact question.
 
-Your answer should be useful and specific, but every factual detail must come from the document context.
-
-You MUST return ONLY valid JSON in this exact shape:
+Return ONLY valid JSON in exactly this shape:
 
 {{
-  "answer": "clear user-facing answer with useful detail",
+  "answer": "clear answer grounded only in the documents",
   "document_used": true,
   "used_sources": [
     {{
       "source_number": 1,
-      "evidence_quote": "quote copied from the selected source"
+      "evidence_quote": "exact text copied from the selected source"
     }}
   ]
 }}
 
-or:
+Or return:
 
 {{
   "answer": "{FALLBACK_NO_DATA_ANSWER}",
@@ -9012,159 +9218,201 @@ or:
   "used_sources": []
 }}
 
-Core rules:
-- Answer only from the document context below.
+Hard rules:
+- Use only the document context below.
 - Do not use general knowledge.
 - Do not fill gaps.
-- Do not invent facts.
+- Do not estimate.
+- Do not invent names, dates, amounts, totals, prices, statuses or facts.
 - Do not answer from loosely related context.
-- Do not answer from a different document topic just because it was retrieved.
-- The selected source must directly contain the information needed to answer the exact user question.
-- If the user asks for a count, total, list, grouping, categories, statuses, dates, names, prices, or any table/list-derived answer, inspect the whole provided context before answering.
-- If the context contains a multi-page table/list, include all visible rows/items in the provided context, not only the first page or first chunk.
-- If the exact answer is not directly present in the context, answer exactly:
-{FALLBACK_NO_DATA_ANSWER}
+- If the exact answer is not supported, return the fallback answer.
+- If a number is missing, say it is not found.
+- For tables and lists, inspect all supplied rows.
+- For counts, totals or calculations, use every relevant visible value.
+- Do not include a document source unless it directly supports the answer.
+- Evidence quotes must be copied from the context.
+- Do not mention document names inside the answer.
+- Return JSON only.
 
 Requested answer depth:
 {answer_depth}
 
-Completeness rules:
-- If the requested depth is "focused", directly answer the exact question
-  with every detail needed to make the answer correct.
-- If the requested depth is "comprehensive", include every distinct relevant
-  fact, item, condition, exception, warning, requirement, value and step
-  present in the supplied evidence.
-- If the requested depth is "document", cover all relevant information from
-  the entire supplied document evidence in an organised answer.
-- Do not stop after finding the first valid item.
-- Do not omit later items because an earlier item was already found.
-- Merge exact duplicates only.
-- Do not shorten a comprehensive answer merely to make it brief.
-- Before finishing, check that every relevant item in the supplied evidence
-  is represented in the answer.
-
-Extraction rules:
-- Extract exact values from the context.
-- Short values are allowed.
-- For tables, receipts, forms, lists, logs, chats, OCR text, and multi-page documents, inspect the whole provided context before answering.
-- If the question asks for a count or total, count every matching row/item/value visible in the provided context.
-- If the question asks for grouping, group every matching row/item/value visible in the provided context.
-- If multiple relevant values exist, list them clearly.
-- If the answer depends on rows/items that may continue later in the context, keep reading the context before answering.
-- If a value is missing, say it is not found in the provided context.
-- Do not reject valid answers just because the evidence is short.
-
-Source rules:
-- Set "document_used": true only if the final answer is directly taken from the context.
-- If "document_used" is true, include at least one item in "used_sources".
-- Each used source must include a valid "source_number".
-- Each "evidence_quote" should be copied from the selected source when possible.
-- For table, list, count, total, grouping, or multi-row answers, the evidence_quote may be a representative row, table header, or visible row that supports the extraction.
-- For short fields such as names, dates, invoice numbers, totals, prices, serial numbers, labels, statuses, or codes, a short evidence_quote is allowed.
-- Do not invent the evidence_quote.
-- Do not include a source just because it was retrieved.
-- If the context does not directly support the answer, use the fallback answer.
-- Do not include document names inside the answer.
-- Return JSON only.
-
-Exact user question:
+User question:
 {query}
 
-Search query used for retrieval:
+Search query used:
 {retrieval_query_input}
 
 Document context:
 {context}
 """.strip()
-)
-
-        parsed = parse_llm_json_response(raw_answer)
-
-        if not parsed or not isinstance(parsed, dict):
-            answer = FALLBACK_NO_DATA_ANSWER
-            document_used = False
-            raw_used_sources = []
-        else:
-            answer = str(parsed.get("answer") or "").strip()
-            document_used = bool(parsed.get("document_used"))
-            raw_used_sources = parsed.get("used_sources") or []
-
-            if not answer:
-                answer = FALLBACK_NO_DATA_ANSWER
-
-        if answer.strip() == FALLBACK_NO_DATA_ANSWER:
-            document_used = False
-            sources = []
-
-        elif document_used:
-            # First try normal quote/source verification.
-            try:
-                verified_rows = verified_source_rows_from_llm_result(
-                    parsed=parsed,
-                    matched_rows=matched_rows
                 )
+
+                parsed = parse_llm_json_response(raw_answer)
+
             except Exception as e:
-                print("SOURCE VERIFICATION HELPER ERROR:", type(e).__name__, str(e))
-                verified_rows = []
+                print(
+                    "DOCUMENT ANSWER LLM ERROR:",
+                    type(e).__name__,
+                    str(e)
+                )
+                parsed = None
 
-            # If quote checking fails because of OCR/table spacing/punctuation,
-            # run the softer answer-support validator against selected source rows.
-            if not verified_rows:
-                selected_rows = []
-
-                for used_source in raw_used_sources:
-                    try:
-                        source_number = int(used_source.get("source_number"))
-                    except Exception:
-                        continue
-
-                    index = source_number - 1
-
-                    if 0 <= index < len(matched_rows):
-                        selected_rows.append(matched_rows[index])
-
-                supported_rows = []
-
-                for row in selected_rows:
-                    try:
-                        if validate_answer_supported_by_source(
-                            query=query,
-                            answer=answer,
-                            source_row=row
-                        ):
-                            supported_rows.append(row)
-                    except Exception as e:
-                        print("SOURCE SUPPORT VALIDATION CALL ERROR:", type(e).__name__, str(e))
-
-                verified_rows = supported_rows
-
-            if verified_rows:
-                # Important:
-                # Do NOT require rows to repeat the same words as the question.
-                # Tables/lists often answer through values, not through the question words.
-                sources = build_sources_from_asset_results(verified_rows)
+            if not parsed or not isinstance(parsed, dict):
+                answer = FALLBACK_NO_DATA_ANSWER
+                document_used = False
+                raw_used_sources = []
 
             else:
-                print("LOCAL CHAT SOURCE VERIFICATION FAILED")
+                answer = str(
+                    parsed.get("answer") or ""
+                ).strip()
 
+                document_used = bool(
+                    parsed.get("document_used")
+                )
+
+                raw_used_sources = (
+                    parsed.get("used_sources")
+                    or []
+                )
+
+                if not isinstance(raw_used_sources, list):
+                    raw_used_sources = []
+
+                if not answer:
+                    answer = FALLBACK_NO_DATA_ANSWER
+
+            if answer.strip() == FALLBACK_NO_DATA_ANSWER:
+                document_used = False
+                sources = []
+
+            elif document_used:
+                try:
+                    verified_rows = (
+                        verified_source_rows_from_llm_result(
+                            parsed=parsed,
+                            matched_rows=matched_rows
+                        )
+                    )
+
+                except Exception as e:
+                    print(
+                        "SOURCE VERIFICATION HELPER ERROR:",
+                        type(e).__name__,
+                        str(e)
+                    )
+                    verified_rows = []
+
+                # OCR and table formatting may alter spaces or punctuation.
+                # In that case validate the complete answer against the
+                # selected source rows.
+                if not verified_rows:
+                    selected_rows = []
+
+                    for used_source in raw_used_sources:
+                        if not isinstance(used_source, dict):
+                            continue
+
+                        try:
+                            source_number = int(
+                                used_source.get("source_number")
+                            )
+                        except Exception:
+                            continue
+
+                        index = source_number - 1
+
+                        if 0 <= index < len(matched_rows):
+                            selected_rows.append(
+                                matched_rows[index]
+                            )
+
+                    supported_rows = []
+
+                    for row in selected_rows:
+                        try:
+                            is_supported = (
+                                validate_answer_supported_by_source(
+                                    query=query,
+                                    answer=answer,
+                                    source_row=row
+                                )
+                            )
+
+                            if is_supported:
+                                supported_rows.append(row)
+
+                        except Exception as e:
+                            print(
+                                "SOURCE SUPPORT VALIDATION CALL ERROR:",
+                                type(e).__name__,
+                                str(e)
+                            )
+
+                    verified_rows = supported_rows
+
+                if verified_rows:
+                    sources = build_sources_from_asset_results(
+                        verified_rows
+                    )
+
+                else:
+                    print(
+                        "LOCAL CHAT SOURCE VERIFICATION FAILED"
+                    )
+
+                    answer = FALLBACK_NO_DATA_ANSWER
+                    sources = []
+
+            else:
                 answer = FALLBACK_NO_DATA_ANSWER
                 sources = []
 
-        else:
-            sources = []
+    if not answer:
+        answer = FALLBACK_NO_DATA_ANSWER
 
-    supabase.table("messages").insert({
-        "chat_id": chat_id,
-        "yacht_id": yacht_id,
-        "crew_id": crew_id,
-        "role": "assistant",
-        "content": answer,
-        "sources": sources
-    }).execute()
+    if not isinstance(sources, list):
+        sources = []
 
-    supabase.table("chats").update({
-        "updated_at": "now()"
-    }).eq("id", chat_id).eq("crew_id", crew_id).eq("yacht_id", yacht_id).execute()
+    if answer.strip() == FALLBACK_NO_DATA_ANSWER:
+        sources = []
+
+    # Saving the answer must not cause a valid response to become "Load failed".
+    try:
+        supabase.table("messages").insert({
+            "chat_id": chat_id,
+            "yacht_id": yacht_id,
+            "crew_id": crew_id,
+            "role": "assistant",
+            "content": answer,
+            "sources": sources
+        }).execute()
+
+    except Exception as e:
+        print(
+            "ASSISTANT MESSAGE SAVE ERROR:",
+            type(e).__name__,
+            str(e)
+        )
+
+    try:
+        supabase.table("chats").update({
+            "updated_at": "now()"
+        }).eq(
+            "id", chat_id
+        ).eq(
+            "crew_id", crew_id
+        ).eq(
+            "yacht_id", yacht_id
+        ).execute()
+
+    except Exception as e:
+        print(
+            "CHAT UPDATE ERROR:",
+            type(e).__name__,
+            str(e)
+        )
 
     return {
         "answer": answer,
