@@ -7049,17 +7049,19 @@ def get_latest_chat_asset_id(
 # ------------------------
 def is_file_listing_query(query: str) -> bool:
     """
-    Detects requests to list or count uploaded assets.
+    Detects genuine requests to list or count available documents.
 
-    Supports questions such as:
-    - how many invoices do we have
-    - count the uploaded documents
-    - what files are available
-    - list the PDFs
-    - which images were uploaded
+    Examples treated as listing requests:
+    - What invoices do we have?
+    - List our SOPs.
+    - What SOPs are available for fire safety?
+    - Show our invoices and procedures for maintenance.
+    - How many policies are uploaded?
 
-    This does not hard-code suppliers, filenames, document content,
-    products, users or exact uploaded assets.
+    Examples not treated as listing requests:
+    - What does the fire safety SOP say?
+    - Explain the maintenance procedure.
+    - What is required by this policy?
     """
 
     clean = normalise_search_text(
@@ -7073,17 +7075,39 @@ def is_file_listing_query(query: str) -> bool:
         clean.split()
     )
 
-    asset_words = {
+    document_words = {
         "file",
         "files",
         "document",
         "documents",
         "doc",
         "docs",
+        "asset",
+        "assets",
+        "upload",
+        "uploads",
+        "uploaded",
+
         "invoice",
         "invoices",
         "receipt",
         "receipts",
+        "bill",
+        "bills",
+
+        "sop",
+        "sops",
+        "procedure",
+        "procedures",
+        "policy",
+        "policies",
+        "manual",
+        "manuals",
+        "guideline",
+        "guidelines",
+        "instruction",
+        "instructions",
+
         "pdf",
         "pdfs",
         "docx",
@@ -7091,24 +7115,19 @@ def is_file_listing_query(query: str) -> bool:
         "images",
         "photo",
         "photos",
-        "upload",
-        "uploads",
-        "uploaded",
-        "asset",
-        "assets",
     }
 
     listing_words = {
         "list",
         "show",
         "which",
-        "what",
         "available",
         "uploaded",
         "uploads",
-        "have",
-        "exist",
         "stored",
+        "exist",
+        "have",
+        "has",
     }
 
     counting_words = {
@@ -7116,43 +7135,91 @@ def is_file_listing_query(query: str) -> bool:
         "number",
         "many",
         "total",
-        "amount",
     }
 
-    has_asset_reference = bool(
+    listing_phrases = [
+        "what files",
+        "what documents",
+        "what invoices",
+        "what receipts",
+        "what bills",
+        "what sops",
+        "what procedures",
+        "what policies",
+        "what manuals",
+        "what do we have",
+        "what are our",
+        "which files",
+        "which documents",
+        "which invoices",
+        "which sops",
+        "show me",
+        "list all",
+        "how many",
+        "number of",
+    ]
+
+    content_question_phrases = [
+        "what does",
+        "what do the",
+        "what is stated",
+        "what does it say",
+        "what does the document say",
+        "according to",
+        "explain",
+        "summarise",
+        "summarize",
+        "analyse",
+        "analyze",
+        "describe",
+        "tell me what",
+        "what is required",
+        "what are the requirements",
+        "how should",
+        "how do we",
+        "when should",
+        "why should",
+        "who should",
+    ]
+
+    has_document_reference = bool(
         words.intersection(
-            asset_words
+            document_words
         )
     )
 
-    has_listing_intent = bool(
+    if not has_document_reference:
+        return False
+
+    # Questions asking about document contents must continue through
+    # normal document retrieval and OpenAI answering.
+    if any(
+        phrase in clean
+        for phrase in content_question_phrases
+    ):
+        return False
+
+    has_listing_word = bool(
         words.intersection(
             listing_words
         )
     )
 
-    has_counting_intent = bool(
+    has_counting_word = bool(
         words.intersection(
             counting_words
         )
     )
 
-    has_how_many = (
-        "how many" in clean
+    has_listing_phrase = any(
+        phrase in clean
+        for phrase in listing_phrases
     )
 
-    has_number_of = (
-        "number of" in clean
-    )
-
-    return (
-        has_asset_reference
-        and (
-            has_listing_intent
-            or has_counting_intent
-            or has_how_many
-            or has_number_of
-        )
+    return bool(
+        has_listing_word
+        or has_counting_word
+        or has_listing_phrase
     )
     
 def answer_file_listing_directly(
@@ -7537,22 +7604,40 @@ def get_asset_metadata_rows_for_listing(
     query: str,
     yacht_id: str,
     allowed_asset_ids: list[str],
-    limit: int = 50
+    limit: int = 500
 ) -> list[dict]:
     """
-    Returns asset metadata rows when the user asks what files/documents exist.
+    Loads metadata and readable text for every accessible processed asset.
 
-    This prevents valid file-listing questions from falling back just because
-    the answer is in asset metadata rather than inside a document paragraph.
+    Important:
+    - This function does not pre-filter only invoices.
+    - It supports mixed questions such as invoices plus SOPs.
+    - Category and topic filtering happens later inside
+      answer_file_listing_directly().
     """
+
+    if not yacht_id:
+        return []
 
     if not allowed_asset_ids:
         return []
 
-    clean_query = (query or "").lower()
+    try:
+        safe_limit = int(
+            limit or 500
+        )
+    except Exception:
+        safe_limit = 500
+
+    if safe_limit < 1:
+        safe_limit = 500
+
+    if safe_limit > 1000:
+        safe_limit = 1000
 
     try:
-        res = supabase.table("assets") \
+        res = (
+            supabase.table("assets")
             .select("""
                 id,
                 yacht_id,
@@ -7571,83 +7656,161 @@ def get_asset_metadata_rows_for_listing(
                 detected_year,
                 tags,
                 created_at
-            """) \
-            .eq("yacht_id", yacht_id) \
-            .in_("id", allowed_asset_ids) \
-            .order("created_at", desc=True) \
-            .limit(limit) \
+            """)
+            .eq("yacht_id", yacht_id)
+            .in_("id", allowed_asset_ids)
+            .eq("processing_status", "processed")
+            .order("created_at", desc=True)
+            .limit(safe_limit)
             .execute()
+        )
 
-    except Exception as e:
-        print("ASSET METADATA LISTING ERROR:", type(e).__name__, str(e))
+    except Exception as error:
+        print(
+            "ASSET METADATA LISTING ERROR:",
+            {
+                "error_type": type(error).__name__,
+                "error": str(error),
+                "yacht_id": yacht_id,
+                "allowed_asset_count": len(
+                    allowed_asset_ids
+                )
+            }
+        )
+
         return []
 
     rows = []
 
     for asset in res.data or []:
-        file_name = (
-            asset.get("original_file_name")
-            or asset.get("file_name")
-            or "Untitled document"
-        )
+        if not isinstance(asset, dict):
+            continue
 
-        file_name_lower = file_name.lower()
-        summary = asset.get("summary") or ""
-        extracted_text = asset.get("extracted_text") or ""
-        visual_description = asset.get("visual_description") or ""
-        ocr_text = asset.get("ocr_text") or ""
+        asset_id = str(
+            asset.get("id")
+            or ""
+        ).strip()
 
-        # For invoice questions, prefer invoice-like files.
-        # This is generic by file name/content, not hardcoded to any vendor.
-        if "invoice" in clean_query:
-            searchable = " ".join([
-                file_name_lower,
-                summary.lower(),
-                extracted_text.lower(),
-                visual_description.lower(),
-                ocr_text.lower()
-            ])
+        if not asset_id:
+            continue
 
-            if "invoice" not in searchable:
-                continue
+        file_name = clean_text_for_postgres(
+            str(
+                asset.get("original_file_name")
+                or asset.get("file_name")
+                or "Untitled document"
+            )
+        ).strip()
+
+        summary = clean_text_for_postgres(
+            str(
+                asset.get("summary")
+                or ""
+            )
+        ).strip()
+
+        extracted_text = clean_text_for_postgres(
+            str(
+                asset.get("extracted_text")
+                or ""
+            )
+        ).strip()
+
+        visual_description = clean_text_for_postgres(
+            str(
+                asset.get("visual_description")
+                or ""
+            )
+        ).strip()
+
+        ocr_text = clean_text_for_postgres(
+            str(
+                asset.get("ocr_text")
+                or ""
+            )
+        ).strip()
+
+        tags = asset.get("tags") or []
+
+        if not isinstance(tags, list):
+            tags = []
 
         content = f"""
 File name: {file_name}
 File type: {asset.get("file_type") or ""}
 MIME type: {asset.get("mime_type") or ""}
 Processing status: {asset.get("processing_status") or ""}
-Processing error: {asset.get("processing_error") or ""}
 Detected year: {asset.get("detected_year") or ""}
-Tags: {", ".join(asset.get("tags") or [])}
+Tags: {", ".join(str(tag) for tag in tags)}
 
 Summary:
 {summary}
 
-Extracted text preview:
-{extracted_text[:2000]}
+Extracted document text:
+{extracted_text[:8000]}
+
+OCR document text:
+{ocr_text[:8000]}
 
 Image visual description:
-{visual_description[:1000]}
-
-OCR text:
-{ocr_text[:1000]}
+{visual_description[:3000]}
 """.strip()
 
         rows.append({
-            "asset_id": asset.get("id"),
-            "yacht_id": asset.get("yacht_id"),
-            "chat_id": asset.get("chat_id"),
-            "security_level": asset.get("security_level"),
+            "asset_id": asset_id,
+            "id": asset_id,
+            "yacht_id": asset.get(
+                "yacht_id"
+            ),
+            "chat_id": asset.get(
+                "chat_id"
+            ),
+            "security_level": asset.get(
+                "security_level"
+            ),
             "content": content,
+            "search_text": content,
+            "summary": summary,
+            "extracted_text": extracted_text,
+            "ocr_text": ocr_text,
+            "visual_description": visual_description,
             "content_type": "asset_metadata_listing",
             "chunk_index": 0,
             "detected_date": None,
-            "detected_year": asset.get("detected_year"),
-            "tags": asset.get("tags") or [],
-            "file_name": asset.get("file_name"),
-            "original_file_name": asset.get("original_file_name"),
-            "file_type": asset.get("file_type")
+            "detected_year": asset.get(
+                "detected_year"
+            ),
+            "tags": tags,
+            "file_name": asset.get(
+                "file_name"
+            ),
+            "original_file_name": asset.get(
+                "original_file_name"
+            ),
+            "file_type": asset.get(
+                "file_type"
+            ),
+            "mime_type": asset.get(
+                "mime_type"
+            ),
+            "processing_status": asset.get(
+                "processing_status"
+            ),
+            "processing_error": asset.get(
+                "processing_error"
+            ),
+            "created_at": asset.get(
+                "created_at"
+            )
         })
+
+    print(
+        "ASSET METADATA LISTING RESULT:",
+        {
+            "query": query,
+            "asset_count": len(rows)
+        }
+    )
 
     return rows
  
