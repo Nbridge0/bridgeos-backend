@@ -9062,66 +9062,77 @@ def extract_subject_line_items_with_llm(
     context: str
 ) -> list[dict]:
     """
-    Extracts matching financial rows generically.
+    Extracts every financial row associated with the requested subject.
 
-    The LLM identifies row structure.
-    Python validates and calculates the amounts.
+    The LLM identifies table structure only.
+    Python validates and performs all arithmetic.
     """
 
-    if not subject or not context:
+    if not str(subject or "").strip():
+        return []
+
+    if not str(context or "").strip():
         return []
 
     try:
         raw = ask_llm(
             query=query,
             context=f"""
-You are a strict financial-document row extractor.
+You are a strict financial table row extractor.
 
-The user requests the monetary amount associated with this subject:
+The user is requesting the monetary amount associated with this subject:
 
 {subject}
 
-Search every supplied source for rows directly associated with that subject.
+Inspect every supplied source and extract every distinct row that directly
+matches the requested subject.
 
-Return ONLY valid JSON in this exact format:
+Return ONLY valid JSON in this exact structure:
 
 {{
   "items": [
     {{
-      "description": "exact description copied from the source",
+      "description": "exact row description",
+      "unit_price": "exact single-unit price or empty string",
       "quantity": "exact quantity or empty string",
-      "unit_price": "exact unit price or empty string",
-      "line_total": "exact row total or empty string",
+      "line_total": "exact full row total or empty string",
       "currency": "currency code or symbol, or empty string",
-      "evidence": "complete exact row or nearby source text",
+      "evidence": "complete exact row including description and values",
       "source_number": 1
     }}
   ]
 }}
 
-Column rules:
-- quantity is the number or measure purchased.
+Table interpretation rules:
+- Read the table headers before interpreting row values.
 - unit_price is the monetary price for one unit.
-- line_total is the monetary total for that row.
+- quantity is the number or measure purchased.
+- line_total is the full monetary amount for the complete row.
+- If headers are Price, QTY, Total and a row is:
+  Item | 40 | 10 | 400
+  then:
+  unit_price = 40
+  quantity = 10
+  line_total = 400
+- Never put unit_price into line_total.
 - Never put quantity into line_total.
-- Never use a product code, invoice number, date, weight, page number,
-  reference number, or count as a monetary total.
-- Prefer an explicit line_total when present.
-- If no explicit line total exists, return quantity and unit_price,
-  leaving line_total empty.
-- Do not perform arithmetic.
-- Do not use subtotal, tax, VAT, delivery, discount, balance, or invoice
-  grand total unless that value itself is the row for the requested subject.
-- Include every distinct matching row from every supplied source.
+- Never use an invoice number, date, page number, product code,
+  reference number or weight as a monetary total.
+- Copy an explicit line total when one is shown.
+- If line total is absent but unit price and quantity are present,
+  leave line_total empty. Do not calculate it.
+- Include matching rows from every supplied source.
 - Do not include unrelated rows.
+- Do not use invoice subtotal, tax, VAT, delivery, discount or grand total.
+- Do not calculate or add values.
 - Do not invent values.
-- Return an empty items list if no reliable row exists.
+- Return {{"items": []}} if no reliable rows exist.
 - Return JSON only.
 
 User request:
 {query}
 
-Document context:
+Document sources:
 {context}
 """.strip()
         )
@@ -9134,57 +9145,56 @@ Document context:
         )
         return []
 
+    print(
+        "SUBJECT LINE ITEM RAW RESPONSE:",
+        str(raw or "")[:5000]
+    )
+
     parsed = parse_llm_json_response(raw)
 
     if not parsed or not isinstance(parsed, dict):
         return []
 
-    items = parsed.get("items") or []
+    raw_items = parsed.get("items") or []
 
-    if not isinstance(items, list):
+    if not isinstance(raw_items, list):
         return []
 
     clean_items = []
-    subject_text = normalise_search_text(subject)
 
     subject_terms = [
         term
-        for term in subject_text.split()
+        for term in normalise_search_text(subject).split()
         if len(term) >= 2
     ]
 
-    for item in items:
+    for item in raw_items:
         if not isinstance(item, dict):
             continue
 
         description = str(
-            item.get("description")
-            or ""
+            item.get("description") or ""
         ).strip()
 
         evidence = str(
-            item.get("evidence")
-            or ""
+            item.get("evidence") or ""
+        ).strip()
+
+        raw_unit_price = str(
+            item.get("unit_price") or ""
+        ).strip()
+
+        raw_quantity = str(
+            item.get("quantity") or ""
+        ).strip()
+
+        raw_line_total = str(
+            item.get("line_total") or ""
         ).strip()
 
         currency = normalise_currency(
             item.get("currency")
         )
-
-        raw_quantity = str(
-            item.get("quantity")
-            or ""
-        ).strip()
-
-        raw_unit_price = str(
-            item.get("unit_price")
-            or ""
-        ).strip()
-
-        raw_line_total = str(
-            item.get("line_total")
-            or ""
-        ).strip()
 
         try:
             source_number = int(
@@ -9200,71 +9210,125 @@ Document context:
             f"{description} {evidence}"
         )
 
+        # The extracted row must actually contain the requested subject.
         if subject_terms and not all(
             term in searchable_row
             for term in subject_terms
         ):
             continue
 
-        quantity = parse_general_decimal(
-            raw_quantity
-        )
-
         unit_price = parse_decimal_money(
             raw_unit_price
         )
 
-        line_total = parse_decimal_money(
-            raw_line_total
+        quantity = parse_general_decimal(
+            raw_quantity
         )
 
-        if quantity is not None and quantity < Decimal("0"):
-            quantity = None
+        explicit_line_total = parse_decimal_money(
+            raw_line_total
+        )
 
         if unit_price is not None and unit_price < Decimal("0"):
             unit_price = None
 
-        if line_total is not None and line_total < Decimal("0"):
-            line_total = None
-
-        # Reject a likely quantity incorrectly labelled as a line total.
-        if (
-            line_total is not None
-            and quantity is not None
-            and line_total == quantity
-            and unit_price is not None
-            and unit_price != Decimal("1")
-        ):
-            line_total = None
-
-        calculated_from_components = False
+        if quantity is not None and quantity < Decimal("0"):
+            quantity = None
 
         if (
-            line_total is None
-            and quantity is not None
-            and unit_price is not None
+            explicit_line_total is not None
+            and explicit_line_total < Decimal("0")
         ):
-            line_total = (
+            explicit_line_total = None
+
+        calculated_total = None
+
+        if (
+            unit_price is not None
+            and quantity is not None
+        ):
+            calculated_total = (
+                unit_price * quantity
+            ).quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP
+            )
+
+        # Validate the explicit total against price x quantity when
+        # all three values are present.
+        if (
+            explicit_line_total is not None
+            and calculated_total is not None
+            and explicit_line_total != calculated_total
+        ):
+            print(
+                "SUBJECT ROW TOTAL MISMATCH:",
+                {
+                    "description": description,
+                    "unit_price": str(unit_price),
+                    "quantity": str(quantity),
+                    "explicit_line_total": str(
+                        explicit_line_total
+                    ),
+                    "calculated_total": str(
+                        calculated_total
+                    ),
+                    "evidence": evidence
+                }
+            )
+
+            # Prefer deterministic arithmetic from the identified columns.
+            final_amount = calculated_total
+            amount_method = "quantity_times_unit_price"
+
+        elif explicit_line_total is not None:
+            final_amount = explicit_line_total
+            amount_method = "explicit_line_total"
+
+        elif calculated_total is not None:
+            final_amount = calculated_total
+            amount_method = "quantity_times_unit_price"
+
+        else:
+            print(
+                "SUBJECT ROW REJECTED: insufficient values",
+                {
+                    "description": description,
+                    "unit_price": raw_unit_price,
+                    "quantity": raw_quantity,
+                    "line_total": raw_line_total,
+                    "evidence": evidence
+                }
+            )
+            continue
+
+        # Explicitly block the old failure where the price or quantity
+        # was returned as the complete spend amount.
+        if (
+            quantity is not None
+            and unit_price is not None
+            and quantity != Decimal("1")
+            and final_amount in {quantity, unit_price}
+        ):
+            final_amount = (
                 quantity * unit_price
             ).quantize(
                 Decimal("0.01"),
                 rounding=ROUND_HALF_UP
             )
 
-            calculated_from_components = True
-
-        if line_total is None:
-            continue
+            amount_method = "quantity_times_unit_price"
 
         clean_items.append({
             "description": description,
-            "quantity": quantity,
             "unit_price": unit_price,
-            "amount": line_total,
+            "quantity": quantity,
+            "explicit_line_total": explicit_line_total,
+            "amount": final_amount,
             "currency": currency,
             "evidence": evidence,
             "source_number": source_number,
-            "calculated_from_components": calculated_from_components
+            "amount_method": amount_method
         })
 
     return clean_items
