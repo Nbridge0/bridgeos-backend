@@ -10408,12 +10408,6 @@ def answer_subject_spending_from_context(
                 "content_type": "financial_document"
             }
 
-            one_document_context = (
-                build_context_from_asset_results(
-                    [source_row]
-                )
-            )
-
             try:
                 extracted_items = (
                     extract_subject_line_items_with_llm(
@@ -12451,10 +12445,58 @@ Rules:
             )
 
         if financial_query:
+            financial_asset_rows = []
+
+            seen_asset_ids = set()
+
+            for row in matched_rows:
+                asset_id = row.get("asset_id")
+
+                if not asset_id or asset_id in seen_asset_ids:
+                    continue
+
+                seen_asset_ids.add(asset_id)
+
+                financial_asset_rows.append({
+                    **row,
+                    "content": str(
+                        row.get("search_text")
+                        or row.get("content")
+                        or ""
+                    ).strip(),
+                    "search_text": str(
+                        row.get("search_text")
+                        or row.get("content")
+                        or ""
+                    ).strip(),
+                    "content_type": "financial_document"
+                })
+
+            financial_context = (
+                build_context_from_asset_results(
+                    financial_asset_rows
+                )
+                if financial_asset_rows
+                else ""
+            )
+
             financial_result = (
                 run_financial_answer(
-                    financial_context=context,
-                    financial_rows=matched_rows
+                    financial_context=financial_context,
+                    financial_rows=financial_asset_rows
+                )
+            )
+
+            return finish(
+                final_answer=financial_result.get(
+                    "answer"
+                ),
+                final_sources=financial_result.get(
+                    "sources"
+                ),
+                mode="uploaded_chat_asset",
+                final_uploaded_asset_id=(
+                    uploaded_asset_id
                 )
             )
 
@@ -12698,11 +12740,10 @@ Rules:
             if requested_subject_groups:
                 include_document = bool(
                     matched_subjects
-                    and document_score >= 2
                 )
             else:
                 include_document = (
-                    document_score >= 2
+                    document_score >= 1
                 )
 
             print(
