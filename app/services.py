@@ -4658,6 +4658,11 @@ def process_uploaded_asset(
 ):
     """
     Converts a raw uploaded file into searchable memory.
+
+    Important:
+    - PDFs are allowed to reach OCR even when normal text extraction is empty.
+    - A document fails only after every applicable extraction method fails.
+    - Extracted text and OCR text are both saved and chunked.
     """
 
     try:
@@ -4672,17 +4677,32 @@ def process_uploaded_asset(
         whatsapp_messages = []
         whatsapp_source_text_file_name = None
 
+        original_file_type = file_type
+
+        # =====================================================
+        # WHATSAPP ZIP
+        # =====================================================
         if file_type == "whatsapp_zip":
             file.seek(0)
 
-            extracted_text, whatsapp_messages, whatsapp_source_text_file_name = extract_whatsapp_zip_payload(
+            (
+                extracted_text,
+                whatsapp_messages,
+                whatsapp_source_text_file_name
+            ) = extract_whatsapp_zip_payload(
                 file=file,
                 filename=filename
             )
 
-            extracted_text = clean_text_for_postgres(extracted_text)
+            extracted_text = clean_text_for_postgres(
+                extracted_text
+            )
+
             file_type = "whatsapp_chat"
 
+        # =====================================================
+        # AUDIO
+        # =====================================================
         elif file_type == "audio":
             file.seek(0)
 
@@ -4692,135 +4712,383 @@ def process_uploaded_asset(
                 mime_type=None
             )
 
-            extracted_text = clean_text_for_postgres(extracted_text)
+            extracted_text = clean_text_for_postgres(
+                extracted_text
+            )
 
-            if not extracted_text:
+            if not extracted_text.strip():
                 raise ValueError(
-                    "The audio file did not contain detectable speech"
+                    "The audio file did not contain detectable speech."
                 )
 
-        elif file_type in ["text", "pdf", "docx"]:
-            original_file_type = file_type
-
+        # =====================================================
+        # TEXT / DOCX
+        # =====================================================
+        elif file_type in ["text", "docx"]:
             file.seek(0)
+
             extracted_text = extract_text_by_file_type(
                 file=file,
                 filename=filename,
-                file_type=original_file_type
+                file_type=file_type
             )
 
-            extracted_text = clean_text_for_postgres(extracted_text)
+            extracted_text = clean_text_for_postgres(
+                extracted_text
+            )
 
-            # Only genuine WhatsApp TXT exports become whatsapp_chat.
             if (
-                original_file_type == "text"
-                and is_whatsapp_export_text(extracted_text, filename)
+                file_type == "text"
+                and is_whatsapp_export_text(
+                    extracted_text,
+                    filename
+                )
             ):
-                extracted_text, whatsapp_messages = normalise_whatsapp_export_text(
+                (
+                    extracted_text,
+                    whatsapp_messages
+                ) = normalise_whatsapp_export_text(
                     text=extracted_text,
                     filename=filename
                 )
 
-                extracted_text = clean_text_for_postgres(extracted_text)
+                extracted_text = clean_text_for_postgres(
+                    extracted_text
+                )
+
                 whatsapp_source_text_file_name = filename
                 file_type = "whatsapp_chat"
-            else:
-                file_type = original_file_type
 
-            if file_type in ["text", "pdf", "docx"]:
-                extracted_text = str(extracted_text or "").strip()
+            if not extracted_text.strip():
+                raise ValueError(
+                    f"No readable text was extracted from {filename}."
+                )
 
+        # =====================================================
+        # PDF
+        # =====================================================
+        elif file_type == "pdf":
+            # First try normal PDF text extraction.
+            try:
+                file.seek(0)
+
+                extracted_text = extract_text_by_file_type(
+                    file=file,
+                    filename=filename,
+                    file_type="pdf"
+                )
+
+                extracted_text = clean_text_for_postgres(
+                    extracted_text
+                )
+
+            except Exception as extraction_error:
                 print(
-                    "DOCUMENT EXTRACTION RESULT:",
+                    "PDF NORMAL TEXT EXTRACTION ERROR:",
                     {
                         "asset_id": asset_id,
                         "filename": filename,
-                        "file_type": file_type,
-                        "characters": len(extracted_text),
-                        "preview": extracted_text[:500]
+                        "error_type": type(
+                            extraction_error
+                        ).__name__,
+                        "error": str(extraction_error)
                     }
                 )
 
-                if not extracted_text:
-                    raise ValueError(
-                        f"No readable text was extracted from {filename}. "
-                        f"The document may be empty, damaged, encrypted, "
-                        f"scanned, or stored in unsupported embedded objects."
-                    )
+                extracted_text = ""
 
-        if file_type == "pdf":
-            should_run_pdf_ocr = False
+            extracted_clean = extracted_text.strip()
 
-            extracted_clean = (extracted_text or "").strip()
-            digit_count = sum(char.isdigit() for char in extracted_clean)
+            digit_count = sum(
+                character.isdigit()
+                for character in extracted_clean
+            )
 
-            # Scanned PDFs often return little or no text.
-            if len(extracted_clean) < 150:
-                should_run_pdf_ocr = True
+            lower_filename = (
+                filename or ""
+            ).lower()
 
-            # Invoices/receipts usually contain several numbers.
-            # If almost no numbers were extracted, OCR is needed.
-            if digit_count < 8:
-                should_run_pdf_ocr = True
-
-            # Also run OCR for likely financial files by filename.
-            # This is generic, not vendor-specific.
-            lower_filename = (filename or "").lower()
             financial_file_words = [
                 "invoice",
                 "receipt",
                 "quote",
+                "quotation",
                 "statement",
                 "purchase",
                 "order",
                 "bill",
                 "payment",
+                "expense",
                 "tax",
-                "vat",
+                "vat"
             ]
 
-            if any(word in lower_filename for word in financial_file_words):
-                should_run_pdf_ocr = True
+            likely_financial_pdf = any(
+                word in lower_filename
+                for word in financial_file_words
+            )
+
+            should_run_pdf_ocr = (
+                not extracted_clean
+                or len(extracted_clean) < 300
+                or digit_count < 8
+                or likely_financial_pdf
+            )
+
+            print(
+                "PDF EXTRACTION DECISION:",
+                {
+                    "asset_id": asset_id,
+                    "filename": filename,
+                    "normal_text_characters": len(
+                        extracted_clean
+                    ),
+                    "normal_text_digit_count": (
+                        digit_count
+                    ),
+                    "likely_financial_pdf": (
+                        likely_financial_pdf
+                    ),
+                    "run_ocr": should_run_pdf_ocr
+                }
+            )
 
             if should_run_pdf_ocr:
-                file.seek(0)
+                try:
+                    file.seek(0)
 
-                pdf_ocr_text = extract_ocr_from_pdf_pages(
-                    file=file,
-                    filename=filename,
-                    max_pages=12
+                    pdf_ocr_text = (
+                        extract_ocr_from_pdf_pages(
+                            file=file,
+                            filename=filename,
+                            max_pages=30
+                        )
+                    )
+
+                    pdf_ocr_text = (
+                        clean_text_for_postgres(
+                            pdf_ocr_text
+                        )
+                    )
+
+                    if (
+                        pdf_ocr_text
+                        and pdf_ocr_text
+                        != "NO_READABLE_TEXT"
+                    ):
+                        ocr_text = pdf_ocr_text
+
+                except Exception as ocr_error:
+                    print(
+                        "PDF OCR ERROR:",
+                        {
+                            "asset_id": asset_id,
+                            "filename": filename,
+                            "error_type": type(
+                                ocr_error
+                            ).__name__,
+                            "error": str(ocr_error)
+                        }
+                    )
+
+                    ocr_text = ""
+
+            # Do not fail until normal extraction AND OCR both fail.
+            if (
+                not extracted_text.strip()
+                and not ocr_text.strip()
+            ):
+                raise ValueError(
+                    f"No readable text or OCR text was extracted "
+                    f"from {filename}. The PDF may be damaged, "
+                    f"encrypted, empty, or unsupported."
                 )
 
-                pdf_ocr_text = clean_text_for_postgres(pdf_ocr_text)
+        # =====================================================
+        # IMAGE
+        # =====================================================
+        elif file_type == "image":
+            try:
+                file.seek(0)
 
-                if pdf_ocr_text:
-                    ocr_text = pdf_ocr_text
+                visual_description = describe_image(
+                    file,
+                    filename
+                )
 
-                    if not extracted_text:
-                        extracted_text = pdf_ocr_text
+                visual_description = (
+                    clean_text_for_postgres(
+                        visual_description
+                    )
+                )
 
-        if file_type == "image":
-            file.seek(0)
-            visual_description = describe_image(file, filename)
+            except Exception as description_error:
+                print(
+                    "IMAGE DESCRIPTION ERROR:",
+                    {
+                        "asset_id": asset_id,
+                        "filename": filename,
+                        "error_type": type(
+                            description_error
+                        ).__name__,
+                        "error": str(description_error)
+                    }
+                )
 
-            file.seek(0)
-            ocr_text = extract_ocr_from_image(file, filename)
+                visual_description = ""
 
-            if ocr_text == "NO_READABLE_TEXT":
+            try:
+                file.seek(0)
+
+                ocr_text = extract_ocr_from_image(
+                    file,
+                    filename
+                )
+
+                ocr_text = clean_text_for_postgres(
+                    ocr_text
+                )
+
+                if ocr_text == "NO_READABLE_TEXT":
+                    ocr_text = ""
+
+            except Exception as ocr_error:
+                print(
+                    "IMAGE OCR ERROR:",
+                    {
+                        "asset_id": asset_id,
+                        "filename": filename,
+                        "error_type": type(
+                            ocr_error
+                        ).__name__,
+                        "error": str(ocr_error)
+                    }
+                )
+
                 ocr_text = ""
 
-            visual_description = clean_text_for_postgres(visual_description)
-            ocr_text = clean_text_for_postgres(ocr_text)
+            if (
+                not visual_description.strip()
+                and not ocr_text.strip()
+            ):
+                raise ValueError(
+                    f"No visual description or OCR text was "
+                    f"extracted from {filename}."
+                )
 
-        combined_text = "\n\n".join([
+        # =====================================================
+        # OTHER FILE TYPES
+        # =====================================================
+        else:
+            try:
+                file.seek(0)
+
+                extracted_text = extract_text_by_file_type(
+                    file=file,
+                    filename=filename,
+                    file_type=file_type
+                )
+
+                extracted_text = (
+                    clean_text_for_postgres(
+                        extracted_text
+                    )
+                )
+
+            except Exception as extraction_error:
+                print(
+                    "GENERIC FILE EXTRACTION ERROR:",
+                    {
+                        "asset_id": asset_id,
+                        "filename": filename,
+                        "file_type": file_type,
+                        "error_type": type(
+                            extraction_error
+                        ).__name__,
+                        "error": str(extraction_error)
+                    }
+                )
+
+                extracted_text = ""
+
+            if not extracted_text.strip():
+                raise ValueError(
+                    f"No readable content was extracted "
+                    f"from {filename}."
+                )
+
+        # =====================================================
+        # BUILD COMPLETE SEARCHABLE TEXT
+        # =====================================================
+        combined_parts = [
             f"File name: {filename}",
-            f"File type: {file_type}",
-            f"Extracted text:\n{extracted_text}" if extracted_text else "",
-            f"Image visual description:\n{visual_description}" if visual_description else "",
-            f"OCR text:\n{ocr_text}" if ocr_text else ""
-        ]).strip()
+            f"File type: {file_type}"
+        ]
 
-        detected_date, date_source = extract_date_from_filename(filename)
+        if extracted_text.strip():
+            combined_parts.append(
+                "Extracted text:\n"
+                + extracted_text.strip()
+            )
+
+        if visual_description.strip():
+            combined_parts.append(
+                "Image visual description:\n"
+                + visual_description.strip()
+            )
+
+        if ocr_text.strip():
+            combined_parts.append(
+                "OCR text:\n"
+                + ocr_text.strip()
+            )
+
+        combined_text = "\n\n".join(
+            combined_parts
+        ).strip()
+
+        print(
+            "FINAL DOCUMENT EXTRACTION RESULT:",
+            {
+                "asset_id": asset_id,
+                "filename": filename,
+                "original_file_type": (
+                    original_file_type
+                ),
+                "final_file_type": file_type,
+                "extracted_text_characters": len(
+                    extracted_text
+                ),
+                "ocr_text_characters": len(
+                    ocr_text
+                ),
+                "visual_description_characters": len(
+                    visual_description
+                ),
+                "combined_characters": len(
+                    combined_text
+                ),
+                "extracted_preview": (
+                    extracted_text[:500]
+                ),
+                "ocr_preview": ocr_text[:500]
+            }
+        )
+
+        if not combined_text.strip():
+            raise ValueError(
+                f"No searchable content was created "
+                f"for {filename}."
+            )
+
+        # =====================================================
+        # METADATA
+        # =====================================================
+        detected_date, date_source = (
+            extract_date_from_filename(
+                filename
+            )
+        )
 
         detected_year = None
         detected_month = None
@@ -4831,30 +5099,63 @@ def process_uploaded_asset(
             detected_month = detected_date.month
             detected_day = detected_date.day
         else:
-            detected_year = extract_year_from_text(combined_text)
+            detected_year = extract_year_from_text(
+                combined_text
+            )
 
-        detected_event = detect_event(combined_text)
-        tags = generate_basic_tags(combined_text)
+        detected_event = detect_event(
+            combined_text
+        )
+
+        tags = generate_basic_tags(
+            combined_text
+        )
 
         summary = combined_text[:1500]
 
-        supabase.table("assets").update({
-            "file_type": file_type,
-            "extracted_text": extracted_text or None,
-            "visual_description": visual_description or None,
-            "ocr_text": ocr_text or None,
-            "detected_date": detected_date.isoformat() if detected_date else None,
-            "detected_year": detected_year,
-            "detected_month": detected_date.month if detected_date else None,
-            "detected_day": detected_date.day if detected_date else None,
-            "date_source": date_source,
-            "detected_event": detected_event,
-            "tags": tags,
-            "summary": summary,
-            "processing_status": "processed",
-            "processing_error": None
-        }).eq("id", asset_id).execute()
+        # =====================================================
+        # SAVE PROCESSED ASSET
+        # =====================================================
+        update_result = (
+            supabase.table("assets")
+            .update({
+                "file_type": file_type,
+                "extracted_text": (
+                    extracted_text or None
+                ),
+                "visual_description": (
+                    visual_description or None
+                ),
+                "ocr_text": ocr_text or None,
+                "detected_date": (
+                    detected_date.isoformat()
+                    if detected_date
+                    else None
+                ),
+                "detected_year": detected_year,
+                "detected_month": detected_month,
+                "detected_day": detected_day,
+                "date_source": date_source,
+                "detected_event": detected_event,
+                "tags": tags,
+                "summary": summary,
+                "processing_status": "processed",
+                "processing_error": None
+            })
+            .eq("id", asset_id)
+            .eq("yacht_id", yacht_id)
+            .execute()
+        )
 
+        if not update_result.data:
+            raise RuntimeError(
+                "The extracted document could not be "
+                "saved to the assets table."
+            )
+
+        # =====================================================
+        # CREATE SEARCHABLE CHUNKS
+        # =====================================================
         create_asset_chunks(
             asset_id=asset_id,
             yacht_id=yacht_id,
@@ -4870,11 +5171,74 @@ def process_uploaded_asset(
             security_level=security_level
         )
 
+        # =====================================================
+        # SAVE WHATSAPP STRUCTURED HISTORY
+        # =====================================================
+        if whatsapp_messages:
+            try:
+                save_whatsapp_chat_history(
+                    asset_id=asset_id,
+                    yacht_id=yacht_id,
+                    chat_id=chat_id,
+                    uploaded_by=uploaded_by,
+                    original_file_name=filename,
+                    source_text_file_name=(
+                        whatsapp_source_text_file_name
+                    ),
+                    messages=whatsapp_messages
+                )
+
+            except Exception as whatsapp_error:
+                print(
+                    "WHATSAPP STRUCTURED SAVE ERROR:",
+                    {
+                        "asset_id": asset_id,
+                        "error_type": type(
+                            whatsapp_error
+                        ).__name__,
+                        "error": str(whatsapp_error)
+                    }
+                )
+
+        print(
+            "ASSET PROCESSING COMPLETED:",
+            {
+                "asset_id": asset_id,
+                "filename": filename,
+                "file_type": file_type,
+                "status": "processed"
+            }
+        )
+
     except Exception as e:
-        supabase.table("assets").update({
-            "processing_status": "failed",
-            "processing_error": str(e)
-        }).eq("id", asset_id).execute()
+        error_message = (
+            f"{type(e).__name__}: {str(e)}"
+        )
+
+        print(
+            "ASSET PROCESSING FAILED:",
+            {
+                "asset_id": asset_id,
+                "filename": filename,
+                "file_type": file_type,
+                "error": error_message
+            }
+        )
+
+        try:
+            supabase.table("assets").update({
+                "processing_status": "failed",
+                "processing_error": (
+                    error_message[:4000]
+                )
+            }).eq("id", asset_id).execute()
+
+        except Exception as update_error:
+            print(
+                "FAILED STATUS UPDATE ERROR:",
+                type(update_error).__name__,
+                str(update_error)
+            )
 
         raise
 
@@ -10055,7 +10419,8 @@ def answer_subject_spending_from_context(
                     extract_subject_line_items_with_llm(
                         query=clean_query,
                         subject=subject,
-                        context=one_document_context
+                        context=document_text,
+                        asset_id=asset_id
                     )
                     or []
                 )
