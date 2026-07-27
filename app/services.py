@@ -9639,6 +9639,13 @@ def evidence_is_supported_exactly(
     evidence: str,
     document_text: str
 ) -> bool:
+    """
+    Verifies that extracted evidence belongs to the document.
+
+    PDF and OCR extraction often changes spacing, separators and line breaks,
+    so requiring an almost exact sentence match rejects valid invoice rows.
+    """
+
     normalised_evidence = normalise_search_text(
         evidence
     )
@@ -9659,20 +9666,22 @@ def evidence_is_supported_exactly(
         if len(word) >= 2
     ]
 
-    if len(evidence_words) < 3:
+    if not evidence_words:
         return False
 
-    matched_word_count = sum(
-        1
+    matched_words = [
+        word
         for word in evidence_words
         if word in normalised_document
+    ]
+
+    overlap = (
+        len(matched_words)
+        / len(evidence_words)
     )
 
-    return (
-        matched_word_count
-        / len(evidence_words)
-    ) >= 0.90
-
+    # OCR and extracted tables commonly lose columns, pipes and spacing.
+    return overlap >= 0.60
 
 def financial_extraction_cache_key(
     asset_id: str,
@@ -9696,10 +9705,10 @@ def extract_subject_line_items_with_llm(
     asset_id: str | None = None
 ) -> list[dict]:
     """
-    Extracts financial rows for one subject from one document only.
+    Extracts every financial line matching one subject.
 
-    The LLM identifies the row structure.
-    Python verifies the evidence and performs all arithmetic.
+    The LLM identifies columns.
+    Python parses numbers and performs the arithmetic.
     """
 
     clean_subject = str(subject or "").strip()
@@ -9745,39 +9754,42 @@ def extract_subject_line_items_with_llm(
         raw = ask_llm(
             query=query,
             context=f"""
-You are a strict financial-row extraction engine.
-
-You are receiving exactly one document.
+You extract financial line items from exactly one document.
 
 Requested subject:
 {clean_subject}
 
-Return only valid JSON:
+Return ONLY valid JSON in this exact structure:
 
 {{
   "items": [
     {{
-      "description": "exact row description",
-      "unit_price": "exact unit price or empty string",
-      "quantity": "exact quantity or empty string",
-      "line_total": "exact row total or empty string",
+      "description": "matching item description",
+      "unit_price": "unit price exactly as written, or empty string",
+      "quantity": "quantity exactly as written, or empty string",
+      "line_total": "line total exactly as written, or empty string",
       "currency": "currency symbol or code, or empty string",
-      "evidence": "exact complete matching row copied from the document"
+      "evidence": "a short exact fragment from the matching document row"
     }}
   ]
 }}
 
 Rules:
-- Use only the supplied document.
-- Extract every row directly matching the requested subject.
-- Copy evidence from the document without paraphrasing.
-- Read table headings before assigning values.
-- Do not calculate.
-- Do not infer missing values.
-- Do not use invoice numbers, dates, references or product codes.
-- Do not use subtotal, tax, VAT, discount, delivery or grand total.
-- Omit unclear rows.
-- Return {{"items": []}} when no reliable row exists.
+- Extract EVERY row matching the requested subject.
+- A match may be singular, plural, an item variation, or a longer description
+  containing the requested subject.
+- Read the table headings to determine quantity, unit price and line total.
+- Preserve decimal points and commas.
+- Evidence should be a short fragment from the row, not a rewritten sentence.
+- Include a row when it contains:
+  1. quantity and unit price, or
+  2. an explicit line total.
+- Do not require all three values.
+- Do not use subtotal, VAT, tax, discount, delivery, invoice total or grand total
+  as a product line total.
+- Do not calculate values.
+- Do not invent missing values.
+- Return {{"items": []}} only when no matching row exists.
 - Return JSON only.
 
 Document:
@@ -9785,22 +9797,44 @@ Document:
 """.strip()
         )
 
-    except Exception as e:
+    except Exception as error:
         print(
             "SINGLE DOCUMENT FINANCIAL EXTRACTION ERROR:",
-            type(e).__name__,
-            str(e)
+            type(error).__name__,
+            str(error)
         )
+
+        FINANCIAL_EXTRACTION_CACHE[cache_key] = []
         return []
+
+    print(
+        "FINANCIAL EXTRACTION RAW RESPONSE:",
+        {
+            "asset_id": asset_id,
+            "subject": clean_subject,
+            "response": str(raw or "")[:2000]
+        }
+    )
 
     parsed = parse_llm_json_response(raw)
 
     if not isinstance(parsed, dict):
+        print(
+            "FINANCIAL EXTRACTION INVALID JSON:",
+            {
+                "asset_id": asset_id,
+                "subject": clean_subject,
+                "raw": str(raw or "")[:1000]
+            }
+        )
+
+        FINANCIAL_EXTRACTION_CACHE[cache_key] = []
         return []
 
     raw_items = parsed.get("items") or []
 
     if not isinstance(raw_items, list):
+        FINANCIAL_EXTRACTION_CACHE[cache_key] = []
         return []
 
     verified_items = []
@@ -9818,7 +9852,7 @@ Document:
             raw_item.get("evidence") or ""
         ).strip()
 
-        if not description or not evidence:
+        if not description:
             continue
 
         searchable_item = normalise_search_text(
@@ -9829,63 +9863,141 @@ Document:
             term in searchable_item
             for term in subject_terms
         ):
-            continue
-
-        if not evidence_is_supported_exactly(
-            evidence=evidence,
-            document_text=document_text
-        ):
             print(
-                "FINANCIAL ROW REJECTED: evidence not found",
+                "FINANCIAL ROW REJECTED: SUBJECT MISMATCH",
                 {
                     "asset_id": asset_id,
                     "subject": clean_subject,
+                    "description": description,
+                    "evidence": evidence
+                }
+            )
+            continue
+
+        # The description itself can verify the row when OCR has damaged
+        # the full evidence string.
+        evidence_supported = (
+            evidence_is_supported_exactly(
+                evidence=evidence,
+                document_text=document_text
+            )
+            if evidence
+            else False
+        )
+
+        description_supported = (
+            normalise_search_text(description)
+            in normalised_document
+        )
+
+        if not evidence_supported and not description_supported:
+            print(
+                "FINANCIAL ROW REJECTED: EVIDENCE NOT FOUND",
+                {
+                    "asset_id": asset_id,
+                    "subject": clean_subject,
+                    "description": description,
                     "evidence": evidence
                 }
             )
             continue
 
         unit_price = parse_decimal_money(
-            str(raw_item.get("unit_price") or "")
+            str(
+                raw_item.get("unit_price")
+                or raw_item.get("price")
+                or raw_item.get("rate")
+                or ""
+            )
         )
 
         quantity = parse_general_decimal(
-            str(raw_item.get("quantity") or "")
+            str(
+                raw_item.get("quantity")
+                or raw_item.get("qty")
+                or raw_item.get("units")
+                or ""
+            )
         )
 
         explicit_line_total = parse_decimal_money(
-            str(raw_item.get("line_total") or "")
+            str(
+                raw_item.get("line_total")
+                or raw_item.get("total")
+                or raw_item.get("amount")
+                or ""
+            )
         )
 
-        if unit_price is not None and unit_price < 0:
-            continue
+        if (
+            unit_price is not None
+            and unit_price < Decimal("0")
+        ):
+            unit_price = None
 
-        if quantity is not None and quantity < 0:
-            continue
+        if (
+            quantity is not None
+            and quantity < Decimal("0")
+        ):
+            quantity = None
 
         if (
             explicit_line_total is not None
-            and explicit_line_total < 0
+            and explicit_line_total < Decimal("0")
         ):
-            continue
+            explicit_line_total = None
 
-        if not document_contains_decimal(
-            document_text,
-            unit_price
+        # Verify each value individually only when it was supplied.
+        if (
+            unit_price is not None
+            and not document_contains_decimal(
+                document_text,
+                unit_price
+            )
         ):
-            continue
+            print(
+                "FINANCIAL VALUE WARNING: UNIT PRICE NOT FOUND",
+                {
+                    "asset_id": asset_id,
+                    "description": description,
+                    "unit_price": str(unit_price)
+                }
+            )
+            unit_price = None
 
-        if not document_contains_decimal(
-            document_text,
-            quantity
+        if (
+            quantity is not None
+            and not document_contains_decimal(
+                document_text,
+                quantity
+            )
         ):
-            continue
+            print(
+                "FINANCIAL VALUE WARNING: QUANTITY NOT FOUND",
+                {
+                    "asset_id": asset_id,
+                    "description": description,
+                    "quantity": str(quantity)
+                }
+            )
+            quantity = None
 
-        if not document_contains_decimal(
-            document_text,
-            explicit_line_total
+        if (
+            explicit_line_total is not None
+            and not document_contains_decimal(
+                document_text,
+                explicit_line_total
+            )
         ):
-            continue
+            print(
+                "FINANCIAL VALUE WARNING: LINE TOTAL NOT FOUND",
+                {
+                    "asset_id": asset_id,
+                    "description": description,
+                    "line_total": str(explicit_line_total)
+                }
+            )
+            explicit_line_total = None
 
         calculated_total = None
 
@@ -9900,13 +10012,23 @@ Document:
                 rounding=ROUND_HALF_UP
             )
 
-        if (
-            calculated_total is not None
-            and explicit_line_total is not None
-        ):
-            if calculated_total != explicit_line_total:
+        # Prefer the explicit line total when the invoice provides one.
+        # The unit may be kilograms, cases, packs, hours or another measure
+        # whose displayed quantity can be rounded.
+        if explicit_line_total is not None:
+            final_amount = explicit_line_total.quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP
+            )
+
+            amount_method = "explicit_line_total"
+
+            if (
+                calculated_total is not None
+                and calculated_total != final_amount
+            ):
                 print(
-                    "FINANCIAL ROW REJECTED: total mismatch",
+                    "FINANCIAL LINE TOTAL DIFFERENCE:",
                     {
                         "asset_id": asset_id,
                         "description": description,
@@ -9915,29 +10037,30 @@ Document:
                         "calculated_total": str(
                             calculated_total
                         ),
-                        "line_total": str(
-                            explicit_line_total
+                        "written_line_total": str(
+                            final_amount
                         )
                     }
                 )
-                continue
-
-            final_amount = calculated_total
-            amount_method = (
-                "verified_quantity_times_unit_price"
-            )
 
         elif calculated_total is not None:
             final_amount = calculated_total
-            amount_method = (
-                "quantity_times_unit_price"
-            )
-
-        elif explicit_line_total is not None:
-            final_amount = explicit_line_total
-            amount_method = "explicit_line_total"
+            amount_method = "quantity_times_unit_price"
 
         else:
+            print(
+                "FINANCIAL ROW REJECTED: NO USABLE AMOUNT",
+                {
+                    "asset_id": asset_id,
+                    "subject": clean_subject,
+                    "description": description,
+                    "unit_price": str(unit_price),
+                    "quantity": str(quantity),
+                    "line_total": str(
+                        explicit_line_total
+                    )
+                }
+            )
             continue
 
         currency = normalise_currency(
@@ -9971,10 +10094,44 @@ Document:
             ),
             "amount": final_amount,
             "currency": currency,
-            "evidence": evidence,
+            "evidence": evidence or description,
             "asset_id": asset_id,
             "amount_method": amount_method
         })
+
+    print(
+        "VERIFIED FINANCIAL ITEMS:",
+        {
+            "asset_id": asset_id,
+            "subject": clean_subject,
+            "count": len(verified_items),
+            "items": [
+                {
+                    "description": item.get(
+                        "description"
+                    ),
+                    "unit_price": str(
+                        item.get("unit_price")
+                    ),
+                    "quantity": str(
+                        item.get("quantity")
+                    ),
+                    "line_total": str(
+                        item.get(
+                            "explicit_line_total"
+                        )
+                    ),
+                    "amount": str(
+                        item.get("amount")
+                    ),
+                    "currency": item.get(
+                        "currency"
+                    )
+                }
+                for item in verified_items
+            ]
+        }
+    )
 
     FINANCIAL_EXTRACTION_CACHE[cache_key] = [
         dict(item)
