@@ -8837,21 +8837,17 @@ def answer_financial_total_from_context(
     matched_rows: list[dict]
 ):
     """
-    Calculates invoice spending deterministically.
+    Extracts one final payable total per invoice, verifies it against the
+    original invoice text, and performs all arithmetic in Python.
 
-    Safety rules:
-    - The LLM does not extract amounts.
-    - The LLM does not perform arithmetic.
-    - One authoritative total is selected per asset/invoice.
-    - Duplicate chunks cannot duplicate an invoice.
-    - Subtotal, VAT, discount and line-item values are excluded.
-    - Different currencies are never combined.
-    - Ambiguous invoices are rejected rather than guessed.
+    The LLM may identify candidates, but it never performs the calculation.
     """
 
-    clean_query = normalise_invoice_line(query).lower()
+    clean_query = " ".join(
+        str(query or "").strip().lower().split()
+    )
 
-    total_phrases = [
+    calculation_phrases = [
         "how much did we spend",
         "how much have we spent",
         "how much we spent",
@@ -8865,19 +8861,21 @@ def answer_financial_total_from_context(
         "total cost",
         "total costs",
         "total amount",
+        "total price",
         "grand total",
         "invoice total",
         "amount paid",
         "amount due",
+        "balance due",
         "sum of",
         "add up",
         "calculate the total",
-        "calculate total",
+        "calculate total"
     ]
 
     if not any(
         phrase in clean_query
-        for phrase in total_phrases
+        for phrase in calculation_phrases
     ):
         return None
 
@@ -8887,46 +8885,313 @@ def answer_financial_total_from_context(
             "sources": []
         }
 
-    assets = build_invoice_text_by_asset(
-        matched_rows
-    )
+    # ---------------------------------------------------------
+    # GROUP ALL CHUNKS BY INVOICE/ASSET
+    # ---------------------------------------------------------
+    assets_by_id = {}
+
+    for row in matched_rows:
+        asset_id = row.get("asset_id")
+
+        if not asset_id:
+            continue
+
+        content = str(
+            row.get("content")
+            or row.get("text")
+            or ""
+        ).strip()
+
+        if not content:
+            continue
+
+        if asset_id not in assets_by_id:
+            assets_by_id[asset_id] = {
+                "asset_id": asset_id,
+                "file_name": (
+                    row.get("original_file_name")
+                    or row.get("file_name")
+                    or row.get("title")
+                    or "Invoice"
+                ),
+                "rows": [],
+                "contents": []
+            }
+
+        normalised_content = " ".join(
+            content.lower().split()
+        )
+
+        existing_contents = {
+            " ".join(item.lower().split())
+            for item in assets_by_id[asset_id]["contents"]
+        }
+
+        if normalised_content not in existing_contents:
+            assets_by_id[asset_id]["contents"].append(content)
+
+        assets_by_id[asset_id]["rows"].append(row)
+
+    if not assets_by_id:
+        return {
+            "answer": FALLBACK_NO_DATA_ANSWER,
+            "sources": []
+        }
 
     verified_invoices = []
     rejected_invoices = []
 
-    for asset_id, asset in assets.items():
-        document_text = "\n\n".join(
-            asset["contents"]
-        )
+    # ---------------------------------------------------------
+    # EXTRACT ONE TOTAL FROM EACH INVOICE
+    # ---------------------------------------------------------
+    for asset_id, asset_data in assets_by_id.items():
+        invoice_text = "\n\n".join(
+            asset_data["contents"]
+        ).strip()
 
-        candidates = extract_invoice_total_candidates(
-            document_text
-        )
+        if not invoice_text:
+            continue
 
-        selected_total, rejection_reason = (
-            choose_one_invoice_total(candidates)
-        )
+        try:
+            raw = ask_llm(
+                query=query,
+                context=f"""
+You are extracting the final payable total from ONE invoice or financial document.
 
-        if not selected_total:
+Return ONLY valid JSON:
+
+{{
+  "found": true,
+  "amount": "1250.50",
+  "currency": "USD",
+  "label": "Grand Total",
+  "evidence": "exact copied text around the final total"
+}}
+
+Or:
+
+{{
+  "found": false,
+  "amount": "",
+  "currency": "",
+  "label": "",
+  "evidence": ""
+}}
+
+Strict rules:
+- Use only the invoice text supplied below.
+- Extract exactly ONE final payable total for this invoice.
+- Prefer, in order:
+  1. Grand Total
+  2. Invoice Total
+  3. Amount Due
+  4. Balance Due
+  5. Total Payable
+  6. Final Total
+- Do not use subtotal.
+- Do not use VAT or tax by itself.
+- Do not use line-item prices.
+- Do not use discounts, deposits, shipping, previous balance, or quantity.
+- Do not add any numbers.
+- Do not calculate.
+- Do not estimate.
+- Copy evidence from the invoice.
+- The amount must contain digits only with an optional decimal point.
+- Currency should be a code such as USD, EUR, GBP, AED, SAR, QAR, CAD or AUD.
+- If the final payable total is unclear, conflicting, or missing, return found=false.
+- Return JSON only.
+
+Invoice text:
+{invoice_text}
+""".strip()
+            )
+
+            parsed = parse_llm_json_response(raw)
+
+        except Exception as e:
+            print(
+                "INVOICE TOTAL EXTRACTION ERROR:",
+                asset_data["file_name"],
+                type(e).__name__,
+                str(e)
+            )
+
+            parsed = None
+
+        if not parsed or not isinstance(parsed, dict):
             rejected_invoices.append({
-                "asset_id": asset_id,
-                "file_name": asset["file_name"],
-                "reason": rejection_reason,
+                "file_name": asset_data["file_name"],
+                "reason": "Invalid extraction response"
+            })
+            continue
+
+        if not bool(parsed.get("found")):
+            rejected_invoices.append({
+                "file_name": asset_data["file_name"],
+                "reason": "No unambiguous final total"
+            })
+            continue
+
+        raw_amount = str(
+            parsed.get("amount")
+            or ""
+        ).strip()
+
+        currency = str(
+            parsed.get("currency")
+            or ""
+        ).strip().upper()
+
+        label = str(
+            parsed.get("label")
+            or "Invoice total"
+        ).strip()
+
+        evidence = str(
+            parsed.get("evidence")
+            or ""
+        ).strip()
+
+        # -----------------------------------------------------
+        # PARSE THE AMOUNT USING DECIMAL
+        # -----------------------------------------------------
+        cleaned_amount = raw_amount.replace(",", "").replace(" ", "")
+
+        cleaned_amount = re.sub(
+            r"[^0-9.\-]",
+            "",
+            cleaned_amount
+        )
+
+        if not cleaned_amount:
+            rejected_invoices.append({
+                "file_name": asset_data["file_name"],
+                "reason": "Missing numeric amount"
+            })
+            continue
+
+        if cleaned_amount.count(".") > 1:
+            rejected_invoices.append({
+                "file_name": asset_data["file_name"],
+                "reason": "Invalid amount formatting"
+            })
+            continue
+
+        try:
+            amount = Decimal(cleaned_amount).quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP
+            )
+        except InvalidOperation:
+            rejected_invoices.append({
+                "file_name": asset_data["file_name"],
+                "reason": "Invalid decimal amount"
+            })
+            continue
+
+        if amount < Decimal("0.00"):
+            rejected_invoices.append({
+                "file_name": asset_data["file_name"],
+                "reason": "Negative total"
+            })
+            continue
+
+        if not currency:
+            rejected_invoices.append({
+                "file_name": asset_data["file_name"],
+                "reason": "Currency missing"
+            })
+            continue
+
+        # -----------------------------------------------------
+        # VERIFY THE EVIDENCE EXISTS IN THIS EXACT INVOICE
+        # -----------------------------------------------------
+        normalised_invoice = " ".join(
+            invoice_text.lower().split()
+        )
+
+        normalised_evidence = " ".join(
+            evidence.lower().split()
+        )
+
+        evidence_verified = False
+
+        if (
+            normalised_evidence
+            and normalised_evidence in normalised_invoice
+        ):
+            evidence_verified = True
+
+        # OCR may alter spaces and punctuation. Also verify that the amount's
+        # digits occur inside this same invoice.
+        invoice_digits = re.sub(
+            r"[^0-9]",
+            "",
+            invoice_text
+        )
+
+        amount_digits = re.sub(
+            r"[^0-9]",
+            "",
+            raw_amount
+        )
+
+        amount_verified = bool(
+            amount_digits
+            and amount_digits in invoice_digits
+        )
+
+        # Reject unless both the amount and supporting invoice text verify.
+        if not amount_verified:
+            rejected_invoices.append({
+                "file_name": asset_data["file_name"],
+                "reason": "Amount not found in invoice text"
+            })
+            continue
+
+        if not evidence_verified:
+            # Secondary OCR-safe evidence verification.
+            evidence_words = [
+                word
+                for word in normalised_evidence.split()
+                if len(word) >= 3
+            ]
+
+            matched_words = [
+                word
+                for word in evidence_words
+                if word in normalised_invoice
+            ]
+
+            if (
+                evidence_words
+                and len(matched_words) / len(evidence_words) >= 0.70
+            ):
+                evidence_verified = True
+
+        if not evidence_verified:
+            rejected_invoices.append({
+                "file_name": asset_data["file_name"],
+                "reason": "Evidence could not be verified"
             })
             continue
 
         verified_invoices.append({
             "asset_id": asset_id,
-            "file_name": asset["file_name"],
-            "amount": selected_total["amount"],
-            "currency": selected_total["currency"],
-            "evidence": selected_total["evidence"],
-            "source_row": asset["rows"][0],
+            "file_name": asset_data["file_name"],
+            "amount": amount,
+            "currency": currency,
+            "label": label,
+            "evidence": evidence,
+            "source_row": asset_data["rows"][0]
         })
 
+    # ---------------------------------------------------------
+    # NO VERIFIED TOTALS
+    # ---------------------------------------------------------
     if not verified_invoices:
         print(
-            "FINANCIAL TOTAL DEBUG: no verified invoice totals",
+            "FINANCIAL CALCULATION REJECTED:",
             rejected_invoices
         )
 
@@ -8935,36 +9200,67 @@ def answer_financial_total_from_context(
             "sources": []
         }
 
+    # ---------------------------------------------------------
+    # NEVER COMBINE DIFFERENT CURRENCIES
+    # ---------------------------------------------------------
     currencies = {
         item["currency"]
         for item in verified_invoices
     }
 
-    if len(currencies) != 1:
-        currency_breakdown = []
+    currency_symbols = {
+        "USD": "$",
+        "EUR": "€",
+        "GBP": "£",
+        "AED": "AED ",
+        "SAR": "SAR ",
+        "QAR": "QAR ",
+        "CAD": "CAD ",
+        "AUD": "AUD "
+    }
 
-        for currency in sorted(currencies):
+    def format_money(
+        value: Decimal,
+        currency_code: str
+    ) -> str:
+        symbol = currency_symbols.get(
+            currency_code,
+            f"{currency_code} "
+        )
+
+        return f"{symbol}{value:,.2f}"
+
+    if len(currencies) > 1:
+        breakdown_lines = []
+
+        for currency_code in sorted(currencies):
             currency_total = sum(
                 (
                     item["amount"]
                     for item in verified_invoices
-                    if item["currency"] == currency
+                    if item["currency"] == currency_code
                 ),
                 Decimal("0.00")
             )
 
-            currency_breakdown.append(
-                f"- {currency}: "
-                f"{format_currency_amount(currency_total, currency)}"
+            currency_total = currency_total.quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP
+            )
+
+            breakdown_lines.append(
+                f"- {currency_code}: "
+                f"{format_money(currency_total, currency_code)}"
             )
 
         answer = "\n".join([
             (
-                "The invoices use different currencies, so they cannot be "
-                "combined into one accurate total without an exchange rate."
+                "The verified invoices contain different currencies, so they "
+                "cannot be combined into one accurate total without an "
+                "exchange rate."
             ),
             "",
-            *currency_breakdown
+            *breakdown_lines
         ])
 
         return {
@@ -8975,6 +9271,9 @@ def answer_financial_total_from_context(
             ])
         }
 
+    # ---------------------------------------------------------
+    # CALCULATE WITH PYTHON DECIMAL
+    # ---------------------------------------------------------
     currency = next(iter(currencies))
 
     total = sum(
@@ -8995,27 +9294,21 @@ def answer_financial_total_from_context(
     for item in verified_invoices:
         invoice_lines.append(
             f"- {item['file_name']}: "
-            f"{format_currency_amount(item['amount'], currency)}"
+            f"{format_money(item['amount'], currency)}"
         )
-
-    arithmetic = " + ".join(
-        format(
-            item["amount"],
-            ",.2f"
-        )
-        for item in verified_invoices
-    )
 
     answer_parts = [
-        (
-            f"The verified total is "
-            f"{format_currency_amount(total, currency)}."
-        ),
+        f"The verified total is {format_money(total, currency)}.",
         "",
-        *invoice_lines,
+        *invoice_lines
     ]
 
     if len(verified_invoices) > 1:
+        arithmetic = " + ".join(
+            f"{item['amount']:,.2f}"
+            for item in verified_invoices
+        )
+
         answer_parts.extend([
             "",
             f"Calculation: {arithmetic} = {total:,.2f}"
@@ -9026,18 +9319,16 @@ def answer_financial_total_from_context(
             "",
             (
                 f"{len(rejected_invoices)} document(s) were excluded because "
-                "a single unambiguous labelled total could not be verified."
+                "their final payable total could not be verified safely."
             )
         ])
 
-    sources = build_sources_from_asset_results([
-        item["source_row"]
-        for item in verified_invoices
-    ])
-
     return {
         "answer": "\n".join(answer_parts),
-        "sources": sources
+        "sources": build_sources_from_asset_results([
+            item["source_row"]
+            for item in verified_invoices
+        ])
     }
 
 def chat(
