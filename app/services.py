@@ -13560,13 +13560,13 @@ Rules:
                     file_name=file_name,
                     document_text=(
                         document_text
-                    )
                 )
             )
+        
 
-                include_document = (
-                    document_score >= 2
-                )
+            include_document = (
+                document_score >= 2
+            )
 
             print(
                 "FINANCIAL ASSET FILTER:",
