@@ -9481,290 +9481,593 @@ def parse_general_decimal(
     except InvalidOperation:
         return None
 
-def answer_financial_total_from_context(
+def extract_spending_subjects(query: str) -> list[str]:
+    """
+    Extracts one or more independent subjects from a financial question.
+
+    Examples:
+    - "How much did we spend on beef?" -> ["beef"]
+    - "How much did we spend on beef and chicken?" -> ["beef", "chicken"]
+    - "What was spent on fuel, repairs and provisions?" ->
+      ["fuel", "repairs", "provisions"]
+
+    The subjects are identified generically. No product names are hard-coded.
+    """
+
+    clean_query = str(query or "").strip()
+
+    if not clean_query:
+        return []
+
+    try:
+        raw = ask_llm(
+            query=clean_query,
+            context="""
+Extract every independent subject for which the user wants a monetary
+amount calculated from documents.
+
+Return ONLY valid JSON in this exact format:
+
+{
+  "subjects": ["first subject", "second subject"]
+}
+
+Examples of independent subjects may include:
+- products
+- services
+- suppliers
+- projects
+- people
+- departments
+- expense categories
+- purposes
+
+Rules:
+- Extract each requested subject separately.
+- A request for "X and Y" must return ["X", "Y"], not ["X and Y"].
+- A request for "X, Y and Z" must return three subjects.
+- Remove generic financial words such as:
+  total, amount, money, cost, costs, spending, spent, paid,
+  charged, invoice, invoices, purchase, purchased, billed,
+  in total, combined and altogether.
+- Preserve the user's actual subject wording.
+- Do not answer the question.
+- Do not calculate.
+- Do not invent subjects.
+- If no specific subject exists, return {"subjects": []}.
+- Return JSON only.
+""".strip()
+        )
+
+        parsed = parse_llm_json_response(raw)
+
+        if not parsed or not isinstance(parsed, dict):
+            return []
+
+        raw_subjects = parsed.get("subjects") or []
+
+        if not isinstance(raw_subjects, list):
+            return []
+
+        subjects = []
+        seen = set()
+
+        for subject in raw_subjects:
+            clean_subject = str(
+                subject or ""
+            ).strip(" .?!,;:")
+
+            key = normalise_search_text(
+                clean_subject
+            )
+
+            if not clean_subject or not key:
+                continue
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+            subjects.append(clean_subject)
+
+        return subjects
+
+    except Exception as e:
+        print(
+            "SPENDING SUBJECTS CLASSIFICATION ERROR:",
+            type(e).__name__,
+            str(e)
+        )
+
+        return []
+
+def answer_subject_spending_from_context(
     query: str,
     context: str,
     matched_rows: list[dict]
 ):
     """
-    Handles financial calculations from retrieved documents.
+    Calculates spending for one or multiple requested subjects.
 
-    Calculation modes:
-    1. Specific subject/category spending:
-       - The LLM identifies the requested subject and extracts row structure.
-       - Python validates quantity, unit price and line total.
-       - Python Decimal performs all arithmetic.
+    Examples:
+    - beef
+    - beef and chicken
+    - fuel, repairs and provisions
 
-    2. Whole-document/invoice totals:
-       - Python identifies one verified final total per document.
-       - Subtotals, VAT, tax and discounts are excluded.
-       - Different currencies are never combined.
-
-    No question wording is hard-coded in this function.
+    Behaviour:
+    - Treats every requested subject independently.
+    - Searches all supplied invoices for every subject.
+    - Calculates quantity multiplied by unit price using Decimal.
+    - Uses explicit line totals when valid.
+    - Combines matching rows across invoices.
+    - Shows individual totals and a combined total.
+    - Never combines conflicting currencies.
+    - Includes only sources that contributed to the calculation.
     """
 
-    # ---------------------------------------------------------
-    # FINANCIAL INTENT CHECK
-    # ---------------------------------------------------------
-    if not is_financial_total_query(query):
+    subjects = extract_spending_subjects(
+        query
+    )
+
+    # Backwards-compatible fallback for a single subject.
+    if not subjects:
+        old_subject = extract_spending_subject(
+            query
+        )
+
+        if old_subject:
+            subjects = [old_subject]
+
+    if not subjects:
         return None
 
-    if not matched_rows or not str(context or "").strip():
+    if not str(context or "").strip() or not matched_rows:
         return {
             "answer": FALLBACK_NO_DATA_ANSWER,
             "sources": []
         }
 
-    # ---------------------------------------------------------
-    # SPECIFIC SUBJECT/CATEGORY CALCULATION
-    # ---------------------------------------------------------
-    # Examples of subjects may be an item, service, supplier,
-    # category, project, person or purpose. The subject itself
-    # is identified generically by the classifier.
-    subject = extract_spending_subject(query)
+    subject_results = []
+    all_contributing_rows = []
+    contributing_row_keys = set()
 
-    if subject:
-        subject_result = answer_subject_spending_from_context(
-            query=query,
-            context=context,
-            matched_rows=matched_rows
+    # =========================================================
+    # PROCESS EACH SUBJECT SEPARATELY
+    # =========================================================
+    for subject in subjects:
+        extracted_items = extract_subject_line_items_with_llm(
+            query=(
+                f"Calculate the amount associated only with "
+                f"the subject: {subject}"
+            ),
+            subject=subject,
+            context=context
         )
 
-        if subject_result is not None:
-            return subject_result
+        print(
+            "MULTI-SUBJECT FINANCIAL DEBUG:",
+            {
+                "subject": subject,
+                "extracted_items": [
+                    {
+                        "description": item.get("description"),
+                        "unit_price": str(
+                            item.get("unit_price")
+                        ),
+                        "quantity": str(
+                            item.get("quantity")
+                        ),
+                        "explicit_line_total": str(
+                            item.get("explicit_line_total")
+                        ),
+                        "amount": str(
+                            item.get("amount")
+                        ),
+                        "currency": item.get("currency"),
+                        "source_number": item.get(
+                            "source_number"
+                        )
+                    }
+                    for item in extracted_items
+                ]
+            }
+        )
 
-    # ---------------------------------------------------------
-    # WHOLE-INVOICE TOTAL CALCULATION
-    # ---------------------------------------------------------
-    assets = build_invoice_text_by_asset(
-        matched_rows
-    )
+        # -----------------------------------------------------
+        # DEDUPLICATE REPRESENTATIONS OF THE SAME ROW
+        # -----------------------------------------------------
+        unique_items = []
+        seen_items = set()
 
-    if not assets:
-        return {
-            "answer": FALLBACK_NO_DATA_ANSWER,
-            "sources": []
+        for item in extracted_items:
+            source_number = item.get(
+                "source_number"
+            )
+
+            description_key = normalise_search_text(
+                item.get("description") or ""
+            )
+
+            evidence_key = normalise_search_text(
+                item.get("evidence") or ""
+            )
+
+            key = (
+                source_number,
+                description_key,
+                item.get("unit_price"),
+                item.get("quantity"),
+                item.get("amount"),
+                evidence_key
+            )
+
+            if key in seen_items:
+                continue
+
+            seen_items.add(key)
+            unique_items.append(item)
+
+        extracted_items = unique_items
+
+        if not extracted_items:
+            subject_results.append({
+                "subject": subject,
+                "items": [],
+                "total": None,
+                "currencies": set(),
+                "has_unknown_currency": False
+            })
+
+            continue
+
+        # -----------------------------------------------------
+        # DETERMINE CURRENCY FROM EACH SOURCE DOCUMENT
+        # -----------------------------------------------------
+        source_currency_lookup = {}
+
+        for source_index, row in enumerate(
+            matched_rows,
+            start=1
+        ):
+            source_text = str(
+                row.get("search_text")
+                or row.get("content")
+                or ""
+            )
+
+            detected_currency = (
+                determine_currency_from_document(
+                    source_text
+                )
+            )
+
+            if detected_currency:
+                source_currency_lookup[
+                    source_index
+                ] = detected_currency
+
+        for item in extracted_items:
+            if item.get("currency"):
+                continue
+
+            source_number = item.get(
+                "source_number"
+            )
+
+            if source_number in source_currency_lookup:
+                item["currency"] = (
+                    source_currency_lookup[
+                        source_number
+                    ]
+                )
+
+        known_currencies = {
+            item.get("currency")
+            for item in extracted_items
+            if item.get("currency")
         }
 
-    verified_documents = []
-    rejected_documents = []
-
-    for asset_id, asset_data in assets.items():
-        # Text selected for deterministic final-total extraction.
-        document_text = "\n\n".join(
-            asset_data.get("contents")
-            or []
-        ).strip()
-
-        # Wider text used for document context and subject relevance.
-        # This may include extracted text, OCR and summary text.
-        searchable_document_text = "\n\n".join(
-            asset_data.get("search_contents")
-            or asset_data.get("contents")
-            or []
-        ).strip()
-
-        if not document_text:
-            rejected_documents.append({
-                "asset_id": asset_id,
-                "file_name": (
-                    asset_data.get("file_name")
-                    or "Untitled document"
-                ),
-                "reason": "No readable financial text"
-            })
-            continue
-
-        candidates = extract_invoice_total_candidates(
-            document_text=document_text
-        )
-
-        selected_total, rejection_reason = (
-            choose_one_invoice_total(
-                candidates=candidates
-            )
-        )
-
-        if not selected_total:
-            rejected_documents.append({
-                "asset_id": asset_id,
-                "file_name": (
-                    asset_data.get("file_name")
-                    or "Untitled document"
-                ),
-                "reason": (
-                    rejection_reason
-                    or "No unique final total could be verified"
-                )
-            })
-            continue
-
-        amount = selected_total.get("amount")
-        currency = selected_total.get("currency")
-        evidence = str(
-            selected_total.get("evidence")
-            or ""
-        ).strip()
-
-        if not isinstance(amount, Decimal):
-            rejected_documents.append({
-                "asset_id": asset_id,
-                "file_name": (
-                    asset_data.get("file_name")
-                    or "Untitled document"
-                ),
-                "reason": "The selected total is not a valid decimal"
-            })
-            continue
-
-        if amount < Decimal("0.00"):
-            rejected_documents.append({
-                "asset_id": asset_id,
-                "file_name": (
-                    asset_data.get("file_name")
-                    or "Untitled document"
-                ),
-                "reason": "The selected total is negative"
-            })
-            continue
-
-        if not currency:
-            # Try to verify one currency from the full searchable
-            # document representation before rejecting the invoice.
-            currency = determine_currency_from_document(
-                searchable_document_text
-                or document_text
+        # If every known row uses one currency, apply it to rows
+        # where the currency symbol was omitted.
+        if len(known_currencies) == 1:
+            only_currency = next(
+                iter(known_currencies)
             )
 
-        if not currency:
-            rejected_documents.append({
-                "asset_id": asset_id,
-                "file_name": (
-                    asset_data.get("file_name")
-                    or "Untitled document"
-                ),
-                "reason": "The currency could not be verified"
-            })
-            continue
+            for item in extracted_items:
+                if not item.get("currency"):
+                    item["currency"] = only_currency
 
-        # -----------------------------------------------------
-        # VERIFY THE SELECTED VALUE APPEARS IN THE EVIDENCE
-        # -----------------------------------------------------
-        evidence_values = extract_money_values_from_line(
-            evidence
+        final_currencies = {
+            item.get("currency")
+            for item in extracted_items
+            if item.get("currency")
+        }
+
+        has_unknown_currency = any(
+            not item.get("currency")
+            for item in extracted_items
         )
 
-        amount_verified = any(
-            item.get("amount") == amount
-            and (
-                not item.get("currency")
-                or item.get("currency") == currency
-            )
-            for item in evidence_values
-        )
-
-        if not amount_verified:
-            rejected_documents.append({
-                "asset_id": asset_id,
-                "file_name": (
-                    asset_data.get("file_name")
-                    or "Untitled document"
-                ),
-                "reason": (
-                    "The selected total could not be verified "
-                    "against its source evidence"
-                )
-            })
-            continue
-
-        source_rows = asset_data.get("rows") or []
-
-        if not source_rows:
-            rejected_documents.append({
-                "asset_id": asset_id,
-                "file_name": (
-                    asset_data.get("file_name")
-                    or "Untitled document"
-                ),
-                "reason": "No source row was available"
-            })
-            continue
-
-        verified_documents.append({
-            "asset_id": asset_id,
-            "file_name": (
-                asset_data.get("file_name")
-                or "Invoice"
+        subject_total = sum(
+            (
+                item["amount"]
+                for item in extracted_items
             ),
-            "amount": amount.quantize(
-                Decimal("0.01"),
-                rounding=ROUND_HALF_UP
-            ),
-            "currency": currency,
-            "evidence": evidence,
-            "source_row": source_rows[0]
+            Decimal("0.00")
+        ).quantize(
+            Decimal("0.01"),
+            rounding=ROUND_HALF_UP
+        )
+
+        subject_results.append({
+            "subject": subject,
+            "items": extracted_items,
+            "total": subject_total,
+            "currencies": final_currencies,
+            "has_unknown_currency": (
+                has_unknown_currency
+            )
         })
 
-    print(
-        "FINANCIAL TOTAL DEBUG:",
-        {
-            "verified_documents": [
-                {
-                    "asset_id": item.get("asset_id"),
-                    "file_name": item.get("file_name"),
-                    "amount": str(item.get("amount")),
-                    "currency": item.get("currency")
-                }
-                for item in verified_documents
-            ],
-            "rejected_documents": rejected_documents
-        }
-    )
+        # -----------------------------------------------------
+        # RECORD ONLY SOURCES THAT CONTRIBUTED
+        # -----------------------------------------------------
+        for item in extracted_items:
+            source_number = item.get(
+                "source_number"
+            )
 
-    if not verified_documents:
+            if not isinstance(source_number, int):
+                continue
+
+            source_index = source_number - 1
+
+            if not 0 <= source_index < len(matched_rows):
+                continue
+
+            row = matched_rows[source_index]
+
+            row_key = (
+                row.get("asset_id"),
+                row.get("chunk_index"),
+                row.get("content_type")
+            )
+
+            if row_key in contributing_row_keys:
+                continue
+
+            contributing_row_keys.add(row_key)
+            all_contributing_rows.append(row)
+
+    successful_results = [
+        result
+        for result in subject_results
+        if result.get("items")
+        and result.get("total") is not None
+    ]
+
+    missing_subjects = [
+        result["subject"]
+        for result in subject_results
+        if not result.get("items")
+    ]
+
+    if not successful_results:
         return {
-            "answer": FALLBACK_NO_DATA_ANSWER,
+            "answer": (
+                "I could not find verifiable financial rows "
+                "for the requested subjects."
+            ),
             "sources": []
         }
 
-    source_rows = [
-        item["source_row"]
-        for item in verified_documents
-    ]
+    # =========================================================
+    # CHECK CURRENCY COMPATIBILITY ACROSS ALL SUBJECTS
+    # =========================================================
+    all_known_currencies = set()
 
-    sources = build_sources_from_asset_results(
-        source_rows
+    for result in successful_results:
+        all_known_currencies.update(
+            result.get("currencies") or set()
+        )
+
+    # Different known currencies cannot be combined.
+    conflicting_currencies = (
+        len(all_known_currencies) > 1
     )
 
-    currencies = {
-        item["currency"]
-        for item in verified_documents
-        if item.get("currency")
-    }
+    answer_lines = []
 
-    # ---------------------------------------------------------
-    # NEVER COMBINE DIFFERENT CURRENCIES
-    # ---------------------------------------------------------
-    if len(currencies) > 1:
-        answer_lines = [
-            (
-                "The verified documents use different currencies, "
-                "so they cannot be combined into one accurate total."
-            ),
-            ""
-        ]
+    if len(successful_results) == 1:
+        result = successful_results[0]
+        subject = result["subject"]
+        subject_total = result["total"]
 
-        for currency in sorted(currencies):
-            currency_documents = [
-                item
-                for item in verified_documents
-                if item["currency"] == currency
-            ]
+        result_currencies = (
+            result.get("currencies")
+            or set()
+        )
 
-            currency_total = sum(
+        if len(result_currencies) == 1:
+            currency = next(
+                iter(result_currencies)
+            )
+
+            formatted_total = (
+                format_currency_amount(
+                    subject_total,
+                    currency
+                )
+            )
+        else:
+            formatted_total = (
+                format_number_for_answer(
+                    subject_total
+                )
+            )
+
+        answer_lines.append(
+            f"The verified total associated with "
+            f"{subject} is {formatted_total}."
+        )
+
+    else:
+        answer_lines.append(
+            "The verified totals are:"
+        )
+
+    # =========================================================
+    # SHOW EACH SUBJECT AND EVERY MATCHING ROW
+    # =========================================================
+    for result in successful_results:
+        subject = result["subject"]
+        subject_total = result["total"]
+        items = result["items"]
+
+        result_currencies = (
+            result.get("currencies")
+            or set()
+        )
+
+        subject_currency = None
+
+        if len(result_currencies) == 1:
+            subject_currency = next(
+                iter(result_currencies)
+            )
+
+        if len(successful_results) > 1:
+            if subject_currency:
+                formatted_subject_total = (
+                    format_currency_amount(
+                        subject_total,
+                        subject_currency
+                    )
+                )
+            else:
+                formatted_subject_total = (
+                    format_number_for_answer(
+                        subject_total
+                    )
+                )
+
+            answer_lines.extend([
+                "",
+                f"{subject}: {formatted_subject_total}"
+            ])
+
+        for item in items:
+            description = (
+                item.get("description")
+                or subject
+            )
+
+            unit_price = item.get(
+                "unit_price"
+            )
+
+            quantity = item.get(
+                "quantity"
+            )
+
+            amount = item["amount"]
+            item_currency = (
+                item.get("currency")
+                or subject_currency
+            )
+
+            source_number = item.get(
+                "source_number"
+            )
+
+            source_name = ""
+
+            if (
+                isinstance(source_number, int)
+                and 1 <= source_number <= len(matched_rows)
+            ):
+                source_row = matched_rows[
+                    source_number - 1
+                ]
+
+                source_name = (
+                    source_row.get("original_file_name")
+                    or source_row.get("file_name")
+                    or ""
+                )
+
+            if item_currency:
+                formatted_amount = (
+                    format_currency_amount(
+                        amount,
+                        item_currency
+                    )
+                )
+
+                formatted_unit_price = (
+                    format_currency_amount(
+                        unit_price,
+                        item_currency
+                    )
+                    if unit_price is not None
+                    else ""
+                )
+            else:
+                formatted_amount = (
+                    format_number_for_answer(
+                        amount
+                    )
+                )
+
+                formatted_unit_price = (
+                    format_number_for_answer(
+                        unit_price
+                    )
+                    if unit_price is not None
+                    else ""
+                )
+
+            source_prefix = (
+                f"{source_name} — "
+                if source_name
+                else ""
+            )
+
+            if (
+                unit_price is not None
+                and quantity is not None
+            ):
+                answer_lines.append(
+                    f"- {source_prefix}{description}: "
+                    f"{formatted_unit_price} × "
+                    f"{format_number_for_answer(quantity)} "
+                    f"= {formatted_amount}"
+                )
+            else:
+                answer_lines.append(
+                    f"- {source_prefix}{description}: "
+                    f"{formatted_amount}"
+                )
+
+    # =========================================================
+    # COMBINED TOTAL FOR MULTIPLE SUBJECTS
+    # =========================================================
+    if len(successful_results) > 1:
+        if conflicting_currencies:
+            answer_lines.extend([
+                "",
                 (
-                    item["amount"]
-                    for item in currency_documents
+                    "A single combined total was not calculated "
+                    "because the matching rows use different currencies."
+                )
+            ])
+
+        else:
+            combined_total = sum(
+                (
+                    result["total"]
+                    for result in successful_results
                 ),
                 Decimal("0.00")
             ).quantize(
@@ -9772,86 +10075,67 @@ def answer_financial_total_from_context(
                 rounding=ROUND_HALF_UP
             )
 
-            answer_lines.append(
-                f"{currency}: "
-                f"{format_currency_amount(currency_total, currency)}"
-            )
+            combined_currency = None
 
-            for item in currency_documents:
-                answer_lines.append(
-                    f"- {item['file_name']}: "
-                    f"{format_currency_amount(item['amount'], currency)}"
+            if len(all_known_currencies) == 1:
+                combined_currency = next(
+                    iter(all_known_currencies)
                 )
 
-        if rejected_documents:
+            if combined_currency:
+                formatted_combined_total = (
+                    format_currency_amount(
+                        combined_total,
+                        combined_currency
+                    )
+                )
+            else:
+                formatted_combined_total = (
+                    format_number_for_answer(
+                        combined_total
+                    )
+                )
+
+            calculation_parts = []
+
+            for result in successful_results:
+                calculation_parts.append(
+                    format_number_for_answer(
+                        result["total"]
+                    )
+                )
+
             answer_lines.extend([
                 "",
                 (
-                    f"{len(rejected_documents)} document(s) were excluded "
-                    "because a unique final total or currency could not "
-                    "be verified."
+                    "Combined total: "
+                    f"{formatted_combined_total}."
+                ),
+                (
+                    "Calculation: "
+                    + " + ".join(calculation_parts)
+                    + " = "
+                    + format_number_for_answer(
+                        combined_total
+                    )
                 )
             ])
 
-        return {
-            "answer": "\n".join(answer_lines),
-            "sources": sources
-        }
-
-    # ---------------------------------------------------------
-    # ONE VERIFIED CURRENCY
-    # ---------------------------------------------------------
-    currency = next(iter(currencies))
-
-    total = sum(
-        (
-            item["amount"]
-            for item in verified_documents
-        ),
-        Decimal("0.00")
-    ).quantize(
-        Decimal("0.01"),
-        rounding=ROUND_HALF_UP
-    )
-
-    answer_lines = [
-        (
-            "The verified total is "
-            f"{format_currency_amount(total, currency)}."
-        ),
-        ""
-    ]
-
-    for item in verified_documents:
-        answer_lines.append(
-            f"- {item['file_name']}: "
-            f"{format_currency_amount(item['amount'], currency)}"
-        )
-
-    if len(verified_documents) > 1:
-        calculation = " + ".join(
-            f"{item['amount']:.2f}"
-            for item in verified_documents
-        )
-
-        answer_lines.extend([
-            "",
-            f"Calculation: {calculation} = {total:.2f}"
-        ])
-
-    if rejected_documents:
+    if missing_subjects:
         answer_lines.extend([
             "",
             (
-                f"{len(rejected_documents)} document(s) were excluded "
-                "because a unique final total or currency could not "
-                "be verified."
+                "No verifiable financial row was found for: "
+                + ", ".join(missing_subjects)
+                + "."
             )
         ])
 
     return {
         "answer": "\n".join(answer_lines),
-        "sources": sources
+        "sources": build_sources_from_asset_results(
+            all_contributing_rows
+        )
     }
 
 def resolve_subject_item_source(
@@ -10792,16 +11076,17 @@ def chat(
     """
     Secure BridgeOS document chat.
 
-    Behaviour:
-    - Uses only documents accessible to the current crew member.
-    - Uses an uploaded chat file only when its asset ID is supplied.
-    - Searches Yacht Documentation for normal document questions.
-    - Loads complete financial document text for monetary calculations.
-    - Supports arbitrary products, services, suppliers and categories.
-    - Keeps separate invoices separate.
-    - Uses Decimal-based calculation helpers.
-    - Never combines different currencies.
-    - Never returns unrelated source cards for financial answers.
+    Financial behaviour:
+    - Supports one subject: "How much did we spend on beef?"
+    - Supports multiple subjects: "How much did we spend on beef and chicken?"
+    - Searches every accessible processed financial document.
+    - Does not require every subject to appear in the same invoice.
+    - Does not require an invoice grand total for line-item calculations.
+    - Uses one source row per document so source numbers stay correct.
+    - Includes only documents that contain a requested subject.
+    - Combines matching rows across multiple invoices.
+    - Does not include unrelated documents as sources.
+    - Uses Decimal-based financial helper functions for calculations.
     """
 
     clean_query = str(query or "").strip()
@@ -10814,287 +11099,8 @@ def chat(
     )
 
     # =========================================================
-    # LOCAL HELPERS
-    # =========================================================
-
-    def save_assistant_response(
-        final_answer: str,
-        final_sources: list[dict]
-    ):
-        try:
-            supabase.table("messages").insert({
-                "chat_id": chat_id,
-                "yacht_id": yacht_id,
-                "crew_id": crew_id,
-                "role": "assistant",
-                "content": final_answer,
-                "sources": final_sources
-            }).execute()
-
-        except Exception as e:
-            print(
-                "ASSISTANT MESSAGE SAVE ERROR:",
-                type(e).__name__,
-                str(e)
-            )
-
-        try:
-            supabase.table("chats").update({
-                "updated_at": "now()"
-            }) \
-                .eq("id", chat_id) \
-                .eq("crew_id", crew_id) \
-                .eq("yacht_id", yacht_id) \
-                .execute()
-
-        except Exception as e:
-            print(
-                "CHAT UPDATE ERROR:",
-                type(e).__name__,
-                str(e)
-            )
-
-    def document_financial_score(
-        text: str,
-        file_name: str
-    ) -> int:
-        """
-        Generic financial-document detector.
-
-        No product, supplier or vendor names are hard-coded.
-        """
-
-        searchable = normalise_search_text(
-            f"{file_name}\n{text}"
-        )
-
-        score = 0
-
-        strong_markers = [
-            "invoice",
-            "receipt",
-            "purchase order",
-            "quotation",
-            "quote",
-            "statement",
-            "bill",
-        ]
-
-        table_markers = [
-            "unit price",
-            "price",
-            "qty",
-            "quantity",
-            "line total",
-            "subtotal",
-            "grand total",
-            "amount due",
-            "total",
-            "vat",
-            "tax",
-        ]
-
-        for marker in strong_markers:
-            if normalise_search_text(marker) in searchable:
-                score += 4
-
-        for marker in table_markers:
-            if normalise_search_text(marker) in searchable:
-                score += 1
-
-        digit_count = sum(
-            character.isdigit()
-            for character in str(text or "")
-        )
-
-        if digit_count >= 5:
-            score += 1
-
-        if digit_count >= 15:
-            score += 1
-
-        return score
-
-    def financial_text_quality_score(
-        text: str
-    ) -> int:
-        """
-        Selects one best text representation per asset.
-
-        This prevents extracted text and OCR from representing the same
-        invoice twice and causing duplicate calculations.
-        """
-
-        clean_text = str(text or "").strip()
-
-        if not clean_text:
-            return -1
-
-        normalised = normalise_search_text(
-            clean_text
-        )
-
-        score = min(len(clean_text), 20000) // 100
-        score += sum(
-            character.isdigit()
-            for character in clean_text
-        )
-
-        table_markers = [
-            "description",
-            "item",
-            "price",
-            "unit price",
-            "qty",
-            "quantity",
-            "total",
-            "subtotal",
-            "amount",
-            "invoice",
-        ]
-
-        for marker in table_markers:
-            if normalise_search_text(marker) in normalised:
-                score += 40
-
-        return score
-
-    def select_best_financial_text(
-        extracted_text: str,
-        ocr_text: str,
-        summary: str
-    ) -> tuple[str, str]:
-        """
-        Returns exactly one main representation of the financial document.
-
-        The summary is used only when no full extracted/OCR text exists.
-        """
-
-        candidates = []
-
-        if extracted_text:
-            candidates.append({
-                "type": "extracted_text",
-                "text": extracted_text,
-                "score": financial_text_quality_score(
-                    extracted_text
-                )
-            })
-
-        if ocr_text:
-            candidates.append({
-                "type": "ocr_text",
-                "text": ocr_text,
-                "score": financial_text_quality_score(
-                    ocr_text
-                )
-            })
-
-        if not candidates and summary:
-            candidates.append({
-                "type": "summary",
-                "text": summary,
-                "score": financial_text_quality_score(
-                    summary
-                )
-            })
-
-        if not candidates:
-            return "", ""
-
-        candidates.sort(
-            key=lambda candidate: candidate["score"],
-            reverse=True
-        )
-
-        best = candidates[0]
-
-        return (
-            str(best["text"] or "").strip(),
-            str(best["type"] or "")
-        )
-
-    def get_subject_terms(
-        subject: str
-    ) -> list[str]:
-        """
-        Converts any requested subject into generic matching terms.
-
-        No products are hard-coded.
-        """
-
-        stopwords = {
-            "the",
-            "a",
-            "an",
-            "of",
-            "for",
-            "on",
-            "in",
-            "at",
-            "to",
-            "from",
-            "and",
-            "or",
-            "with",
-            "total",
-            "money",
-            "amount",
-            "cost",
-            "costs",
-            "spending",
-            "spent",
-            "paid",
-            "invoice",
-            "invoices",
-            "purchase",
-            "purchased",
-            "billed",
-        }
-
-        terms = []
-
-        for term in normalise_search_text(
-            subject
-        ).split():
-            if len(term) < 2:
-                continue
-
-            if term in stopwords:
-                continue
-
-            if term not in terms:
-                terms.append(term)
-
-        return terms
-
-    def row_contains_subject(
-        row: dict,
-        subject_terms: list[str]
-    ) -> bool:
-        if not subject_terms:
-            return False
-
-        row_text = normalise_search_text(
-            str(
-                row.get("search_text")
-                or row.get("content")
-                or ""
-            )
-        )
-
-        if not row_text:
-            return False
-
-        return all(
-            term in row_text
-            for term in subject_terms
-        )
-
-    # =========================================================
     # SAVE USER MESSAGE
     # =========================================================
-
     try:
         supabase.table("messages").insert({
             "chat_id": chat_id,
@@ -11133,7 +11139,6 @@ def chat(
     # =========================================================
     # UPDATE DEFAULT CHAT TITLE
     # =========================================================
-
     if chat_row.get("title") == "New Chat":
         try:
             supabase.table("chats").update({
@@ -11166,26 +11171,6 @@ def chat(
         clean_query
     )
 
-    requested_financial_subject = ""
-
-    if financial_query:
-        try:
-            requested_financial_subject = (
-                extract_spending_subject(
-                    clean_query
-                )
-                or ""
-            ).strip()
-
-        except Exception as e:
-            print(
-                "FINANCIAL SUBJECT LOOKUP ERROR:",
-                type(e).__name__,
-                str(e)
-            )
-
-            requested_financial_subject = ""
-
     if financial_query:
         answer_depth = "comprehensive"
     else:
@@ -11197,12 +11182,152 @@ def chat(
         "LOCAL CHAT DEBUG:",
         {
             "query": clean_query,
+            "query_scope": query_scope,
             "financial_query": financial_query,
-            "financial_subject": requested_financial_subject,
-            "answer_depth": answer_depth
+            "answer_depth": answer_depth,
+            "uploaded_asset_id": uploaded_asset_id
         }
     )
 
+    # =========================================================
+    # EXTRACT ONE OR MULTIPLE FINANCIAL SUBJECTS
+    # =========================================================
+    requested_financial_subjects = []
+
+    if financial_query:
+        try:
+            requested_financial_subjects = (
+                extract_spending_subjects(
+                    clean_query
+                )
+                or []
+            )
+
+        except Exception as e:
+            print(
+                "MULTI-SUBJECT EXTRACTION ERROR:",
+                type(e).__name__,
+                str(e)
+            )
+
+            requested_financial_subjects = []
+
+        # Backwards-compatible fallback.
+        if not requested_financial_subjects:
+            try:
+                single_subject = str(
+                    extract_spending_subject(
+                        clean_query
+                    )
+                    or ""
+                ).strip()
+
+                if single_subject:
+                    requested_financial_subjects = [
+                        single_subject
+                    ]
+
+            except Exception as e:
+                print(
+                    "SINGLE-SUBJECT EXTRACTION ERROR:",
+                    type(e).__name__,
+                    str(e)
+                )
+
+    print(
+        "FINANCIAL SUBJECTS DEBUG:",
+        requested_financial_subjects
+    )
+
+    # =========================================================
+    # LOCAL SUBJECT-TERM NORMALISATION
+    # =========================================================
+    def get_subject_terms(subject: str) -> list[str]:
+        """
+        Converts one requested subject into meaningful matching terms.
+
+        No product names are hard-coded.
+        """
+
+        normalised = normalise_search_text(
+            subject
+        )
+
+        ignored_terms = {
+            "the",
+            "a",
+            "an",
+            "some",
+            "any",
+            "all",
+            "total",
+            "totals",
+            "money",
+            "amount",
+            "amounts",
+            "cost",
+            "costs",
+            "spend",
+            "spent",
+            "spending",
+            "paid",
+            "payment",
+            "payments",
+            "charged",
+            "charge",
+            "charges",
+            "invoice",
+            "invoices",
+            "purchase",
+            "purchases",
+            "purchased",
+            "bill",
+            "billed",
+            "billing",
+            "price",
+            "prices",
+            "in",
+            "on",
+            "for",
+            "of",
+            "and",
+            "or"
+        }
+
+        terms = []
+
+        for term in normalised.split():
+            if len(term) < 2:
+                continue
+
+            if term in ignored_terms:
+                continue
+
+            if term not in terms:
+                terms.append(term)
+
+        return terms
+
+    subject_term_groups = [
+        get_subject_terms(subject)
+        for subject in requested_financial_subjects
+        if str(subject or "").strip()
+    ]
+
+    subject_term_groups = [
+        terms
+        for terms in subject_term_groups
+        if terms
+    ]
+
+    print(
+        "FINANCIAL SUBJECT TERM GROUPS DEBUG:",
+        subject_term_groups
+    )
+
+    # =========================================================
+    # FOLLOW-UP DETECTION
+    # =========================================================
     is_followup_query = is_contextual_followup_query(
         query=clean_query,
         chat_id=chat_id
@@ -11222,9 +11347,48 @@ def chat(
     resolved_uploaded_asset_id = uploaded_asset_id
 
     # =========================================================
+    # SAVE ASSISTANT RESPONSE
+    # =========================================================
+    def save_assistant_response(
+        final_answer: str,
+        final_sources: list[dict]
+    ):
+        try:
+            supabase.table("messages").insert({
+                "chat_id": chat_id,
+                "yacht_id": yacht_id,
+                "crew_id": crew_id,
+                "role": "assistant",
+                "content": final_answer,
+                "sources": final_sources
+            }).execute()
+
+        except Exception as e:
+            print(
+                "ASSISTANT MESSAGE SAVE ERROR:",
+                type(e).__name__,
+                str(e)
+            )
+
+        try:
+            supabase.table("chats").update({
+                "updated_at": "now()"
+            }) \
+                .eq("id", chat_id) \
+                .eq("crew_id", crew_id) \
+                .eq("yacht_id", yacht_id) \
+                .execute()
+
+        except Exception as e:
+            print(
+                "CHAT UPDATE ERROR:",
+                type(e).__name__,
+                str(e)
+            )
+
+    # =========================================================
     # CONVERSATIONAL MODE
     # =========================================================
-
     if (
         query_scope == "conversational"
         and not resolved_uploaded_asset_id
@@ -11235,14 +11399,12 @@ def chat(
                 context="""
 You are BridgeOS, a helpful private document assistant.
 
-The user message is conversational or asks how to use the assistant.
-
 Rules:
 - Reply briefly and naturally.
 - You may explain that you can search uploaded documents.
-- Do not answer factual, financial, legal, medical or operational
-  questions without document evidence.
-- Do not invent document data.
+- Do not answer factual, financial, operational, technical,
+  legal, medical or recommendation questions without documents.
+- Do not invent document information.
 - Use British English.
 - Return plain text only.
 """.strip()
@@ -11281,12 +11443,16 @@ Rules:
     # =========================================================
     # DOCUMENT RETRIEVAL
     # =========================================================
-
     try:
         # -----------------------------------------------------
-        # EXPLICIT CHAT-UPLOADED ASSET
+        # EXPLICIT CHAT-UPLOADED FILE
         # -----------------------------------------------------
         if resolved_uploaded_asset_id:
+            print(
+                "LOCAL CHAT DEBUG: explicit uploaded asset:",
+                resolved_uploaded_asset_id
+            )
+
             matched_rows = get_uploaded_chat_asset_rows(
                 uploaded_asset_id=resolved_uploaded_asset_id,
                 crew_id=crew_id,
@@ -11337,6 +11503,9 @@ Rules:
                         str(e)
                     )
 
+            # A normal follow-up can remain restricted to previous
+            # sources. A financial question must inspect every
+            # accessible financial document.
             if (
                 previous_source_asset_ids
                 and not financial_query
@@ -11351,8 +11520,8 @@ Rules:
                     allowed_asset_ids = restricted_ids
 
             print(
-                "LOCAL CHAT DEBUG allowed_asset_ids:",
-                len(allowed_asset_ids)
+                "LOCAL CHAT DEBUG: allowed_asset_ids:",
+                allowed_asset_ids
             )
 
             if not allowed_asset_ids:
@@ -11360,211 +11529,378 @@ Rules:
                 context = ""
 
             # =================================================
-            # FINANCIAL RETRIEVAL
+            # FINANCIAL DIRECT RETRIEVAL
             # =================================================
             elif financial_query:
-                financial_assets_res = (
-                    supabase.table("assets")
-                    .select("""
-                        id,
-                        yacht_id,
-                        chat_id,
-                        security_level,
-                        file_name,
-                        original_file_name,
-                        file_type,
-                        mime_type,
-                        extracted_text,
-                        ocr_text,
-                        summary,
-                        processing_status,
-                        processing_error
-                    """)
-                    .eq("yacht_id", yacht_id)
-                    .in_("id", allowed_asset_ids)
-                    .eq("processing_status", "processed")
-                    .execute()
-                )
-
-                subject_terms = get_subject_terms(
-                    requested_financial_subject
-                )
-
-                direct_financial_rows = []
-                seen_asset_ids = set()
-
-                for asset in financial_assets_res.data or []:
-                    asset_id = asset.get("id")
-
-                    if not asset_id:
-                        continue
-
-                    if asset_id in seen_asset_ids:
-                        continue
-
-                    file_name = (
-                        asset.get("original_file_name")
-                        or asset.get("file_name")
-                        or "Untitled document"
+                try:
+                    financial_assets_res = (
+                        supabase.table("assets")
+                        .select("""
+                            id,
+                            yacht_id,
+                            chat_id,
+                            security_level,
+                            file_name,
+                            original_file_name,
+                            file_type,
+                            mime_type,
+                            extracted_text,
+                            ocr_text,
+                            summary,
+                            processing_status,
+                            processing_error
+                        """)
+                        .eq("yacht_id", yacht_id)
+                        .in_("id", allowed_asset_ids)
+                        .eq("processing_status", "processed")
+                        .execute()
                     )
 
-                    extracted_text = clean_text_for_postgres(
-                        asset.get("extracted_text")
-                        or ""
-                    )
+                    direct_financial_rows = []
 
-                    ocr_text = clean_text_for_postgres(
-                        asset.get("ocr_text")
-                        or ""
-                    )
+                    for asset in financial_assets_res.data or []:
+                        asset_id = asset.get("id")
 
-                    summary = clean_text_for_postgres(
-                        asset.get("summary")
-                        or ""
-                    )
-
-                    best_text, selected_text_type = (
-                        select_best_financial_text(
-                            extracted_text=extracted_text,
-                            ocr_text=ocr_text,
-                            summary=summary
+                        file_name = (
+                            asset.get("original_file_name")
+                            or asset.get("file_name")
+                            or "Untitled document"
                         )
-                    )
 
-                    if not best_text:
+                        extracted_text = str(
+                            asset.get("extracted_text")
+                            or ""
+                        ).strip()
+
+                        ocr_text = str(
+                            asset.get("ocr_text")
+                            or ""
+                        ).strip()
+
+                        summary = str(
+                            asset.get("summary")
+                            or ""
+                        ).strip()
+
+                        # -------------------------------------
+                        # BUILD ONE DOCUMENT REPRESENTATION
+                        # -------------------------------------
+                        # Keep each asset as exactly one row.
+                        # This preserves source_number -> asset
+                        # mapping for the financial extractor.
+                        document_parts = [
+                            f"File name: {file_name}"
+                        ]
+
+                        if extracted_text:
+                            document_parts.append(
+                                "Extracted document text:\n"
+                                + extracted_text
+                            )
+
+                        # Avoid adding OCR when it is effectively an
+                        # exact copy of extracted text.
+                        if ocr_text:
+                            extracted_normalised = (
+                                normalise_search_text(
+                                    extracted_text
+                                )
+                            )
+
+                            ocr_normalised = (
+                                normalise_search_text(
+                                    ocr_text
+                                )
+                            )
+
+                            if (
+                                not extracted_normalised
+                                or ocr_normalised
+                                not in extracted_normalised
+                            ):
+                                document_parts.append(
+                                    "OCR text:\n"
+                                    + ocr_text
+                                )
+
+                        if summary:
+                            document_parts.append(
+                                "Document summary:\n"
+                                + summary
+                            )
+
+                        searchable_document_text = (
+                            "\n\n".join(
+                                part
+                                for part in document_parts
+                                if str(part or "").strip()
+                            ).strip()
+                        )
+
+                        if not searchable_document_text:
+                            continue
+
+                        normalised_document = (
+                            normalise_search_text(
+                                searchable_document_text
+                            )
+                        )
+
+                        normalised_file_name = (
+                            normalise_search_text(
+                                file_name
+                            )
+                        )
+
+                        # -------------------------------------
+                        # CHECK REQUESTED SUBJECTS
+                        # -------------------------------------
+                        # ANY subject group may match the document.
+                        # We do not require all requested subjects
+                        # to appear in the same invoice.
+                        matched_subjects = []
+
+                        for subject_index, subject_terms in enumerate(
+                            subject_term_groups
+                        ):
+                            if not subject_terms:
+                                continue
+
+                            if all(
+                                term in normalised_document
+                                for term in subject_terms
+                            ):
+                                if (
+                                    subject_index
+                                    < len(requested_financial_subjects)
+                                ):
+                                    matched_subjects.append(
+                                        requested_financial_subjects[
+                                            subject_index
+                                        ]
+                                    )
+
+                        contains_requested_subject = bool(
+                            matched_subjects
+                        )
+
+                        # -------------------------------------
+                        # GENERIC FINANCIAL-DOCUMENT SCORE
+                        # -------------------------------------
+                        financial_score = 0
+
+                        financial_file_terms = [
+                            "invoice",
+                            "receipt",
+                            "statement",
+                            "bill",
+                            "quote",
+                            "purchase order",
+                            "purchase",
+                            "expense",
+                            "payment",
+                            "supplier",
+                            "vendor"
+                        ]
+
+                        financial_text_terms = [
+                            "invoice number",
+                            "invoice no",
+                            "invoice #",
+                            "subtotal",
+                            "grand total",
+                            "amount due",
+                            "balance due",
+                            "unit price",
+                            "quantity",
+                            "qty",
+                            "description price",
+                            "description quantity",
+                            "price qty total",
+                            "price quantity total",
+                            "tax",
+                            "vat"
+                        ]
+
+                        if any(
+                            term in normalised_file_name
+                            for term in financial_file_terms
+                        ):
+                            financial_score += 4
+
+                        for term in financial_text_terms:
+                            normalised_term = (
+                                normalise_search_text(
+                                    term
+                                )
+                            )
+
+                            if normalised_term in normalised_document:
+                                financial_score += 1
+
+                        # Rows with obvious table headings receive
+                        # an additional score.
+                        has_price_heading = (
+                            "price" in normalised_document
+                            or "unit price" in normalised_document
+                        )
+
+                        has_quantity_heading = (
+                            "qty" in normalised_document
+                            or "quantity" in normalised_document
+                        )
+
+                        has_total_heading = (
+                            "total" in normalised_document
+                        )
+
+                        if (
+                            has_price_heading
+                            and has_quantity_heading
+                        ):
+                            financial_score += 3
+
+                        if (
+                            has_price_heading
+                            and has_total_heading
+                        ):
+                            financial_score += 2
+
+                        # -------------------------------------
+                        # DECIDE WHETHER TO INCLUDE DOCUMENT
+                        # -------------------------------------
+                        include_financial_document = False
+
+                        if requested_financial_subjects:
+                            # Specific line-item question:
+                            # include only a financial-looking
+                            # document containing at least one of
+                            # the requested subjects.
+                            include_financial_document = (
+                                contains_requested_subject
+                                and financial_score >= 2
+                            )
+
+                        else:
+                            # Whole-invoice total question:
+                            # include financial-looking documents.
+                            include_financial_document = (
+                                financial_score >= 2
+                            )
+
                         print(
-                            "FINANCIAL DOCUMENT EXCLUDED:",
-                            {
-                                "file_name": file_name,
-                                "reason": "No readable text"
-                            }
-                        )
-                        continue
-
-                    full_document_text = "\n\n".join([
-                        f"File name: {file_name}",
-                        f"Selected document text type: {selected_text_type}",
-                        best_text
-                    ]).strip()
-
-                    normalised_document = (
-                        normalise_search_text(
-                            full_document_text
-                        )
-                    )
-
-                    contains_requested_subject = bool(
-                        subject_terms
-                    ) and all(
-                        term in normalised_document
-                        for term in subject_terms
-                    )
-
-                    financial_score = document_financial_score(
-                        text=best_text,
-                        file_name=file_name
-                    )
-
-                    # Financial calculations must never inspect unrelated
-                    # manuals/SOPs merely because they contain numbers or a
-                    # coincidental word.
-                    if requested_financial_subject:
-                        include_financial_document = (
-                            financial_score >= 3
-                            and contains_requested_subject
-                        )
-                    else:
-                        include_financial_document = (
-                            financial_score >= 3
-                        )
-
-                    if not include_financial_document:
-                        print(
-                            "FINANCIAL DOCUMENT EXCLUDED:",
+                            "FINANCIAL ASSET FILTER DEBUG:",
                             {
                                 "asset_id": asset_id,
                                 "file_name": file_name,
                                 "financial_score": financial_score,
-                                "contains_subject": (
+                                "requested_subjects": (
+                                    requested_financial_subjects
+                                ),
+                                "matched_subjects": matched_subjects,
+                                "contains_requested_subject": (
                                     contains_requested_subject
+                                ),
+                                "included": (
+                                    include_financial_document
                                 )
                             }
                         )
-                        continue
 
-                    seen_asset_ids.add(asset_id)
+                        if not include_financial_document:
+                            continue
 
-                    direct_financial_rows.append({
-                        "asset_id": asset_id,
-                        "yacht_id": asset.get("yacht_id"),
-                        "chat_id": asset.get("chat_id"),
-                        "security_level": asset.get(
-                            "security_level"
-                        ),
-                        "content": full_document_text,
-                        "search_text": full_document_text,
-                        "content_type": (
-                            "financial_full_document"
-                        ),
-                        "chunk_index": 0,
-                        "detected_date": None,
-                        "detected_year": None,
-                        "tags": [],
-                        "file_name": asset.get("file_name"),
-                        "original_file_name": asset.get(
-                            "original_file_name"
-                        ),
-                        "file_type": asset.get("file_type"),
-                        "mime_type": asset.get("mime_type")
-                    })
+                        direct_financial_rows.append({
+                            "asset_id": asset_id,
+                            "yacht_id": asset.get("yacht_id"),
+                            "chat_id": asset.get("chat_id"),
+                            "security_level": asset.get(
+                                "security_level"
+                            ),
+
+                            # Full text is used for both line-item
+                            # extraction and final-total extraction.
+                            "content": searchable_document_text,
+                            "search_text": searchable_document_text,
+
+                            "content_type": "financial_document",
+                            "chunk_index": 0,
+                            "detected_date": None,
+                            "detected_year": None,
+                            "tags": [
+                                "financial",
+                                *[
+                                    normalise_search_text(subject)
+                                    for subject in matched_subjects
+                                ]
+                            ],
+                            "file_name": asset.get("file_name"),
+                            "original_file_name": asset.get(
+                                "original_file_name"
+                            ),
+                            "file_type": asset.get("file_type"),
+                            "mime_type": asset.get("mime_type")
+                        })
+
+                    # Do not use a content-based deduplication
+                    # result that changes source ordering.
+                    # Keep exactly one row per asset.
+                    unique_financial_rows = []
+                    seen_financial_asset_ids = set()
+
+                    for row in direct_financial_rows:
+                        asset_id = row.get("asset_id")
+
+                        if not asset_id:
+                            continue
+
+                        if asset_id in seen_financial_asset_ids:
+                            continue
+
+                        seen_financial_asset_ids.add(
+                            asset_id
+                        )
+
+                        unique_financial_rows.append(
+                            row
+                        )
+
+                    matched_rows = unique_financial_rows
+
+                    context = (
+                        build_context_from_asset_results(
+                            matched_rows
+                        )
+                        if matched_rows
+                        else ""
+                    )
 
                     print(
-                        "FINANCIAL DOCUMENT INCLUDED:",
+                        "FINANCIAL DIRECT RETRIEVAL DEBUG:",
                         {
-                            "source_number": (
-                                len(direct_financial_rows)
+                            "matched_documents": len(
+                                matched_rows
                             ),
-                            "asset_id": asset_id,
-                            "file_name": file_name,
-                            "text_type": selected_text_type,
-                            "financial_score": financial_score,
-                            "contains_subject": (
-                                contains_requested_subject
+                            "documents": [
+                                row.get("original_file_name")
+                                or row.get("file_name")
+                                for row in matched_rows
+                            ],
+                            "context_length": len(
+                                context
                             )
                         }
                     )
 
-                # Do not content-deduplicate financial documents.
-                # Two separate invoices may contain identical rows.
-                matched_rows = direct_financial_rows
+                except Exception as e:
+                    print(
+                        "FINANCIAL DIRECT RETRIEVAL ERROR:",
+                        type(e).__name__,
+                        str(e)
+                    )
 
-                context = build_context_from_asset_results(
-                    matched_rows
-                )
-
-                print(
-                    "FINANCIAL DIRECT RETRIEVAL DEBUG:",
-                    {
-                        "requested_subject": (
-                            requested_financial_subject
-                        ),
-                        "document_count": len(matched_rows),
-                        "documents": [
-                            {
-                                "source_number": index,
-                                "asset_id": row.get("asset_id"),
-                                "file_name": (
-                                    row.get("original_file_name")
-                                    or row.get("file_name")
-                                )
-                            }
-                            for index, row in enumerate(
-                                matched_rows,
-                                start=1
-                            )
-                        ]
-                    }
-                )
+                    matched_rows = []
+                    context = ""
 
             # =================================================
             # NORMAL DOCUMENT RETRIEVAL
@@ -11594,6 +11930,9 @@ Rules:
 
                 matched_rows_by_key = {}
 
+                # ---------------------------------------------
+                # FILE LISTING
+                # ---------------------------------------------
                 if is_file_listing_query(clean_query):
                     listing_rows = (
                         get_asset_metadata_rows_for_listing(
@@ -11611,7 +11950,8 @@ Rules:
                             row.get("content_type")
                         )
 
-                        matched_rows_by_key[key] = row
+                        if key not in matched_rows_by_key:
+                            matched_rows_by_key[key] = row
 
                 for retrieval_query in retrieval_queries:
                     retrieval_query = str(
@@ -11625,8 +11965,13 @@ Rules:
                         retrieval_query
                     )
 
-                    year_filter = filters.get("year")
+                    year_filter = filters.get(
+                        "year"
+                    )
 
+                    # -----------------------------------------
+                    # KEYWORD SEARCH
+                    # -----------------------------------------
                     try:
                         keyword_rows = (
                             keyword_search_asset_chunks(
@@ -11657,6 +12002,9 @@ Rules:
                             str(e)
                         )
 
+                    # -----------------------------------------
+                    # SEMANTIC SEARCH
+                    # -----------------------------------------
                     try:
                         query_embedding = embed(
                             retrieval_query
@@ -11696,9 +12044,16 @@ Rules:
                     matched_rows_by_key.values()
                 )[:100]
 
+                print(
+                    "LOCAL CHAT DEBUG: matched chunks:",
+                    len(matched_rows)
+                )
+
                 if (
                     matched_rows
-                    and not is_file_listing_query(clean_query)
+                    and not is_file_listing_query(
+                        clean_query
+                    )
                 ):
                     matched_rows = (
                         expand_retrieved_rows_to_full_relevant_documents(
@@ -11714,9 +12069,13 @@ Rules:
                         matched_rows
                     )
 
-                context = build_context_from_asset_results(
-                    matched_rows
-                ) if matched_rows else ""
+                context = (
+                    build_context_from_asset_results(
+                        matched_rows
+                    )
+                    if matched_rows
+                    else ""
+                )
 
     except Exception as e:
         print(
@@ -11729,34 +12088,36 @@ Rules:
         context = ""
 
     print(
-        "LOCAL CHAT FINAL DEBUG:",
+        "LOCAL CHAT FINAL RETRIEVAL DEBUG:",
         {
-            "matched_rows": len(matched_rows or []),
-            "context_length": len(context or ""),
-            "uploaded_asset_id": resolved_uploaded_asset_id
+            "matched_rows": len(
+                matched_rows or []
+            ),
+            "context_length": len(
+                context or ""
+            ),
+            "uploaded_asset_id": (
+                resolved_uploaded_asset_id
+            )
         }
     )
 
     # =========================================================
-    # EXPLICIT UPLOADED CHAT ASSET
+    # EXPLICITLY UPLOADED CHAT FILE ANSWER
     # =========================================================
-
     if resolved_uploaded_asset_id:
         if not context:
             answer = FALLBACK_NO_DATA_ANSWER
             sources = []
 
         else:
-            financial_result = None
-
-            if financial_query:
-                financial_result = (
-                    answer_financial_total_from_context(
-                        query=clean_query,
-                        context=context,
-                        matched_rows=matched_rows
-                    )
+            financial_result = (
+                answer_financial_total_from_context(
+                    query=clean_query,
+                    context=context,
+                    matched_rows=matched_rows
                 )
+            )
 
             numeric_result = None
 
@@ -11792,10 +12153,12 @@ Rules:
                 )
 
             else:
-                uploaded_result = answer_from_uploaded_chat_asset(
-                    query=clean_query,
-                    context=context,
-                    matched_rows=matched_rows
+                uploaded_result = (
+                    answer_from_uploaded_chat_asset(
+                        query=clean_query,
+                        context=context,
+                        matched_rows=matched_rows
+                    )
                 )
 
                 answer = str(
@@ -11814,7 +12177,7 @@ Rules:
         if not isinstance(sources, list):
             sources = []
 
-        if answer == FALLBACK_NO_DATA_ANSWER:
+        if answer.strip() == FALLBACK_NO_DATA_ANSWER:
             sources = []
 
         save_assistant_response(
@@ -11832,23 +12195,35 @@ Rules:
     # =========================================================
     # YACHT DOCUMENTATION ANSWER
     # =========================================================
-
     if not context:
-        answer = FALLBACK_NO_DATA_ANSWER
+        if (
+            financial_query
+            and requested_financial_subjects
+        ):
+            answer = (
+                "I could not find a processed financial document "
+                "containing the requested item or category."
+            )
+        else:
+            answer = FALLBACK_NO_DATA_ANSWER
+
         sources = []
 
     else:
-        financial_result = None
-
-        if financial_query:
-            financial_result = (
-                answer_financial_total_from_context(
-                    query=clean_query,
-                    context=context,
-                    matched_rows=matched_rows
-                )
+        # -----------------------------------------------------
+        # DETERMINISTIC FINANCIAL CALCULATION
+        # -----------------------------------------------------
+        financial_result = (
+            answer_financial_total_from_context(
+                query=clean_query,
+                context=context,
+                matched_rows=matched_rows
             )
+        )
 
+        # -----------------------------------------------------
+        # DETERMINISTIC NUMERIC COMPARISON
+        # -----------------------------------------------------
         numeric_result = None
 
         if financial_result is None:
@@ -11860,40 +12235,17 @@ Rules:
                 )
             )
 
-        # -----------------------------------------------------
-        # FINANCIAL ANSWER
-        # -----------------------------------------------------
         if financial_result is not None:
             answer = str(
                 financial_result.get("answer")
                 or FALLBACK_NO_DATA_ANSWER
             ).strip()
 
-            # Use only the sources returned by the verified financial
-            # calculator. Do not replace these with every retrieved file.
             sources = (
                 financial_result.get("sources")
                 or []
             )
 
-            if not isinstance(sources, list):
-                sources = []
-
-            if answer == FALLBACK_NO_DATA_ANSWER:
-                sources = []
-
-            print(
-                "FINANCIAL FINAL ANSWER DEBUG:",
-                {
-                    "answer": answer,
-                    "subject": requested_financial_subject,
-                    "sources": sources
-                }
-            )
-
-        # -----------------------------------------------------
-        # NUMERIC COMPARISON
-        # -----------------------------------------------------
         elif numeric_result is not None:
             answer = str(
                 numeric_result.get("answer")
@@ -11936,7 +12288,10 @@ You are BridgeOS, a private document-based assistant.
 
 Always respond in British English.
 
-Return ONLY valid JSON in exactly this shape:
+You may answer only when the supplied document context directly
+supports the user's exact question.
+
+Return ONLY valid JSON:
 
 {{
   "answer": "clear answer grounded only in the documents",
@@ -11960,11 +12315,13 @@ Or:
 Rules:
 - Use only the supplied document context.
 - Do not use general knowledge.
-- Do not invent facts, values, dates, names or statuses.
-- Answer only when the exact question is supported.
-- Inspect all supplied rows.
-- Evidence must be copied from the selected source.
-- Do not mention document names inside the answer.
+- Do not estimate.
+- Do not invent facts, names, dates, values or statuses.
+- Do not answer from loosely related information.
+- If the exact answer is unsupported, return the fallback.
+- Inspect every supplied table row when relevant.
+- Do not include a source unless it directly supports the answer.
+- Evidence must be copied from the context.
 - Return JSON only.
 
 Requested answer depth:
@@ -11994,7 +12351,10 @@ Document context:
 
                 parsed = None
 
-            if not parsed or not isinstance(parsed, dict):
+            if not parsed or not isinstance(
+                parsed,
+                dict
+            ):
                 answer = FALLBACK_NO_DATA_ANSWER
                 document_used = False
                 raw_used_sources = []
@@ -12014,20 +12374,21 @@ Document context:
                     or []
                 )
 
-                if not isinstance(raw_used_sources, list):
+                if not isinstance(
+                    raw_used_sources,
+                    list
+                ):
                     raw_used_sources = []
 
                 if not answer:
                     answer = FALLBACK_NO_DATA_ANSWER
 
-            if (
-                answer == FALLBACK_NO_DATA_ANSWER
-                or not document_used
-            ):
-                answer = FALLBACK_NO_DATA_ANSWER
+            if answer == FALLBACK_NO_DATA_ANSWER:
                 sources = []
 
-            else:
+            elif document_used:
+                verified_rows = []
+
                 try:
                     verified_rows = (
                         verified_source_rows_from_llm_result(
@@ -12043,23 +12404,66 @@ Document context:
                         str(e)
                     )
 
-                    verified_rows = []
-
                 if verified_rows:
-                    sources = build_sources_from_asset_results(
-                        verified_rows
+                    sources = (
+                        build_sources_from_asset_results(
+                            verified_rows
+                        )
                     )
 
                 else:
-                    # Never attach a guessed or unrelated source.
-                    # If evidence verification fails, return the fallback.
-                    answer = FALLBACK_NO_DATA_ANSWER
-                    sources = []
+                    selected_rows = []
+
+                    for used_source in raw_used_sources:
+                        if not isinstance(
+                            used_source,
+                            dict
+                        ):
+                            continue
+
+                        try:
+                            source_number = int(
+                                used_source.get(
+                                    "source_number"
+                                )
+                            )
+
+                        except Exception:
+                            continue
+
+                        source_index = source_number - 1
+
+                        if (
+                            0
+                            <= source_index
+                            < len(matched_rows)
+                        ):
+                            selected_row = matched_rows[
+                                source_index
+                            ]
+
+                            if selected_row not in selected_rows:
+                                selected_rows.append(
+                                    selected_row
+                                )
+
+                    if selected_rows:
+                        sources = (
+                            build_sources_from_asset_results(
+                                selected_rows
+                            )
+                        )
+                    else:
+                        answer = FALLBACK_NO_DATA_ANSWER
+                        sources = []
+
+            else:
+                answer = FALLBACK_NO_DATA_ANSWER
+                sources = []
 
     # =========================================================
-    # FINAL NORMALISATION
+    # FINAL SOURCE SAFETY
     # =========================================================
-
     if not answer:
         answer = FALLBACK_NO_DATA_ANSWER
 
@@ -12068,6 +12472,34 @@ Document context:
 
     if answer.strip() == FALLBACK_NO_DATA_ANSWER:
         sources = []
+
+    # Remove duplicated source cards.
+    unique_sources = []
+    seen_source_asset_ids = set()
+
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+
+        source_asset_id = source.get(
+            "asset_id"
+        )
+
+        if not source_asset_id:
+            continue
+
+        if source_asset_id in seen_source_asset_ids:
+            continue
+
+        seen_source_asset_ids.add(
+            source_asset_id
+        )
+
+        unique_sources.append(
+            source
+        )
+
+    sources = unique_sources
 
     save_assistant_response(
         final_answer=answer,
