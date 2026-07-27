@@ -7048,118 +7048,488 @@ def get_latest_chat_asset_id(
 # ------------------------
 def is_file_listing_query(query: str) -> bool:
     """
-    Detects generic questions asking what uploaded files/documents exist.
+    Detects requests to list or count uploaded assets.
+
+    Supports questions such as:
+    - how many invoices do we have
+    - count the uploaded documents
+    - what files are available
+    - list the PDFs
+    - which images were uploaded
+
+    This does not hard-code suppliers, filenames, document content,
+    products, users or exact uploaded assets.
     """
 
-    clean = (query or "").lower().strip()
+    clean = normalise_search_text(
+        str(query or "")
+    )
 
-    listing_phrases = [
-        "what invoices",
-        "which invoices",
-        "list invoices",
-        "show invoices",
-        "uploaded invoices",
+    if not clean:
+        return False
 
-        "what documents",
-        "which documents",
-        "list documents",
-        "show documents",
-        "uploaded documents",
+    words = set(
+        clean.split()
+    )
 
-        "what files",
-        "which files",
-        "list files",
-        "show files",
-        "uploaded files",
+    asset_words = {
+        "file",
+        "files",
+        "document",
+        "documents",
+        "doc",
+        "docs",
+        "invoice",
+        "invoices",
+        "receipt",
+        "receipts",
+        "pdf",
+        "pdfs",
+        "docx",
+        "image",
+        "images",
+        "photo",
+        "photos",
+        "upload",
+        "uploads",
+        "uploaded",
+        "asset",
+        "assets",
+    }
 
-        "what docs",
-        "which docs",
-        "list docs",
-        "show docs",
+    listing_words = {
+        "list",
+        "show",
+        "which",
+        "what",
+        "available",
+        "uploaded",
+        "uploads",
+        "have",
+        "exist",
+        "stored",
+    }
 
-        "what do we have uploaded",
-        "what have we uploaded",
-        "what is uploaded",
-        "what's uploaded"
-    ]
+    counting_words = {
+        "count",
+        "number",
+        "many",
+        "total",
+        "amount",
+    }
 
-    return any(phrase in clean for phrase in listing_phrases)
+    has_asset_reference = bool(
+        words.intersection(
+            asset_words
+        )
+    )
 
+    has_listing_intent = bool(
+        words.intersection(
+            listing_words
+        )
+    )
+
+    has_counting_intent = bool(
+        words.intersection(
+            counting_words
+        )
+    )
+
+    has_how_many = (
+        "how many" in clean
+    )
+
+    has_number_of = (
+        "number of" in clean
+    )
+
+    return (
+        has_asset_reference
+        and (
+            has_listing_intent
+            or has_counting_intent
+            or has_how_many
+            or has_number_of
+        )
+    )
+    
 def answer_file_listing_directly(
     query: str,
     rows: list[dict]
 ) -> dict:
     """
-    Answers file/document/invoice listing questions directly from asset metadata.
+    Directly answers uploaded-file listing and counting questions.
 
-    This avoids the LLM returning the fallback even when files exist.
+    Important:
+    - Counts unique assets, not chunks.
+    - Can count all documents or a requested file category.
+    - Can list matching files.
+    - Does not call the LLM.
+    - Does not return the no-data fallback when matching assets exist.
     """
 
-    clean_query = (query or "").lower()
+    clean_query = normalise_search_text(
+        str(query or "")
+    )
 
     if not rows:
         return {
-            "answer": FALLBACK_NO_DATA_ANSWER,
+            "answer": (
+                "There are no accessible processed files "
+                "available for this account."
+            ),
             "sources": []
         }
+
+    # =========================================================
+    # DEDUPLICATE BY ASSET
+    # =========================================================
+
+    unique_rows = []
+    seen_asset_ids = set()
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        asset_id = str(
+            row.get("asset_id")
+            or row.get("id")
+            or ""
+        ).strip()
+
+        if not asset_id:
+            continue
+
+        if asset_id in seen_asset_ids:
+            continue
+
+        seen_asset_ids.add(
+            asset_id
+        )
+
+        unique_rows.append(row)
+
+    if not unique_rows:
+        return {
+            "answer": (
+                "There are no accessible processed files "
+                "available for this account."
+            ),
+            "sources": []
+        }
+
+    # =========================================================
+    # DETERMINE WHETHER THE USER WANTS A COUNT OR A LIST
+    # =========================================================
+
+    query_words = set(
+        clean_query.split()
+    )
+
+    count_request = (
+        "how many" in clean_query
+        or "number of" in clean_query
+        or "count" in query_words
+        or "number" in query_words
+        or "total" in query_words
+    )
+
+    # =========================================================
+    # GENERIC FILE CATEGORY MATCHING
+    # =========================================================
+
+    def row_file_name(row: dict) -> str:
+        return clean_text_for_postgres(
+            str(
+                row.get("original_file_name")
+                or row.get("file_name")
+                or row.get("title")
+                or "Untitled document"
+            )
+        ).strip()
+
+    def row_file_type(row: dict) -> str:
+        return normalise_search_text(
+            str(
+                row.get("file_type")
+                or ""
+            )
+        )
+
+    def row_searchable_text(row: dict) -> str:
+        return normalise_search_text(
+            " ".join([
+                row_file_name(row),
+                str(
+                    row.get("content")
+                    or ""
+                ),
+                str(
+                    row.get("summary")
+                    or ""
+                ),
+                str(
+                    row.get("mime_type")
+                    or ""
+                ),
+                str(
+                    row.get("file_type")
+                    or ""
+                ),
+            ])
+        )
+
+    requested_category = "files"
+
+    if (
+        "invoice" in query_words
+        or "invoices" in query_words
+    ):
+        requested_category = "invoices"
+
+    elif (
+        "receipt" in query_words
+        or "receipts" in query_words
+    ):
+        requested_category = "receipts"
+
+    elif (
+        "pdf" in query_words
+        or "pdfs" in query_words
+    ):
+        requested_category = "PDF files"
+
+    elif "docx" in query_words:
+        requested_category = "DOCX files"
+
+    elif (
+        "image" in query_words
+        or "images" in query_words
+        or "photo" in query_words
+        or "photos" in query_words
+    ):
+        requested_category = "images"
+
+    elif (
+        "document" in query_words
+        or "documents" in query_words
+        or "doc" in query_words
+        or "docs" in query_words
+    ):
+        requested_category = "documents"
 
     filtered_rows = []
 
-    for row in rows:
-        file_name = (
-            row.get("original_file_name")
-            or row.get("file_name")
-            or "Untitled document"
+    for row in unique_rows:
+        file_name = row_file_name(
+            row
         )
 
-        content = str(row.get("content") or "").lower()
-        file_name_lower = file_name.lower()
+        file_name_lower = (
+            file_name.lower()
+        )
 
-        if "invoice" in clean_query:
-            if "invoice" not in file_name_lower and "invoice" not in content:
-                continue
+        file_type = row_file_type(
+            row
+        )
 
-        filtered_rows.append(row)
+        searchable_text = (
+            row_searchable_text(
+                row
+            )
+        )
+
+        include_row = True
+
+        if requested_category == "invoices":
+            include_row = (
+                "invoice"
+                in searchable_text
+            )
+
+        elif requested_category == "receipts":
+            include_row = (
+                "receipt"
+                in searchable_text
+            )
+
+        elif requested_category == "PDF files":
+            include_row = (
+                file_type == "pdf"
+                or file_name_lower.endswith(
+                    ".pdf"
+                )
+            )
+
+        elif requested_category == "DOCX files":
+            include_row = (
+                file_type == "docx"
+                or file_name_lower.endswith(
+                    ".docx"
+                )
+            )
+
+        elif requested_category == "images":
+            include_row = (
+                file_type == "image"
+                or file_name_lower.endswith(
+                    (
+                        ".jpg",
+                        ".jpeg",
+                        ".png",
+                        ".webp",
+                        ".heic",
+                        ".gif",
+                    )
+                )
+            )
+
+        if include_row:
+            filtered_rows.append(
+                row
+            )
+
+    count = len(
+        filtered_rows
+    )
+
+    # =========================================================
+    # COUNT ANSWER
+    # =========================================================
+
+    if count_request:
+        if count == 0:
+            answer = (
+                f"There are no accessible processed "
+                f"{requested_category} uploaded."
+            )
+
+        elif count == 1:
+            singular_labels = {
+                "files": "file",
+                "documents": "document",
+                "invoices": "invoice",
+                "receipts": "receipt",
+                "PDF files": "PDF file",
+                "DOCX files": "DOCX file",
+                "images": "image",
+            }
+
+            singular_label = (
+                singular_labels.get(
+                    requested_category,
+                    requested_category
+                )
+            )
+
+            answer = (
+                f"There is 1 accessible processed "
+                f"{singular_label} uploaded."
+            )
+
+        else:
+            answer = (
+                f"There are {count} accessible processed "
+                f"{requested_category} uploaded."
+            )
+
+        # Include the names after the count so the result can be checked.
+        if filtered_rows:
+            answer_lines = [
+                answer,
+                "",
+                "Files counted:"
+            ]
+
+            for row in filtered_rows:
+                answer_lines.append(
+                    "- " + row_file_name(
+                        row
+                    )
+                )
+
+            answer = "\n".join(
+                answer_lines
+            )
+
+        return {
+            "answer": answer,
+            "sources": (
+                build_sources_from_asset_results(
+                    filtered_rows
+                )
+            )
+        }
+
+    # =========================================================
+    # LIST ANSWER
+    # =========================================================
 
     if not filtered_rows:
         return {
-            "answer": FALLBACK_NO_DATA_ANSWER,
+            "answer": (
+                f"There are no accessible processed "
+                f"{requested_category} uploaded."
+            ),
             "sources": []
         }
 
-    lines = []
-
-    if "invoice" in clean_query:
-        lines.append("The uploaded invoice files I can see are:")
-    else:
-        lines.append("The uploaded documents/files I can see are:")
+    answer_lines = [
+        (
+            f"The accessible processed "
+            f"{requested_category} are:"
+        )
+    ]
 
     for row in filtered_rows:
-        file_name = (
-            row.get("original_file_name")
-            or row.get("file_name")
-            or "Untitled document"
+        file_name = row_file_name(
+            row
         )
 
-        file_type = row.get("file_type") or "file"
-        status = row.get("processing_status") or ""
+        file_type = str(
+            row.get("file_type")
+            or ""
+        ).strip()
 
-        extra = []
+        processing_status = str(
+            row.get("processing_status")
+            or ""
+        ).strip()
+
+        details = []
 
         if file_type:
-            extra.append(file_type)
+            details.append(
+                file_type
+            )
 
-        if status:
-            extra.append(status)
+        if processing_status:
+            details.append(
+                processing_status
+            )
 
-        if extra:
-            lines.append(f"- {file_name} ({', '.join(extra)})")
+        if details:
+            answer_lines.append(
+                f"- {file_name} "
+                f"({', '.join(details)})"
+            )
+
         else:
-            lines.append(f"- {file_name}")
+            answer_lines.append(
+                f"- {file_name}"
+            )
 
     return {
-        "answer": "\n".join(lines),
-        "sources": build_sources_from_asset_results(filtered_rows)
+        "answer": "\n".join(
+            answer_lines
+        ),
+        "sources": (
+            build_sources_from_asset_results(
+                filtered_rows
+            )
+        )
     }
 
 def get_asset_metadata_rows_for_listing(
