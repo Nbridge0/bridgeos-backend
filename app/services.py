@@ -10498,16 +10498,17 @@ def answer_subject_spending_from_context(
     Calculates spending for one or more dynamically requested subjects.
 
     Behaviour:
+    - Searches every supplied document.
     - Processes every document independently.
     - Extracts every matching financial row.
-    - Keeps identical purchases from different invoices.
-    - Removes duplicate OCR/text copies inside the same invoice.
-    - Shows every contributing invoice.
-    - Shows every row calculation.
-    - Shows a subtotal for each invoice.
-    - Combines invoice subtotals only when the currency is compatible.
-    - Returns only documents that contributed verified amounts.
-    - Does not hard-code any product, supplier, filename or question.
+    - Counts identical purchases from different invoices separately.
+    - Removes duplicate OCR/text copies only within the same invoice.
+    - Shows each document and each matching row.
+    - Shows a subtotal for each document.
+    - Combines document subtotals only when their currencies match.
+    - Keeps different currencies separate.
+    - Returns only documents that contributed verified financial rows.
+    - Does not hard-code products, suppliers, filenames, questions or amounts.
     """
 
     clean_query = str(query or "").strip()
@@ -10522,30 +10523,25 @@ def answer_subject_spending_from_context(
         }
 
     # =========================================================
-    # EXTRACT THE REQUESTED SUBJECTS
+    # 1. EXTRACT EVERY DYNAMICALLY REQUESTED SUBJECT
     # =========================================================
 
     subjects = []
 
     try:
-        multi_subject_extractor = globals().get(
-            "extract_spending_subjects"
+        extracted_subjects = (
+            extract_spending_subjects(clean_query)
+            or []
         )
 
-        if callable(multi_subject_extractor):
-            extracted_subjects = (
-                multi_subject_extractor(clean_query)
-                or []
-            )
+        if isinstance(extracted_subjects, list):
+            for subject in extracted_subjects:
+                clean_subject = str(
+                    subject or ""
+                ).strip()
 
-            if isinstance(extracted_subjects, list):
-                for subject in extracted_subjects:
-                    clean_subject = str(
-                        subject or ""
-                    ).strip()
-
-                    if clean_subject:
-                        subjects.append(clean_subject)
+                if clean_subject:
+                    subjects.append(clean_subject)
 
     except Exception as error:
         print(
@@ -10554,6 +10550,7 @@ def answer_subject_spending_from_context(
             str(error)
         )
 
+    # Fallback for one requested subject.
     if not subjects:
         try:
             single_subject = extract_spending_subject(
@@ -10572,8 +10569,9 @@ def answer_subject_spending_from_context(
                 str(error)
             )
 
-    clean_subjects = []
-    seen_subjects = set()
+    # Remove repeated subject names.
+    unique_subjects = []
+    seen_subject_keys = set()
 
     for subject in subjects:
         subject = str(subject or "").strip()
@@ -10585,13 +10583,13 @@ def answer_subject_spending_from_context(
         if not subject_key:
             continue
 
-        if subject_key in seen_subjects:
+        if subject_key in seen_subject_keys:
             continue
 
-        seen_subjects.add(subject_key)
-        clean_subjects.append(subject)
+        seen_subject_keys.add(subject_key)
+        unique_subjects.append(subject)
 
-    subjects = clean_subjects
+    subjects = unique_subjects
 
     if not subjects:
         return None
@@ -10602,10 +10600,15 @@ def answer_subject_spending_from_context(
     )
 
     # =========================================================
-    # GROUP RETRIEVED ROWS BY DOCUMENT
+    # 2. GROUP INPUT ROWS BY DOCUMENT
+    # =========================================================
+    #
+    # One PDF may have many chunks.
+    # All chunks belonging to the same asset_id are joined into
+    # one complete document before financial extraction.
     # =========================================================
 
-    assets_by_id = {}
+    documents_by_asset = {}
 
     for row in matched_rows or []:
         if not isinstance(row, dict):
@@ -10637,51 +10640,50 @@ def answer_subject_spending_from_context(
             or "Untitled document"
         ).strip()
 
-        if asset_id not in assets_by_id:
-            assets_by_id[asset_id] = {
+        if asset_id not in documents_by_asset:
+            documents_by_asset[asset_id] = {
                 "asset_id": asset_id,
                 "file_name": file_name,
                 "source_row": row,
-                "texts": [],
-                "normalised_text_keys": set()
+                "text_parts": [],
+                "seen_text_parts": set()
             }
 
-        normalised_key = normalise_for_source_check(
+        normalised_part = normalise_for_source_check(
             row_text
         )
 
-        if not normalised_key:
+        if not normalised_part:
             continue
 
         if (
-            normalised_key
-            in assets_by_id[asset_id][
-                "normalised_text_keys"
-            ]
+            normalised_part
+            in documents_by_asset[asset_id]["seen_text_parts"]
         ):
             continue
 
-        assets_by_id[asset_id][
-            "normalised_text_keys"
-        ].add(normalised_key)
+        documents_by_asset[asset_id][
+            "seen_text_parts"
+        ].add(normalised_part)
 
-        assets_by_id[asset_id][
-            "texts"
+        documents_by_asset[asset_id][
+            "text_parts"
         ].append(row_text)
 
-    if not assets_by_id:
+    if not documents_by_asset:
         return {
             "answer": FALLBACK_NO_DATA_ANSWER,
             "sources": []
         }
 
+    # Every subject receives its own verified result list.
     subject_results = {
         subject: []
         for subject in subjects
     }
 
     # =========================================================
-    # PROCESS EVERY SUBJECT AGAINST EVERY DOCUMENT
+    # 3. PROCESS EVERY SUBJECT AGAINST EVERY DOCUMENT
     # =========================================================
 
     for subject in subjects:
@@ -10696,11 +10698,11 @@ def answer_subject_spending_from_context(
         if not subject_terms:
             continue
 
-        for asset_id, asset_data in assets_by_id.items():
-            file_name = asset_data["file_name"]
+        for asset_id, document in documents_by_asset.items():
+            file_name = document["file_name"]
 
             document_text = "\n\n".join(
-                asset_data.get("texts") or []
+                document.get("text_parts") or []
             ).strip()
 
             if not document_text:
@@ -10710,7 +10712,8 @@ def answer_subject_spending_from_context(
                 document_text
             )
 
-            # The requested subject must occur in this exact document.
+            # This document must contain the requested subject.
+            # This is generic and works with any subject.
             if not all(
                 term in normalised_document
                 for term in subject_terms
@@ -10718,12 +10721,10 @@ def answer_subject_spending_from_context(
                 continue
 
             source_row = {
-                **asset_data["source_row"],
+                **document["source_row"],
                 "asset_id": asset_id,
                 "file_name": (
-                    asset_data["source_row"].get(
-                        "file_name"
-                    )
+                    document["source_row"].get("file_name")
                     or file_name
                 ),
                 "original_file_name": file_name,
@@ -10745,14 +10746,12 @@ def answer_subject_spending_from_context(
 
             except Exception as error:
                 print(
-                    "FINANCIAL EXTRACTION ERROR:",
+                    "FINANCIAL DOCUMENT EXTRACTION ERROR:",
                     {
-                        "subject": subject,
                         "asset_id": asset_id,
                         "file_name": file_name,
-                        "error_type": (
-                            type(error).__name__
-                        ),
+                        "subject": subject,
+                        "error_type": type(error).__name__,
                         "error": str(error)
                     }
                 )
@@ -10786,25 +10785,21 @@ def answer_subject_spending_from_context(
                 if not description:
                     continue
 
-                combined_item_text = (
-                    normalise_search_text(
-                        description
-                    )
-                    + " "
-                    + normalise_search_text(
-                        evidence
-                    )
-                ).strip()
+                item_search_text = normalise_search_text(
+                    f"{description} {evidence}"
+                )
 
+                # The extracted row itself must refer to the subject.
                 if not all(
-                    term in combined_item_text
+                    term in item_search_text
                     for term in subject_terms
                 ):
                     print(
                         "FINANCIAL ROW REJECTED: SUBJECT MISMATCH",
                         {
-                            "subject": subject,
+                            "asset_id": asset_id,
                             "file_name": file_name,
+                            "subject": subject,
                             "description": description,
                             "evidence": evidence
                         }
@@ -10823,9 +10818,7 @@ def answer_subject_spending_from_context(
                     )
 
                 description_supported = (
-                    normalise_search_text(
-                        description
-                    )
+                    normalise_search_text(description)
                     in normalised_document
                 )
 
@@ -10836,8 +10829,9 @@ def answer_subject_spending_from_context(
                     print(
                         "FINANCIAL ROW REJECTED: EVIDENCE NOT FOUND",
                         {
-                            "subject": subject,
+                            "asset_id": asset_id,
                             "file_name": file_name,
+                            "subject": subject,
                             "description": description,
                             "evidence": evidence
                         }
@@ -10845,24 +10839,23 @@ def answer_subject_spending_from_context(
 
                     continue
 
-                unit_price = item.get(
-                    "unit_price"
-                )
-
-                quantity = item.get(
-                    "quantity"
-                )
+                unit_price = item.get("unit_price")
+                quantity = item.get("quantity")
 
                 explicit_line_total = item.get(
                     "explicit_line_total"
                 )
 
+                # Support extraction functions that return "line_total"
+                # instead of "explicit_line_total".
+                if explicit_line_total is None:
+                    explicit_line_total = item.get(
+                        "line_total"
+                    )
+
                 if (
                     unit_price is not None
-                    and not isinstance(
-                        unit_price,
-                        Decimal
-                    )
+                    and not isinstance(unit_price, Decimal)
                 ):
                     unit_price = parse_decimal_money(
                         str(unit_price)
@@ -10870,10 +10863,7 @@ def answer_subject_spending_from_context(
 
                 if (
                     quantity is not None
-                    and not isinstance(
-                        quantity,
-                        Decimal
-                    )
+                    and not isinstance(quantity, Decimal)
                 ):
                     quantity = parse_general_decimal(
                         str(quantity)
@@ -10905,12 +10895,8 @@ def answer_subject_spending_from_context(
                     quantity = None
 
                 if (
-                    isinstance(
-                        explicit_line_total,
-                        Decimal
-                    )
-                    and explicit_line_total
-                    < Decimal("0")
+                    isinstance(explicit_line_total, Decimal)
+                    and explicit_line_total < Decimal("0")
                 ):
                     explicit_line_total = None
 
@@ -10927,7 +10913,7 @@ def answer_subject_spending_from_context(
                         rounding=ROUND_HALF_UP
                     )
 
-                # Prefer the written invoice row total when one exists.
+                # Prefer the line total written in the invoice.
                 if isinstance(
                     explicit_line_total,
                     Decimal
@@ -10954,23 +10940,21 @@ def answer_subject_spending_from_context(
                     print(
                         "FINANCIAL ROW REJECTED: NO USABLE AMOUNT",
                         {
-                            "subject": subject,
+                            "asset_id": asset_id,
                             "file_name": file_name,
+                            "subject": subject,
                             "description": description
                         }
                     )
 
                     continue
 
-                item_currency = normalise_currency(
+                currency = normalise_currency(
                     item.get("currency")
                 )
 
-                currency = (
-                    item_currency
-                    or document_currency
-                    or ""
-                )
+                if not currency:
+                    currency = document_currency or ""
 
                 subject_results[subject].append({
                     "subject": subject,
@@ -10984,16 +10968,19 @@ def answer_subject_spending_from_context(
                     "explicit_line_total": (
                         explicit_line_total
                     ),
-                    "calculated_total": (
-                        calculated_total
-                    ),
+                    "calculated_total": calculated_total,
                     "amount": final_amount,
                     "currency": currency,
                     "amount_method": amount_method
                 })
 
     # =========================================================
-    # DEDUPLICATE ONLY INSIDE EACH DOCUMENT
+    # 4. REMOVE DUPLICATES ONLY INSIDE THE SAME DOCUMENT
+    # =========================================================
+    #
+    # OCR and normal PDF extraction may return the same row twice.
+    # asset_id is part of the duplicate key, so an identical purchase
+    # in another invoice is still counted separately.
     # =========================================================
 
     for subject in subjects:
@@ -11004,13 +10991,10 @@ def answer_subject_spending_from_context(
             subject,
             []
         ):
-            key = (
-                str(
-                    item.get("asset_id") or ""
-                ),
+            duplicate_key = (
+                str(item.get("asset_id") or ""),
                 normalise_search_text(
-                    item.get("description")
-                    or ""
+                    item.get("description") or ""
                 ),
                 item.get("unit_price"),
                 item.get("quantity"),
@@ -11020,10 +11004,10 @@ def answer_subject_spending_from_context(
                 )
             )
 
-            if key in seen_item_keys:
+            if duplicate_key in seen_item_keys:
                 continue
 
-            seen_item_keys.add(key)
+            seen_item_keys.add(duplicate_key)
             unique_items.append(item)
 
         subject_results[subject] = unique_items
@@ -11050,12 +11034,12 @@ def answer_subject_spending_from_context(
             "sources": []
         }
 
-    # These must be defined before append() or extend() is used.
+    # Define these before any append() or extend().
     answer_lines: list[str] = []
     combinable_subject_totals: list[dict] = []
 
     # =========================================================
-    # FORMAT ONE SUBJECT
+    # 5. FORMAT ONE SUBJECT ACROSS ALL MATCHING DOCUMENTS
     # =========================================================
 
     def format_subject_result(
@@ -11085,9 +11069,11 @@ def answer_subject_spending_from_context(
                     "items": []
                 }
 
-            documents[document_key][
-                "items"
-            ].append(item)
+            documents[document_key]["items"].append(
+                item
+            )
+
+        document_count = len(documents)
 
         total_row_count = sum(
             len(document["items"])
@@ -11096,12 +11082,12 @@ def answer_subject_spending_from_context(
 
         lines.append(
             f"{subject}: found {total_row_count} verified "
-            f"{'row' if total_row_count == 1 else 'rows'} "
-            f"across {len(documents)} "
-            f"{'document' if len(documents) == 1 else 'documents'}."
+            f"{'matching row' if total_row_count == 1 else 'matching rows'} "
+            f"across {document_count} "
+            f"{'document' if document_count == 1 else 'documents'}."
         )
 
-        known_currencies = {
+        all_known_currencies = {
             normalise_currency(
                 item.get("currency")
             )
@@ -11111,21 +11097,20 @@ def answer_subject_spending_from_context(
             )
         }
 
-        unknown_currency_items = [
-            item
-            for item in items
-            if not normalise_currency(
+        has_unknown_currency = any(
+            not normalise_currency(
                 item.get("currency")
             )
-        ]
+            for item in items
+        )
 
         one_safe_currency = (
-            len(known_currencies) == 1
-            and not unknown_currency_items
+            len(all_known_currencies) == 1
+            and not has_unknown_currency
         )
 
         combined_currency = (
-            next(iter(known_currencies))
+            next(iter(all_known_currencies))
             if one_safe_currency
             else None
         )
@@ -11137,10 +11122,7 @@ def answer_subject_spending_from_context(
             start=1
         ):
             file_name = document["file_name"]
-
-            document_items = document[
-                "items"
-            ]
+            document_items = document["items"]
 
             lines.extend([
                 "",
@@ -11160,21 +11142,14 @@ def answer_subject_spending_from_context(
                     item.get("currency")
                 )
 
-                unit_price = item.get(
-                    "unit_price"
-                )
-
-                quantity = item.get(
-                    "quantity"
-                )
+                unit_price = item.get("unit_price")
+                quantity = item.get("quantity")
 
                 explicit_line_total = item.get(
                     "explicit_line_total"
                 )
 
-                amount = item.get(
-                    "amount"
-                )
+                amount = item.get("amount")
 
                 amount_method = str(
                     item.get("amount_method")
@@ -11199,8 +11174,7 @@ def answer_subject_spending_from_context(
                     )
 
                 if (
-                    amount_method
-                    == "explicit_line_total"
+                    amount_method == "explicit_line_total"
                     and explicit_line_total is not None
                 ):
                     if (
@@ -11222,12 +11196,10 @@ def answer_subject_spending_from_context(
                             )
 
                         calculation = (
-                            f"written line total "
-                            f"{displayed_amount} "
+                            f"written line total {displayed_amount} "
                             f"(quantity "
                             f"{format_number_for_answer(quantity)}, "
-                            f"unit price "
-                            f"{displayed_unit_price})"
+                            f"unit price {displayed_unit_price})"
                         )
 
                     else:
@@ -11278,28 +11250,33 @@ def answer_subject_spending_from_context(
                 )
             }
 
-            document_unknown_currency = any(
+            document_has_unknown_currency = any(
                 not normalise_currency(
                     item.get("currency")
                 )
                 for item in document_items
             )
 
+            # -------------------------------------------------
+            # SAME CURRENCY INSIDE THIS DOCUMENT
+            # -------------------------------------------------
+
             if (
                 len(document_currencies) == 1
-                and not document_unknown_currency
+                and not document_has_unknown_currency
             ):
                 document_currency = next(
                     iter(document_currencies)
                 )
 
+                document_amounts = [
+                    item["amount"]
+                    for item in document_items
+                    if item.get("amount") is not None
+                ]
+
                 document_total = sum(
-                    (
-                        item["amount"]
-                        for item in document_items
-                        if item.get("amount")
-                        is not None
-                    ),
+                    document_amounts,
                     Decimal("0.00")
                 ).quantize(
                     Decimal("0.01"),
@@ -11314,13 +11291,6 @@ def answer_subject_spending_from_context(
                     )
                 )
 
-                document_amounts = [
-                    item["amount"]
-                    for item in document_items
-                    if item.get("amount")
-                    is not None
-                ]
-
                 if len(document_amounts) > 1:
                     lines.append(
                         "Document calculation: "
@@ -11328,8 +11298,7 @@ def answer_subject_spending_from_context(
                             format_number_for_answer(
                                 amount
                             )
-                            for amount
-                            in document_amounts
+                            for amount in document_amounts
                         )
                         + " = "
                         + format_number_for_answer(
@@ -11338,36 +11307,38 @@ def answer_subject_spending_from_context(
                     )
 
                 document_subtotals.append({
-                    "asset_id": document[
-                        "asset_id"
-                    ],
+                    "asset_id": document["asset_id"],
                     "file_name": file_name,
                     "amount": document_total,
                     "currency": document_currency
                 })
 
+            # -------------------------------------------------
+            # DIFFERENT CURRENCIES INSIDE ONE DOCUMENT
+            # -------------------------------------------------
+
             elif len(document_currencies) > 1:
                 lines.append(
-                    "Document subtotal was not combined "
-                    "because this document contains "
-                    "different currencies."
+                    "Document subtotal was not combined because "
+                    "the matching rows use different currencies."
                 )
 
                 for currency in sorted(
                     document_currencies
                 ):
+                    currency_amounts = [
+                        item["amount"]
+                        for item in document_items
+                        if (
+                            item.get("amount") is not None
+                            and normalise_currency(
+                                item.get("currency")
+                            ) == currency
+                        )
+                    ]
+
                     currency_total = sum(
-                        (
-                            item["amount"]
-                            for item in document_items
-                            if (
-                                item.get("amount")
-                                is not None
-                                and normalise_currency(
-                                    item.get("currency")
-                                ) == currency
-                            )
-                        ),
+                        currency_amounts,
                         Decimal("0.00")
                     ).quantize(
                         Decimal("0.01"),
@@ -11384,18 +11355,20 @@ def answer_subject_spending_from_context(
 
             else:
                 lines.append(
-                    "Document subtotal was not combined "
-                    "because the currency could not be "
-                    "verified for every row."
+                    "Document subtotal was not combined because "
+                    "the currency could not be verified for every row."
                 )
+
+        # =====================================================
+        # COMBINE ALL MATCHING DOCUMENTS
+        # =====================================================
 
         if one_safe_currency:
             combined_total = sum(
                 (
                     item["amount"]
                     for item in items
-                    if item.get("amount")
-                    is not None
+                    if item.get("amount") is not None
                 ),
                 Decimal("0.00")
             ).quantize(
@@ -11418,15 +11391,16 @@ def answer_subject_spending_from_context(
                 lines.append(
                     "Combined document calculation: "
                     + " + ".join(
-                        format_number_for_answer(
-                            document["amount"]
+                        format_currency_amount(
+                            document["amount"],
+                            combined_currency
                         )
-                        for document
-                        in document_subtotals
+                        for document in document_subtotals
                     )
                     + " = "
-                    + format_number_for_answer(
-                        combined_total
+                    + format_currency_amount(
+                        combined_total,
+                        combined_currency
                     )
                 )
 
@@ -11434,16 +11408,17 @@ def answer_subject_spending_from_context(
                 lines.append(
                     "Combined row calculation: "
                     + " + ".join(
-                        format_number_for_answer(
-                            item["amount"]
+                        format_currency_amount(
+                            item["amount"],
+                            combined_currency
                         )
                         for item in items
-                        if item.get("amount")
-                        is not None
+                        if item.get("amount") is not None
                     )
                     + " = "
-                    + format_number_for_answer(
-                        combined_total
+                    + format_currency_amount(
+                        combined_total,
+                        combined_currency
                     )
                 )
 
@@ -11453,29 +11428,34 @@ def answer_subject_spending_from_context(
                 combined_currency
             )
 
+        # =====================================================
+        # CURRENCIES CANNOT BE COMBINED
+        # =====================================================
+
         lines.append("")
 
-        if len(known_currencies) > 1:
+        if len(all_known_currencies) > 1:
             lines.append(
-                "The verified rows use different currencies, "
-                "so they were not combined into one total."
+                "The matching documents use different currencies, "
+                "so they were not combined into one overall total."
             )
 
             for currency in sorted(
-                known_currencies
+                all_known_currencies
             ):
+                currency_amounts = [
+                    item["amount"]
+                    for item in items
+                    if (
+                        item.get("amount") is not None
+                        and normalise_currency(
+                            item.get("currency")
+                        ) == currency
+                    )
+                ]
+
                 currency_total = sum(
-                    (
-                        item["amount"]
-                        for item in items
-                        if (
-                            item.get("amount")
-                            is not None
-                            and normalise_currency(
-                                item.get("currency")
-                            ) == currency
-                        )
-                    ),
+                    currency_amounts,
                     Decimal("0.00")
                 ).quantize(
                     Decimal("0.01"),
@@ -11490,14 +11470,20 @@ def answer_subject_spending_from_context(
                     )
                 )
 
+        unknown_currency_items = [
+            item
+            for item in items
+            if not normalise_currency(
+                item.get("currency")
+            )
+        ]
+
         if unknown_currency_items:
             unknown_total = sum(
                 (
                     item["amount"]
-                    for item
-                    in unknown_currency_items
-                    if item.get("amount")
-                    is not None
+                    for item in unknown_currency_items
+                    if item.get("amount") is not None
                 ),
                 Decimal("0.00")
             ).quantize(
@@ -11506,8 +11492,8 @@ def answer_subject_spending_from_context(
             )
 
             lines.append(
-                "Rows without a verified currency were "
-                "excluded from currency totals."
+                "Rows without a verified currency were excluded "
+                "from the currency totals."
             )
 
             lines.append(
@@ -11520,7 +11506,7 @@ def answer_subject_spending_from_context(
         return lines, None, None
 
     # =========================================================
-    # BUILD THE FINAL ANSWER
+    # 6. BUILD THE FINAL RESPONSE
     # =========================================================
 
     for subject_index, subject in enumerate(
@@ -11536,9 +11522,7 @@ def answer_subject_spending_from_context(
         if subject_index > 0:
             answer_lines.append("")
 
-        answer_lines.extend(
-            subject_lines
-        )
+        answer_lines.extend(subject_lines)
 
         if (
             subject_total is not None
@@ -11550,32 +11534,32 @@ def answer_subject_spending_from_context(
                 "currency": currency
             })
 
+    # If the user requested several independent subjects,
+    # combine their totals only when all use one currency.
     if len(found_subjects) > 1:
-        combined_currencies = {
+        subject_currencies = {
             item["currency"]
-            for item
-            in combinable_subject_totals
+            for item in combinable_subject_totals
             if item.get("currency")
         }
 
-        all_subjects_are_combinable = (
+        every_subject_can_be_combined = (
             len(combinable_subject_totals)
             == len(found_subjects)
         )
 
         if (
-            all_subjects_are_combinable
-            and len(combined_currencies) == 1
+            every_subject_can_be_combined
+            and len(subject_currencies) == 1
         ):
             combined_currency = next(
-                iter(combined_currencies)
+                iter(subject_currencies)
             )
 
-            combined_total = sum(
+            all_subjects_total = sum(
                 (
                     item["amount"]
-                    for item
-                    in combinable_subject_totals
+                    for item in combinable_subject_totals
                 ),
                 Decimal("0.00")
             ).quantize(
@@ -11590,22 +11574,23 @@ def answer_subject_spending_from_context(
                     + ", ".join(found_subjects)
                     + ": "
                     + format_currency_amount(
-                        combined_total,
+                        all_subjects_total,
                         combined_currency
                     )
                 ),
                 (
-                    "Combined calculation: "
+                    "Combined subject calculation: "
                     + " + ".join(
-                        format_number_for_answer(
-                            item["amount"]
+                        format_currency_amount(
+                            item["amount"],
+                            combined_currency
                         )
-                        for item
-                        in combinable_subject_totals
+                        for item in combinable_subject_totals
                     )
                     + " = "
-                    + format_number_for_answer(
-                        combined_total
+                    + format_currency_amount(
+                        all_subjects_total,
+                        combined_currency
                     )
                 )
             ])
@@ -11614,15 +11599,14 @@ def answer_subject_spending_from_context(
         answer_lines.extend([
             "",
             (
-                "No verifiable matching financial row "
-                "was found for: "
+                "No verifiable matching financial row was found for: "
                 + ", ".join(missing_subjects)
                 + "."
             )
         ])
 
     # =========================================================
-    # RETURN ONLY CONTRIBUTING DOCUMENT SOURCES
+    # 7. RETURN ONLY DOCUMENTS THAT CONTRIBUTED AN AMOUNT
     # =========================================================
 
     contributing_rows = []
@@ -11637,9 +11621,7 @@ def answer_subject_spending_from_context(
                 item.get("asset_id") or ""
             ).strip()
 
-            source_row = item.get(
-                "source_row"
-            )
+            source_row = item.get("source_row")
 
             if not asset_id:
                 continue
@@ -11650,38 +11632,31 @@ def answer_subject_spending_from_context(
             if not isinstance(source_row, dict):
                 continue
 
-            seen_contributing_assets.add(
-                asset_id
-            )
-
-            contributing_rows.append(
-                source_row
-            )
+            seen_contributing_assets.add(asset_id)
+            contributing_rows.append(source_row)
 
     sources = build_sources_from_asset_results(
         contributing_rows
     )
 
     print(
-        "FINAL VERIFIED MULTI-SUBJECT RESULTS:",
+        "FINAL VERIFIED MULTI-DOCUMENT FINANCIAL RESULTS:",
         {
             subject: [
                 {
-                    "asset_id": item.get(
-                        "asset_id"
+                    "asset_id": item.get("asset_id"),
+                    "file_name": item.get("file_name"),
+                    "description": item.get("description"),
+                    "unit_price": str(
+                        item.get("unit_price")
                     ),
-                    "file_name": item.get(
-                        "file_name"
-                    ),
-                    "description": item.get(
-                        "description"
+                    "quantity": str(
+                        item.get("quantity")
                     ),
                     "amount": str(
                         item.get("amount")
                     ),
-                    "currency": item.get(
-                        "currency"
-                    )
+                    "currency": item.get("currency")
                 }
                 for item in subject_results.get(
                     subject,
