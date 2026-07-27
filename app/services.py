@@ -1336,327 +1336,23 @@ def chat_with_runpod_bridgeos(
     uploaded_asset_id: str | None = None
 ):
     """
-    Sends the BridgeOS chat request to the RunPod AI API.
+    Uses BridgeOS secure document retrieval for every document-based question.
 
     Important:
-    - The frontend calls the BridgeOS backend.
-    - The BridgeOS backend calls RunPod.
-    - Users should never see raw Internal Server Error messages.
-    - If RunPod fails, return the normal fallback answer.
+    - Searches documents already uploaded to Yacht Documentation.
+    - Uses the exact uploaded chat asset when one is attached.
+    - Does not answer factual questions without document evidence.
+    - Uses the existing deterministic document and numeric-answer pipeline.
     """
 
-    verify_chat_access(
-        chat_id=chat_id,
+    return chat(
+        query=query,
         crew_id=crew["id"],
-        yacht_id=crew["yacht_id"]
+        yacht_id=crew["yacht_id"],
+        security_level=int(crew["security_level"]),
+        chat_id=chat_id,
+        uploaded_asset_id=uploaded_asset_id
     )
-    query_scope = classify_bridgeos_query_scope(query)
-
-    if query_scope == "factual" and not uploaded_asset_id:
-        answer = FALLBACK_NO_DATA_ANSWER
-
-        supabase.table("messages").insert({
-            "chat_id": chat_id,
-            "yacht_id": crew["yacht_id"],
-            "crew_id": crew["id"],
-            "role": "user",
-            "content": query,
-            "sources": []
-        }).execute()
-
-        supabase.table("messages").insert({
-            "chat_id": chat_id,
-            "yacht_id": crew["yacht_id"],
-            "crew_id": crew["id"],
-            "role": "assistant",
-            "content": answer,
-            "sources": []
-        }).execute()
-
-        supabase.table("chats").update({
-            "updated_at": "now()"
-        }).eq("id", chat_id).eq("crew_id", crew["id"]).eq("yacht_id", crew["yacht_id"]).execute()
-
-        return {
-            "answer": answer,
-            "sources": [],
-            "provider": "runpod_bridgeos",
-            "error": False
-        }
-
-    uploaded_asset = None
-
-    if uploaded_asset_id:
-        asset_res = (
-            supabase.table("assets")
-            .select("id, file_name, original_file_name, mime_type, yacht_id, chat_id")
-            .eq("id", uploaded_asset_id)
-            .eq("yacht_id", crew["yacht_id"])
-            .execute()
-        )
-
-        if asset_res.data:
-            uploaded_asset = asset_res.data[0]
-
-    supabase.table("messages").insert({
-        "chat_id": chat_id,
-        "yacht_id": crew["yacht_id"],
-        "crew_id": crew["id"],
-        "role": "user",
-        "content": query,
-        "uploaded_asset_id": uploaded_asset.get("id") if uploaded_asset else None,
-        "file_name": uploaded_asset.get("file_name") if uploaded_asset else None,
-        "original_file_name": uploaded_asset.get("original_file_name") if uploaded_asset else None,
-        "mime_type": uploaded_asset.get("mime_type") if uploaded_asset else None
-    }).execute()
-
-    if not RUNPOD_BASE_URL:
-        answer = FALLBACK_NO_DATA_ANSWER
-
-        supabase.table("messages").insert({
-            "chat_id": chat_id,
-            "yacht_id": crew["yacht_id"],
-            "crew_id": crew["id"],
-            "role": "assistant",
-            "content": answer
-        }).execute()
-
-        return {
-            "answer": answer,
-            "sources": [],
-            "provider": "runpod_bridgeos",
-            "error": True
-        }
-
-    if not BRIDGEOS_API_KEY:
-        answer = FALLBACK_NO_DATA_ANSWER
-
-        supabase.table("messages").insert({
-            "chat_id": chat_id,
-            "yacht_id": crew["yacht_id"],
-            "crew_id": crew["id"],
-            "role": "assistant",
-            "content": answer
-        }).execute()
-
-        return {
-            "answer": answer,
-            "sources": [],
-            "provider": "runpod_bridgeos",
-            "error": True
-        }
-
-    history_res = supabase.table("messages") \
-        .select("role, content") \
-        .eq("chat_id", chat_id) \
-        .eq("crew_id", crew["id"]) \
-        .eq("yacht_id", crew["yacht_id"]) \
-        .order("created_at", desc=False) \
-        .limit(20) \
-        .execute()
-
-    history = []
-
-    for message in history_res.data or []:
-        role = message.get("role")
-        content = message.get("content")
-
-        if role in ["user", "assistant"] and content:
-            history.append({
-                "role": role,
-                "content": content
-            })
-
-    backend_context = {
-        "crew": {
-            "id": crew.get("id"),
-            "email": crew.get("email"),
-            "full_name": crew.get("full_name"),
-            "role": crew.get("role"),
-            "position": crew.get("position"),
-            "phone_number": crew.get("phone_number"),
-            "security_level": crew.get("security_level"),
-            "yacht_id": crew.get("yacht_id"),
-            "yacht_name": crew.get("yacht_name")
-        }
-    }
-
-    try:
-        my_assets = list_my_assets(crew)
-
-        safe_assets = []
-
-        asset_rows = (
-            my_assets.get("data", [])
-            if isinstance(my_assets, dict)
-            else getattr(my_assets, "data", []) or []
-        )
-
-        for asset in asset_rows:
-            safe_assets.append({
-                "id": asset.get("id"),
-                "file_name": asset.get("file_name"),
-                "original_file_name": asset.get("original_file_name"),
-                "file_type": asset.get("file_type"),
-                "mime_type": asset.get("mime_type"),
-                "security_level": asset.get("security_level"),
-                "processing_status": asset.get("processing_status"),
-                "detected_year": asset.get("detected_year"),
-                "detected_event": asset.get("detected_event"),
-                "tags": asset.get("tags"),
-                "summary": asset.get("summary")
-            })
-
-        backend_context["assets"] = safe_assets[:50]
-
-    except Exception as e:
-        print("ASSET CONTEXT ERROR:", type(e).__name__, str(e))
-        backend_context["assets"] = []
-
-    url = f"{RUNPOD_BASE_URL.rstrip('/')}/api/bridgeos/chat"
-
-    try:
-        print("RUNPOD DEBUG: url:", url)
-        print("RUNPOD DEBUG: key present:", bool(BRIDGEOS_API_KEY))
-        print("RUNPOD DEBUG: key length:", len(BRIDGEOS_API_KEY or ""))
-        print("RUNPOD DEBUG: key last4:", (BRIDGEOS_API_KEY or "")[-4:])
-
-        response = requests.post(
-            url,
-            json={
-                "user_input": query,
-                "history": history,
-                "backend_context": backend_context
-            },
-            headers={
-                "Content-Type": "application/json",
-                "x-api-key": BRIDGEOS_API_KEY
-            },
-            timeout=180
-        )
-
-        print("RUNPOD DEBUG: status:", response.status_code)
-        print("RUNPOD DEBUG: response:", response.text[:500])
-
-    except requests.exceptions.Timeout:
-        print("RUNPOD TIMEOUT ERROR")
-
-        answer = FALLBACK_NO_DATA_ANSWER
-
-        supabase.table("messages").insert({
-            "chat_id": chat_id,
-            "yacht_id": crew["yacht_id"],
-            "crew_id": crew["id"],
-            "role": "assistant",
-            "content": answer
-        }).execute()
-
-        supabase.table("chats").update({
-            "updated_at": "now()"
-        }).eq("id", chat_id).eq("crew_id", crew["id"]).eq("yacht_id", crew["yacht_id"]).execute()
-
-        return {
-            "answer": answer,
-            "sources": [],
-            "provider": "runpod_bridgeos",
-            "error": True
-        }
-
-    except Exception as e:
-        print("RUNPOD REQUEST ERROR:", type(e).__name__, str(e))
-
-        answer = FALLBACK_NO_DATA_ANSWER
-
-        supabase.table("messages").insert({
-            "chat_id": chat_id,
-            "yacht_id": crew["yacht_id"],
-            "crew_id": crew["id"],
-            "role": "assistant",
-            "content": answer
-        }).execute()
-
-        supabase.table("chats").update({
-            "updated_at": "now()"
-        }).eq("id", chat_id).eq("crew_id", crew["id"]).eq("yacht_id", crew["yacht_id"]).execute()
-
-        return {
-            "answer": answer,
-            "sources": [],
-            "provider": "runpod_bridgeos",
-            "error": True
-        }
-
-    if response.status_code >= 400:
-        print("RUNPOD ERROR STATUS:", response.status_code)
-        print("RUNPOD ERROR RESPONSE:", response.text[:1000])
-
-        answer = FALLBACK_NO_DATA_ANSWER
-
-        supabase.table("messages").insert({
-            "chat_id": chat_id,
-            "yacht_id": crew["yacht_id"],
-            "crew_id": crew["id"],
-            "role": "assistant",
-            "content": answer
-        }).execute()
-
-        supabase.table("chats").update({
-            "updated_at": "now()"
-        }).eq("id", chat_id).eq("crew_id", crew["id"]).eq("yacht_id", crew["yacht_id"]).execute()
-
-        return {
-            "answer": answer,
-            "sources": [],
-            "provider": "runpod_bridgeos",
-            "error": True
-        }
-
-    try:
-        data = response.json()
-    except Exception:
-        print("RUNPOD JSON PARSE ERROR:", response.text[:1000])
-
-        answer = FALLBACK_NO_DATA_ANSWER
-
-        supabase.table("messages").insert({
-            "chat_id": chat_id,
-            "yacht_id": crew["yacht_id"],
-            "crew_id": crew["id"],
-            "role": "assistant",
-            "content": answer
-        }).execute()
-
-        supabase.table("chats").update({
-            "updated_at": "now()"
-        }).eq("id", chat_id).eq("crew_id", crew["id"]).eq("yacht_id", crew["yacht_id"]).execute()
-
-        return {
-            "answer": answer,
-            "sources": [],
-            "provider": "runpod_bridgeos",
-            "error": True
-        }
-
-    answer = data.get("response") or FALLBACK_NO_DATA_ANSWER
-
-    supabase.table("messages").insert({
-        "chat_id": chat_id,
-        "yacht_id": crew["yacht_id"],
-        "crew_id": crew["id"],
-        "role": "assistant",
-        "content": answer
-    }).execute()
-
-    supabase.table("chats").update({
-        "updated_at": "now()"
-    }).eq("id", chat_id).eq("crew_id", crew["id"]).eq("yacht_id", crew["yacht_id"]).execute()
-
-    return {
-        "answer": answer,
-        "sources": [],
-        "provider": "runpod_bridgeos",
-        "error": False
-    }
 # ------------------------
 # CREW
 # ------------------------
@@ -8630,7 +8326,204 @@ def create_voice_note_and_answer(
             "mime_type": asset.get("mime_type"),
             "storage_path": asset.get("storage_path")
         }
+    
+
+def answer_financial_total_from_context(
+    query: str,
+    context: str,
+    matched_rows: list[dict]
+):
+    """
+    Extracts financial values from document context and calculates the total
+    in Python rather than allowing the LLM to invent or miscalculate it.
+    """
+
+    clean_query = str(query or "").strip().lower()
+
+    total_phrases = [
+        "how much did we spend",
+        "how much have we spent",
+        "how much we spent",
+        "what did we spend",
+        "what have we spent",
+        "total spent",
+        "total spend",
+        "total cost",
+        "total amount",
+        "grand total",
+        "sum of",
+        "add up"
+    ]
+
+    if not any(phrase in clean_query for phrase in total_phrases):
+        return None
+
+    if not context or not context.strip():
+        return None
+
+    try:
+        raw = ask_llm(
+            query=query,
+            context=f"""
+You extract monetary amounts from document evidence.
+
+Return ONLY valid JSON in this exact shape:
+
+{{
+  "currency": "EUR",
+  "amounts": [
+    {{
+      "label": "item or invoice name",
+      "amount": 125.50,
+      "evidence": "exact supporting text copied from the document"
+    }}
+  ]
+}}
+
+Rules:
+- Use only the supplied document context.
+- Extract only amounts relevant to the user's exact question.
+- Do not calculate the total.
+- Do not estimate.
+- Do not invent missing amounts.
+- Do not include subtotals when the corresponding final total is also included,
+  unless the user explicitly asks for subtotals.
+- Do not combine different currencies.
+- If currencies differ, return the currency as "MIXED".
+- Amount must be a JSON number without currency symbols.
+- Evidence must be copied from the supplied context.
+- If no supported amounts exist, return:
+  {{"currency": "", "amounts": []}}
+
+User question:
+{query}
+
+Document context:
+{context}
+""".strip()
+        )
+
+        parsed = parse_llm_json_response(raw)
+
+    except Exception as e:
+        print("FINANCIAL EXTRACTION ERROR:", type(e).__name__, str(e))
+        return None
+
+    if not parsed or not isinstance(parsed, dict):
+        return None
+
+    currency = str(parsed.get("currency") or "").strip()
+    amount_rows = parsed.get("amounts") or []
+
+    verified_amounts = []
+
+    for item in amount_rows:
+        if not isinstance(item, dict):
+            continue
+
+        label = str(item.get("label") or "").strip()
+        evidence = str(item.get("evidence") or "").strip()
+
+        try:
+            amount = float(item.get("amount"))
+        except (TypeError, ValueError):
+            continue
+
+        if amount < 0:
+            continue
+
+        if not evidence:
+            continue
+
+        evidence_normalised = " ".join(evidence.lower().split())
+
+        supporting_row = None
+
+        for row in matched_rows or []:
+            row_text = " ".join(
+                str(row.get("content") or "").lower().split()
+            )
+
+            if evidence_normalised and evidence_normalised in row_text:
+                supporting_row = row
+                break
+
+        if not supporting_row:
+            print("FINANCIAL EVIDENCE NOT VERIFIED:", evidence[:150])
+            continue
+
+        verified_amounts.append({
+            "label": label or "Amount",
+            "amount": amount,
+            "evidence": evidence,
+            "source_row": supporting_row
+        })
+
+    if not verified_amounts:
+        return None
+
+    if currency.upper() == "MIXED":
+        return {
+            "answer": (
+                "The documents contain amounts in different currencies, so I cannot "
+                "produce one accurate combined total without a conversion rate."
+            ),
+            "sources": build_sources_from_asset_results(
+                [item["source_row"] for item in verified_amounts]
+            )
+        }
+
+    total = sum(item["amount"] for item in verified_amounts)
+
+    symbol_lookup = {
+        "USD": "$",
+        "EUR": "€",
+        "GBP": "£"
     }
+
+    clean_currency = currency.upper()
+    currency_symbol = symbol_lookup.get(clean_currency, "")
+
+    lines = []
+
+    for item in verified_amounts:
+        formatted_amount = f"{item['amount']:,.2f}"
+
+        if currency_symbol:
+            amount_text = f"{currency_symbol}{formatted_amount}"
+        elif clean_currency:
+            amount_text = f"{formatted_amount} {clean_currency}"
+        else:
+            amount_text = formatted_amount
+
+        lines.append(f"- {item['label']}: {amount_text}")
+
+    formatted_total = f"{total:,.2f}"
+
+    if currency_symbol:
+        total_text = f"{currency_symbol}{formatted_total}"
+    elif clean_currency:
+        total_text = f"{formatted_total} {clean_currency}"
+    else:
+        total_text = formatted_total
+
+    answer = "\n".join([
+        f"The supported total is {total_text}.",
+        "",
+        *lines,
+        "",
+        "Calculation: "
+        + " + ".join(f"{item['amount']:,.2f}" for item in verified_amounts)
+        + f" = {formatted_total}"
+    ])
+
+    return {
+        "answer": answer,
+        "sources": build_sources_from_asset_results(
+            [item["source_row"] for item in verified_amounts]
+        )
+    }
+    
 
 def chat(
     query: str,
@@ -9040,22 +8933,33 @@ Rules:
         answer = FALLBACK_NO_DATA_ANSWER
         sources = []
 
-    elif is_file_listing_query(query):
-        listing_result = answer_file_listing_directly(
+    else:
+        financial_result = answer_financial_total_from_context(
             query=query,
-            rows=matched_rows
+            context=context,
+            matched_rows=matched_rows
         )
 
-        answer = listing_result.get("answer") or FALLBACK_NO_DATA_ANSWER
-        sources = listing_result.get("sources") or []
+        if financial_result:
+            answer = financial_result["answer"]
+            sources = financial_result["sources"]
 
-        if answer.strip() == FALLBACK_NO_DATA_ANSWER:
-            sources = []
+        elif is_file_listing_query(query):
+            listing_result = answer_file_listing_directly(
+                query=query,
+                rows=matched_rows
+            )
 
-    else:
-        raw_answer = ask_llm(
-            query=query,
-            context=f"""
+            answer = listing_result.get("answer") or FALLBACK_NO_DATA_ANSWER
+            sources = listing_result.get("sources") or []
+
+            if answer.strip() == FALLBACK_NO_DATA_ANSWER:
+                sources = []
+
+        else:
+            raw_answer = ask_llm(
+                query=query,
+                context=f"""
 You are BridgeOS, a private document-based assistant.
 
 Always respond in British English.
@@ -9220,14 +9124,8 @@ Document context:
             else:
                 print("LOCAL CHAT SOURCE VERIFICATION FAILED")
 
-                # Soft fallback for expanded full-document context:
-                # If the model produced an answer from full context but quote verification failed
-                # due to table/OCR formatting, keep the answer and attach the first rows from the expanded document.
-                if matched_rows and answer and answer.strip() != FALLBACK_NO_DATA_ANSWER:
-                    sources = build_sources_from_asset_results(matched_rows[:3])
-                else:
-                    answer = FALLBACK_NO_DATA_ANSWER
-                    sources = []
+                answer = FALLBACK_NO_DATA_ANSWER
+                sources = []
 
         else:
             sources = []
