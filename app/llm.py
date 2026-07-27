@@ -1,71 +1,192 @@
-import requests
+from openai import OpenAI
 
-from app.config import RUNPOD_BASE_URL, BRIDGEOS_API_KEY
-
-
-FALLBACK_NO_DATA_ANSWER = (
-    "Sorry, I don't have this data yet. Please ask your admin to upload it."
+from app.config import (
+    OPENAI_API_KEY,
+    OPENAI_CHAT_MODEL
 )
 
 
-def ask_llm(query: str, context: str) -> str:
-    if not RUNPOD_BASE_URL:
-        print("RUNPOD LLM ERROR: RUNPOD_BASE_URL missing")
-        return "RunPod config error: RUNPOD_BASE_URL missing"
+FALLBACK_NO_DATA_ANSWER = (
+    "Sorry, I could not find enough information "
+    "in the available documents to answer that."
+)
 
-    if not BRIDGEOS_API_KEY:
-        print("RUNPOD LLM ERROR: BRIDGEOS_API_KEY missing")
-        return "RunPod config error: BRIDGEOS_API_KEY missing"
 
-    url = f"{RUNPOD_BASE_URL.rstrip('/')}/api/bridgeos/generate"
+_openai_client = None
 
-    prompt = f"""
-{context or ""}
 
-Current user request:
-{query}
+def get_openai_client() -> OpenAI:
+    """
+    Creates and reuses one OpenAI client.
+
+    The API key is read from the backend environment through app.config.
+    """
+
+    global _openai_client
+
+    if not OPENAI_API_KEY:
+        raise RuntimeError(
+            "OPENAI_API_KEY is missing from the backend environment."
+        )
+
+    if _openai_client is None:
+        _openai_client = OpenAI(
+            api_key=OPENAI_API_KEY,
+            timeout=120.0,
+            max_retries=2
+        )
+
+    return _openai_client
+
+
+def extract_openai_response_text(response) -> str:
+    """
+    Extracts the final text from an OpenAI Responses API response.
+    """
+
+    direct_text = getattr(
+        response,
+        "output_text",
+        None
+    )
+
+    if direct_text:
+        return str(direct_text).strip()
+
+    text_parts = []
+
+    output_items = getattr(
+        response,
+        "output",
+        None
+    ) or []
+
+    for output_item in output_items:
+        content_items = getattr(
+            output_item,
+            "content",
+            None
+        ) or []
+
+        for content_item in content_items:
+            content_text = getattr(
+                content_item,
+                "text",
+                None
+            )
+
+            if content_text:
+                text_parts.append(
+                    str(content_text)
+                )
+
+    return "\n".join(
+        text_parts
+    ).strip()
+
+
+def ask_llm(
+    query: str,
+    context: str = ""
+) -> str:
+    """
+    Main BridgeOS language-model function.
+
+    Existing code can continue calling:
+
+        ask_llm(
+            query=query,
+            context=context
+        )
+
+    No services.py call sites need to change.
+    """
+
+    clean_query = str(
+        query or ""
+    ).strip()
+
+    clean_context = str(
+        context or ""
+    ).strip()
+
+    if not clean_query:
+        return ""
+
+    client = get_openai_client()
+
+    system_instructions = """
+You are BridgeOS, a private document-based assistant.
+
+Follow the instructions contained in the supplied context.
+
+Rules:
+- Use British English unless the requested format requires otherwise.
+- When document context is supplied, use only that document context
+  for factual answers.
+- Do not invent facts, names, numbers, dates, sources, values or events.
+- When asked to return JSON, return valid JSON only.
+- Do not wrap JSON in markdown code fences.
+- Preserve monetary values, decimal separators, quantities and currencies.
+- Do not perform approximate arithmetic when exact values are available.
+- Follow the requested output structure exactly.
+- Return only the requested answer or structured result.
 """.strip()
 
+    if clean_context:
+        user_input = f"""
+Instructions and document context:
+{clean_context}
+
+User request:
+{clean_query}
+""".strip()
+
+    else:
+        user_input = clean_query
+
     try:
-        response = requests.post(
-            url,
-            json={
-                "prompt": prompt,
-                "max_tokens": 2500,
-                "max_new_tokens": 2500,
-                "max_output_tokens": 2500,
-                "temperature": 0.1
-            },
-            headers={
-                "Content-Type": "application/json",
-                "x-api-key": BRIDGEOS_API_KEY
-            },
-            timeout=180
+        response = client.responses.create(
+            model=OPENAI_CHAT_MODEL,
+            instructions=system_instructions,
+            input=user_input
         )
 
-        print("RUNPOD GENERATE DEBUG: url:", url)
-        print("RUNPOD GENERATE DEBUG: status:", response.status_code)
-        print("RUNPOD GENERATE DEBUG: response:", response.text[:1000])
-
-        if response.status_code >= 400:
-            return f"RunPod generate error {response.status_code}: {response.text[:500]}"
-
-        data = response.json()
-
-        answer = (
-            data.get("response")
-            or data.get("answer")
-            or data.get("message")
-            or ""
+        answer = extract_openai_response_text(
+            response
         )
 
-        answer = str(answer or "").strip()
-
-        if not answer:
-            return "RunPod returned an empty response."
+        print(
+            "OPENAI LLM RESPONSE:",
+            {
+                "model": OPENAI_CHAT_MODEL,
+                "query_characters": len(
+                    clean_query
+                ),
+                "context_characters": len(
+                    clean_context
+                ),
+                "answer_characters": len(
+                    answer
+                )
+            }
+        )
 
         return answer
 
-    except Exception as e:
-        print("RUNPOD GENERATE REQUEST ERROR:", type(e).__name__, str(e))
-        return f"RunPod request error: {type(e).__name__}: {str(e)}"
+    except Exception as error:
+        print(
+            "OPENAI LLM ERROR:",
+            {
+                "model": OPENAI_CHAT_MODEL,
+                "error_type": type(
+                    error
+                ).__name__,
+                "error": str(error)
+            }
+        )
+
+        raise RuntimeError(
+            "OpenAI generation failed: "
+            f"{type(error).__name__}: {str(error)}"
+        ) from error
