@@ -9827,6 +9827,407 @@ def answer_financial_total_from_context(
         "sources": sources
     }
 
+def answer_subject_spending_from_context(
+    query: str,
+    context: str,
+    matched_rows: list[dict]
+):
+    """
+    Calculates the monetary amount associated with a requested subject.
+
+    Behaviour:
+    - Calculates each matching row separately.
+    - Combines matching rows across multiple invoices.
+    - Uses Decimal for every calculation.
+    - Never combines different known currencies.
+    - Does not require a currency symbol to calculate numeric totals.
+    """
+
+    subject = extract_spending_subject(
+        query
+    )
+
+    if not subject:
+        return None
+
+    if not str(context or "").strip() or not matched_rows:
+        return {
+            "answer": FALLBACK_NO_DATA_ANSWER,
+            "sources": []
+        }
+
+    extracted_items = extract_subject_line_items_with_llm(
+        query=query,
+        subject=subject,
+        context=context
+    )
+
+    print(
+        "SUBJECT SPENDING EXTRACTED ITEMS:",
+        [
+            {
+                "description": item.get("description"),
+                "unit_price": str(item.get("unit_price")),
+                "quantity": str(item.get("quantity")),
+                "explicit_line_total": str(
+                    item.get("explicit_line_total")
+                ),
+                "amount": str(item.get("amount")),
+                "currency": item.get("currency"),
+                "source_number": item.get("source_number"),
+                "amount_method": item.get("amount_method")
+            }
+            for item in extracted_items
+        ]
+    )
+
+    if not extracted_items:
+        return {
+            "answer": (
+                f"I found no row for {subject} with a verifiable "
+                "unit price and quantity or line total."
+            ),
+            "sources": []
+        }
+
+    # ---------------------------------------------------------
+    # DEDUPLICATE OCR / EXTRACTED-TEXT COPIES
+    # ---------------------------------------------------------
+    unique_items = []
+    seen = set()
+
+    for item in extracted_items:
+        evidence_key = normalise_search_text(
+            item.get("evidence") or ""
+        )
+
+        key = (
+            item.get("source_number"),
+            normalise_search_text(
+                item.get("description") or ""
+            ),
+            item.get("unit_price"),
+            item.get("quantity"),
+            item.get("amount"),
+            evidence_key
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        unique_items.append(item)
+
+    extracted_items = unique_items
+
+    # ---------------------------------------------------------
+    # RESOLVE CURRENCY FROM EACH SOURCE WHEN POSSIBLE
+    # ---------------------------------------------------------
+    source_currency_lookup = {}
+
+    for source_index, row in enumerate(
+        matched_rows,
+        start=1
+    ):
+        source_text = str(
+            row.get("search_text")
+            or row.get("content")
+            or ""
+        )
+
+        verified_currency = determine_currency_from_document(
+            source_text
+        )
+
+        if verified_currency:
+            source_currency_lookup[
+                source_index
+            ] = verified_currency
+
+    for item in extracted_items:
+        if item.get("currency"):
+            continue
+
+        source_number = item.get("source_number")
+
+        if source_number in source_currency_lookup:
+            item["currency"] = source_currency_lookup[
+                source_number
+            ]
+
+    known_currencies = {
+        item.get("currency")
+        for item in extracted_items
+        if item.get("currency")
+    }
+
+    # Rows without a currency can be combined only when there is
+    # no conflicting known currency.
+    if len(known_currencies) == 1:
+        only_currency = next(
+            iter(known_currencies)
+        )
+
+        for item in extracted_items:
+            if not item.get("currency"):
+                item["currency"] = only_currency
+
+    final_currencies = {
+        item.get("currency")
+        for item in extracted_items
+        if item.get("currency")
+    }
+
+    has_unknown_currency = any(
+        not item.get("currency")
+        for item in extracted_items
+    )
+
+    # Do not combine known conflicting currencies.
+    if len(final_currencies) > 1:
+        answer_lines = [
+            (
+                f"The verified {subject} rows use different currencies, "
+                "so they cannot be combined into one total."
+            ),
+            ""
+        ]
+
+        for currency in sorted(final_currencies):
+            currency_items = [
+                item
+                for item in extracted_items
+                if item.get("currency") == currency
+            ]
+
+            currency_total = sum(
+                (
+                    item["amount"]
+                    for item in currency_items
+                ),
+                Decimal("0.00")
+            ).quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP
+            )
+
+            answer_lines.append(
+                f"{currency}: "
+                f"{format_currency_amount(currency_total, currency)}"
+            )
+
+            for item in currency_items:
+                unit_price = item.get("unit_price")
+                quantity = item.get("quantity")
+                amount = item["amount"]
+
+                if (
+                    unit_price is not None
+                    and quantity is not None
+                ):
+                    answer_lines.append(
+                        f"- {item['description']}: "
+                        f"{format_number_for_answer(unit_price)} × "
+                        f"{format_number_for_answer(quantity)} = "
+                        f"{format_currency_amount(amount, currency)}"
+                    )
+                else:
+                    answer_lines.append(
+                        f"- {item['description']}: "
+                        f"{format_currency_amount(amount, currency)}"
+                    )
+
+        relevant_rows = []
+
+        for item in extracted_items:
+            source_number = item.get("source_number")
+
+            if (
+                isinstance(source_number, int)
+                and 1 <= source_number <= len(matched_rows)
+            ):
+                relevant_rows.append(
+                    matched_rows[source_number - 1]
+                )
+
+        return {
+            "answer": "\n".join(answer_lines),
+            "sources": build_sources_from_asset_results(
+                relevant_rows
+            )
+        }
+
+    # ---------------------------------------------------------
+    # CALCULATE COMBINED TOTAL
+    # ---------------------------------------------------------
+    total = sum(
+        (
+            item["amount"]
+            for item in extracted_items
+        ),
+        Decimal("0.00")
+    ).quantize(
+        Decimal("0.01"),
+        rounding=ROUND_HALF_UP
+    )
+
+    single_currency = None
+
+    if len(final_currencies) == 1:
+        single_currency = next(
+            iter(final_currencies)
+        )
+
+    if single_currency:
+        formatted_total = format_currency_amount(
+            total,
+            single_currency
+        )
+    else:
+        formatted_total = format_number_for_answer(
+            total
+        )
+
+    answer_lines = [
+        (
+            f"The verified total associated with {subject} is "
+            f"{formatted_total}."
+        ),
+        ""
+    ]
+
+    # ---------------------------------------------------------
+    # SHOW EACH INVOICE/ROW CALCULATION
+    # ---------------------------------------------------------
+    for index, item in enumerate(
+        extracted_items,
+        start=1
+    ):
+        unit_price = item.get("unit_price")
+        quantity = item.get("quantity")
+        amount = item["amount"]
+        currency = item.get("currency")
+
+        if currency:
+            formatted_amount = format_currency_amount(
+                amount,
+                currency
+            )
+
+            formatted_unit_price = (
+                format_currency_amount(
+                    unit_price,
+                    currency
+                )
+                if unit_price is not None
+                else ""
+            )
+        else:
+            formatted_amount = format_number_for_answer(
+                amount
+            )
+
+            formatted_unit_price = (
+                format_number_for_answer(
+                    unit_price
+                )
+                if unit_price is not None
+                else ""
+            )
+
+        source_label = ""
+
+        source_number = item.get("source_number")
+
+        if isinstance(source_number, int):
+            source_label = f"Source {source_number} — "
+
+        if (
+            unit_price is not None
+            and quantity is not None
+        ):
+            answer_lines.append(
+                f"- {source_label}{item['description']}: "
+                f"{formatted_unit_price} × "
+                f"{format_number_for_answer(quantity)} = "
+                f"{formatted_amount}"
+            )
+
+        else:
+            answer_lines.append(
+                f"- {source_label}{item['description']}: "
+                f"{formatted_amount}"
+            )
+
+    # Show aggregation when multiple invoices/rows matched.
+    if len(extracted_items) > 1:
+        calculation_parts = [
+            format_number_for_answer(
+                item["amount"]
+            )
+            for item in extracted_items
+        ]
+
+        answer_lines.extend([
+            "",
+            (
+                "Combined calculation: "
+                + " + ".join(calculation_parts)
+                + " = "
+                + format_number_for_answer(total)
+            )
+        ])
+
+    if has_unknown_currency and not single_currency:
+        answer_lines.extend([
+            "",
+            (
+                "The source does not show a verifiable currency, "
+                "so the result is reported as a numeric amount."
+            )
+        ])
+
+    # ---------------------------------------------------------
+    # INCLUDE ONLY SOURCES THAT CONTRIBUTED TO THE TOTAL
+    # ---------------------------------------------------------
+    relevant_rows = []
+    relevant_row_keys = set()
+
+    for item in extracted_items:
+        source_number = item.get("source_number")
+
+        if not isinstance(source_number, int):
+            continue
+
+        source_index = source_number - 1
+
+        if not 0 <= source_index < len(matched_rows):
+            continue
+
+        row = matched_rows[source_index]
+
+        row_key = (
+            row.get("asset_id"),
+            row.get("chunk_index"),
+            row.get("content_type")
+        )
+
+        if row_key in relevant_row_keys:
+            continue
+
+        relevant_row_keys.add(row_key)
+        relevant_rows.append(row)
+
+    if not relevant_rows:
+        relevant_rows = matched_rows[:3]
+
+    return {
+        "answer": "\n".join(answer_lines),
+        "sources": build_sources_from_asset_results(
+            relevant_rows
+        )
+    }
+
 def chat(
     query: str,
     crew_id: str,
