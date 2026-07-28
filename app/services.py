@@ -1,10 +1,35 @@
-from fastapi import HTTPException
+
+Auth.py: from fastapi import Request, HTTPException
+from supabase import create_client
+import jwt as pyjwt
+
+from app.config import SUPABASE_URL, SUPABASE_SERVICE_KEY, SUPABASE_JWT_SECRET
+
+
+auth_client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+
+from fastapi import HTTPException, Request
 import requests
 import json
+import random
+import hashlib
+import smtplib
+from openai import OpenAI
+from email.message import EmailMessage
 from app.database import supabase
 from app.embeddings import embed
-from app.config import BUCKET_NAME, RUNPOD_BASE_URL, BRIDGEOS_API_KEY
-from app.llm import ask_llm, FALLBACK_NO_DATA_ANSWER
+from app.config import (
+    BUCKET_NAME,
+    API_SYNC_TIMEOUT_SECONDS,
+    GMAIL_SYNC_MAX_RESULTS,
+    OPENAI_CHAT_MODEL,
+    OPENAI_TRANSCRIPTION_MODEL
+)
+from app.llm import (
+    ask_llm,
+    FALLBACK_NO_DATA_ANSWER,
+    get_openai_client
+)
 from app.file_utils import detect_file_type, calculate_file_hash, safe_filename
 from app.metadata_utils import (
     extract_date_from_filename,
@@ -19,18 +44,47 @@ from app.extractors import (
 )
 from app.image_ai import (
     describe_image,
-    extract_ocr_from_image
+    extract_ocr_from_image,
+    extract_ocr_from_pdf_pages
 )
 
+import base64
+from email.utils import parsedate_to_datetime
 
 import time
 import uuid
 import jwt as pyjwt
 import io
+import re
+import zipfile
+import ast
+import operator
 from urllib.parse import quote
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
-from app.config import SUPABASE_JWT_SECRET, SUPABASE_URL, SUPABASE_SERVICE_KEY
+from app.config import (
+    OPENAI_EMBEDDING_MODEL,
+    OPENAI_EMBEDDING_DIMENSIONS,
+    SUPABASE_JWT_SECRET,
+    SUPABASE_URL,
+    SUPABASE_SERVICE_KEY,
+    SMTP_HOST,
+    SMTP_PORT,
+    SMTP_USERNAME,
+    SMTP_PASSWORD,
+    SMTP_FROM_EMAIL,
+    SMTP_FROM_NAME,
+    BREVO_API_KEY,
+    BREVO_FROM_EMAIL,
+    BREVO_FROM_NAME,
+    BREVO_API_URL,
+    WHATSAPP_WEBHOOK_VERIFY_TOKEN,
+    META_APP_ID,
+    META_APP_SECRET,
+    META_GRAPH_VERSION
+)
+
 from supabase import create_client
 
 auth_admin = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
@@ -39,6 +93,767 @@ storage_admin = create_client(
     SUPABASE_URL,
     SUPABASE_SERVICE_KEY
 )
+
+FINANCIAL_EXTRACTION_CACHE: dict[str, list[dict]] = {}
+
+# ------------------------
+# WHATSAPP EXPORT UPLOADS
+# ------------------------
+
+WHATSAPP_EXPORT_LINE_PATTERNS = [
+    re.compile(
+        r"^(?P<date>\d{1,2}/\d{1,2}/\d{2,4}),?\s+"
+        r"(?P<time>\d{1,2}:\d{2}(?::\d{2})?(?:\s?[AP]M)?)\s+-\s+"
+        r"(?P<sender>[^:]{1,120}):\s*(?P<message>.*)$"
+    ),
+    re.compile(
+        r"^\[(?P<date>\d{1,2}/\d{1,2}/\d{2,4}),?\s+"
+        r"(?P<time>\d{1,2}:\d{2}(?::\d{2})?(?:\s?[AP]M)?)\]\s+"
+        r"(?P<sender>[^:]{1,120}):\s*(?P<message>.*)$"
+    ),
+]
+
+
+def parse_whatsapp_export_messages(text: str) -> list[dict]:
+    if not text:
+        return []
+
+    messages = []
+    current_message = None
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip("\ufeff").rstrip()
+        matched = None
+
+        for pattern in WHATSAPP_EXPORT_LINE_PATTERNS:
+            matched = pattern.match(line)
+            if matched:
+                break
+
+        if matched:
+            if current_message:
+                messages.append(current_message)
+
+            current_message = {
+                "date": matched.group("date"),
+                "time": matched.group("time"),
+                "sender": matched.group("sender").strip(),
+                "message": matched.group("message").strip(),
+            }
+        else:
+            if current_message and line:
+                current_message["message"] += "\n" + line
+
+    if current_message:
+        messages.append(current_message)
+
+    return messages
+
+
+def is_whatsapp_export_text(text: str, filename: str | None = None) -> bool:
+    lower_filename = (filename or "").lower()
+
+    if "whatsapp" in lower_filename and lower_filename.endswith(".txt"):
+        return True
+
+    if not text:
+        return False
+
+    messages = parse_whatsapp_export_messages(text)
+
+    if len(messages) >= 3:
+        return True
+
+    lower_text = text[:3000].lower()
+
+    markers = [
+        "messages and calls are end-to-end encrypted",
+        "changed the subject",
+        "created group",
+        "added you",
+        "left",
+        "image omitted",
+        "video omitted",
+        "audio omitted",
+        "sticker omitted",
+    ]
+
+    return any(marker in lower_text for marker in markers)
+
+
+def format_whatsapp_messages_for_analysis(messages: list[dict], filename: str | None = None) -> str:
+    if not messages:
+        return ""
+
+    sender_counts = {}
+
+    for item in messages:
+        sender = item.get("sender") or "Unknown"
+        sender_counts[sender] = sender_counts.get(sender, 0) + 1
+
+    sender_summary = "\n".join(
+        f"- {sender}: {count} messages"
+        for sender, count in sorted(sender_counts.items(), key=lambda pair: pair[1], reverse=True)
+    )
+
+    formatted_messages = []
+
+    for item in messages:
+        formatted_messages.append(
+            f"[{item.get('date', '')} {item.get('time', '')}] "
+            f"{item.get('sender', 'Unknown')}: {item.get('message', '')}"
+        )
+
+    return "\n\n".join([
+        "WhatsApp chat export",
+        f"File name: {filename or 'WhatsApp export'}",
+        f"Total parsed messages: {len(messages)}",
+        "Participants:",
+        sender_summary,
+        "Messages:",
+        "\n".join(formatted_messages),
+    ]).strip()
+
+
+def normalise_whatsapp_export_text(text: str, filename: str | None = None) -> tuple[str, list[dict]]:
+    messages = parse_whatsapp_export_messages(text)
+
+    if not messages:
+        return text or "", []
+
+    return format_whatsapp_messages_for_analysis(messages, filename), messages
+
+
+def extract_whatsapp_zip_payload(file, filename: str) -> tuple[str, list[dict], str]:
+    file.seek(0)
+    zip_bytes = file.read()
+    file.seek(0)
+
+    archive = zipfile.ZipFile(io.BytesIO(zip_bytes))
+
+    txt_names = [
+        name
+        for name in archive.namelist()
+        if name.lower().endswith(".txt")
+        and "__macosx" not in name.lower()
+        and not name.endswith("/")
+    ]
+
+    if not txt_names:
+        raise ValueError("No .txt WhatsApp chat file was found inside the .zip export.")
+
+    preferred_name = None
+
+    for name in txt_names:
+        lower_name = name.lower()
+
+        if "whatsapp" in lower_name or "chat" in lower_name:
+            preferred_name = name
+            break
+
+    txt_name = preferred_name or txt_names[0]
+    raw_bytes = archive.read(txt_name)
+
+    try:
+        raw_text = raw_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raw_text = raw_bytes.decode("latin-1", errors="replace")
+
+    normalised_text, messages = normalise_whatsapp_export_text(raw_text, txt_name or filename)
+
+    return normalised_text, messages, txt_name
+
+
+def save_whatsapp_chat_history(
+    asset_id: str,
+    yacht_id: str,
+    chat_id: str | None,
+    uploaded_by: str | None,
+    original_file_name: str,
+    source_text_file_name: str | None,
+    messages: list[dict]
+):
+    if not messages:
+        return
+
+    sender_counts = {}
+
+    for item in messages:
+        sender = item.get("sender") or "Unknown"
+        sender_counts[sender] = sender_counts.get(sender, 0) + 1
+
+    first = messages[0]
+    last = messages[-1]
+
+    export_res = supabase.table("whatsapp_chat_exports").upsert({
+        "asset_id": asset_id,
+        "yacht_id": yacht_id,
+        "chat_id": chat_id,
+        "uploaded_by": uploaded_by,
+        "original_file_name": original_file_name,
+        "source_text_file_name": source_text_file_name,
+        "message_count": len(messages),
+        "participants": sender_counts,
+        "first_message_label": f"{first.get('date', '')} {first.get('time', '')}".strip(),
+        "last_message_label": f"{last.get('date', '')} {last.get('time', '')}".strip(),
+        "updated_at": "now()"
+    }, on_conflict="asset_id").execute()
+
+    if not export_res.data:
+        raise RuntimeError("Could not save WhatsApp export row.")
+
+    export_id = export_res.data[0]["id"]
+
+    supabase.table("whatsapp_chat_messages").delete().eq("asset_id", asset_id).execute()
+
+    rows = []
+
+    for index, item in enumerate(messages):
+        date_raw = item.get("date") or ""
+        time_raw = item.get("time") or ""
+
+        rows.append({
+            "export_id": export_id,
+            "asset_id": asset_id,
+            "yacht_id": yacht_id,
+            "chat_id": chat_id,
+            "uploaded_by": uploaded_by,
+            "message_index": index,
+            "sender_name": item.get("sender") or "Unknown",
+            "message_text": clean_text_for_postgres(item.get("message") or ""),
+            "message_date_raw": date_raw or None,
+            "message_time_raw": time_raw or None,
+            "message_label": f"{date_raw} {time_raw}".strip() or None,
+        })
+
+    for start in range(0, len(rows), 500):
+        supabase.table("whatsapp_chat_messages").insert(rows[start:start + 500]).execute()
+
+# ------------------------
+# WHATSAPP BUSINESS CLOUD API
+# ------------------------
+
+def verify_whatsapp_webhook_token(token: str | None) -> bool:
+    clean_token = (token or "").strip()
+
+    if not clean_token:
+        return False
+
+    if WHATSAPP_WEBHOOK_VERIFY_TOKEN and clean_token == WHATSAPP_WEBHOOK_VERIFY_TOKEN:
+        return True
+
+    res = supabase.table("whatsapp_connections") \
+        .select("id") \
+        .eq("verify_token", clean_token) \
+        .eq("is_active", True) \
+        .limit(1) \
+        .execute()
+
+    return bool(res.data)
+
+
+def exchange_whatsapp_code_for_token(code: str) -> dict:
+    """
+    Used after Meta Embedded Signup redirects back with a code.
+    """
+
+    url = f"https://graph.facebook.com/{META_GRAPH_VERSION}/oauth/access_token"
+
+    params = {
+        "client_id": META_APP_ID,
+        "client_secret": META_APP_SECRET,
+        "code": code,
+    }
+
+    res = requests.get(url, params=params, timeout=30)
+
+    if res.status_code >= 400:
+        raise RuntimeError(f"Meta token exchange failed: {res.text}")
+
+    return res.json()
+
+
+def save_client_whatsapp_connection(
+    yacht_id: str,
+    crew_id: str,
+    client_name: str | None,
+    waba_id: str | None,
+    phone_number_id: str,
+    display_phone_number: str | None,
+    access_token: str
+):
+    verify_token = WHATSAPP_WEBHOOK_VERIFY_TOKEN or f"bridgeos-whatsapp-{uuid.uuid4()}"
+
+    payload = {
+        "yacht_id": yacht_id,
+        "created_by": crew_id,
+        "client_name": client_name,
+        "waba_id": waba_id,
+        "phone_number_id": phone_number_id,
+        "display_phone_number": display_phone_number,
+        "verify_token": verify_token,
+        "access_token": access_token,
+        "is_active": True,
+        "updated_at": "now()"
+    }
+
+    res = supabase.table("whatsapp_connections") \
+        .upsert(payload, on_conflict="phone_number_id") \
+        .execute()
+
+    if not res.data:
+        raise RuntimeError("Could not save WhatsApp connection.")
+
+    return res.data[0]
+
+
+def get_whatsapp_connection_by_phone_number_id(phone_number_id: str | None):
+    if not phone_number_id:
+        return None
+
+    res = supabase.table("whatsapp_connections") \
+        .select("*") \
+        .eq("phone_number_id", phone_number_id) \
+        .eq("is_active", True) \
+        .limit(1) \
+        .execute()
+
+    if not res.data:
+        return None
+
+    return res.data[0]
+
+
+def parse_whatsapp_timestamp(timestamp_raw: str | None):
+    if not timestamp_raw:
+        return None
+
+    try:
+        return datetime.fromtimestamp(int(timestamp_raw), tz=timezone.utc).isoformat()
+    except Exception:
+        return None
+
+
+def extract_whatsapp_message_text(message: dict) -> str:
+    message_type = message.get("type")
+
+    if message_type == "text":
+        return (message.get("text") or {}).get("body") or ""
+
+    if message_type == "button":
+        return (message.get("button") or {}).get("text") or ""
+
+    if message_type == "interactive":
+        interactive = message.get("interactive") or {}
+        button_reply = interactive.get("button_reply") or {}
+        list_reply = interactive.get("list_reply") or {}
+
+        return (
+            button_reply.get("title")
+            or list_reply.get("title")
+            or list_reply.get("description")
+            or ""
+        )
+
+    if message_type == "image":
+        return (message.get("image") or {}).get("caption") or "[Image message]"
+
+    if message_type == "document":
+        document = message.get("document") or {}
+        return document.get("caption") or document.get("filename") or "[Document message]"
+
+    if message_type == "audio":
+        return "[Audio message]"
+
+    if message_type == "video":
+        return (message.get("video") or {}).get("caption") or "[Video message]"
+
+    if message_type == "sticker":
+        return "[Sticker message]"
+
+    if message_type == "location":
+        location = message.get("location") or {}
+        return f"[Location] {location.get('latitude', '')}, {location.get('longitude', '')}".strip()
+
+    if message_type == "contacts":
+        return "[Contact card]"
+
+    return f"[Unsupported WhatsApp message type: {message_type}]"
+
+
+def get_whatsapp_media_info(message: dict) -> dict:
+    message_type = message.get("type")
+
+    if message_type not in ["image", "document", "audio", "video", "sticker"]:
+        return {}
+
+    media = message.get(message_type) or {}
+
+    return {
+        "media_id": media.get("id"),
+        "media_mime_type": media.get("mime_type"),
+        "media_sha256": media.get("sha256"),
+    }
+
+
+def ensure_whatsapp_conversation_asset(
+    connection: dict,
+    contact_wa_id: str,
+    contact_name: str | None
+):
+    yacht_id = connection["yacht_id"]
+    connection_id = connection["id"]
+
+    conversation_res = supabase.table("whatsapp_conversations") \
+        .select("*") \
+        .eq("connection_id", connection_id) \
+        .eq("contact_wa_id", contact_wa_id) \
+        .limit(1) \
+        .execute()
+
+    if conversation_res.data:
+        conversation = conversation_res.data[0]
+
+        if conversation.get("asset_id"):
+            return conversation
+    else:
+        conversation_insert = supabase.table("whatsapp_conversations").insert({
+            "connection_id": connection_id,
+            "yacht_id": yacht_id,
+            "contact_wa_id": contact_wa_id,
+            "contact_name": contact_name,
+            "message_count": 0
+        }).execute()
+
+        if not conversation_insert.data:
+            raise RuntimeError("Could not create WhatsApp conversation row.")
+
+        conversation = conversation_insert.data[0]
+
+    asset_title = f"WhatsApp - {contact_name or contact_wa_id}.txt"
+    asset_id = str(uuid.uuid4())
+
+    asset_res = supabase.table("assets").insert({
+        "id": asset_id,
+        "yacht_id": yacht_id,
+        "chat_id": None,
+        "uploaded_by": connection.get("created_by"),
+        "security_level": 1,
+        "folder_name": "WhatsApp",
+        "folder_security_level": 1,
+        "file_name": asset_title,
+        "original_file_name": asset_title,
+        "original_relative_path": None,
+        "file_hash": f"whatsapp-api-{connection_id}-{contact_wa_id}",
+        "file_type": "whatsapp_api_chat",
+        "mime_type": "text/plain",
+        "storage_path": f"whatsapp-api/{connection_id}/{contact_wa_id}.txt",
+        "file_url": None,
+        "processing_status": "processed",
+        "summary": f"WhatsApp API conversation with {contact_name or contact_wa_id}"
+    }).execute()
+
+    if not asset_res.data:
+        raise RuntimeError("Could not create WhatsApp conversation asset.")
+
+    supabase.table("whatsapp_conversations").update({
+        "asset_id": asset_id,
+        "updated_at": "now()"
+    }).eq("id", conversation["id"]).execute()
+
+    conversation["asset_id"] = asset_id
+
+    return conversation
+
+
+def append_whatsapp_message_chunk(
+    asset_id: str,
+    yacht_id: str,
+    security_level: int,
+    message_index: int,
+    sender_name: str | None,
+    contact_wa_id: str,
+    message_text: str,
+    message_label: str | None,
+    message_type: str | None
+):
+    content = f"""
+WhatsApp message
+Sender: {sender_name or contact_wa_id}
+WhatsApp ID: {contact_wa_id}
+Message label: {message_label or ""}
+Message type: {message_type or ""}
+Content:
+{message_text}
+""".strip()
+
+    supabase.table("asset_chunks").insert({
+        "asset_id": asset_id,
+        "yacht_id": yacht_id,
+        "chat_id": None,
+        "security_level": security_level,
+        "content": content,
+        "content_type": "whatsapp_api_message",
+        "chunk_index": message_index,
+        "detected_date": None,
+        "detected_year": None,
+        "tags": ["whatsapp", "api", "message"],
+        "embedding": embed(content)
+    }).execute()
+
+
+def save_whatsapp_api_message(
+    connection: dict,
+    contact: dict,
+    message: dict,
+    raw_value: dict
+):
+    metadata = raw_value.get("metadata") or {}
+    phone_number_id = metadata.get("phone_number_id") or connection.get("phone_number_id")
+
+    contact_wa_id = contact.get("wa_id") or message.get("from")
+    contact_name = ((contact.get("profile") or {}).get("name")) or contact_wa_id
+
+    if not contact_wa_id:
+        return
+
+    wa_message_id = message.get("id")
+
+    if not wa_message_id:
+        return
+
+    existing = supabase.table("whatsapp_api_messages") \
+        .select("id") \
+        .eq("wa_message_id", wa_message_id) \
+        .limit(1) \
+        .execute()
+
+    if existing.data:
+        return
+
+    conversation = ensure_whatsapp_conversation_asset(
+        connection=connection,
+        contact_wa_id=contact_wa_id,
+        contact_name=contact_name
+    )
+
+    asset_id = conversation.get("asset_id")
+    yacht_id = connection["yacht_id"]
+
+    timestamp_raw = message.get("timestamp")
+    timestamp_at = parse_whatsapp_timestamp(timestamp_raw)
+    message_type = message.get("type")
+    message_text = extract_whatsapp_message_text(message)
+    media_info = get_whatsapp_media_info(message)
+
+    current_count = int(conversation.get("message_count") or 0)
+    next_index = current_count + 1
+
+    supabase.table("whatsapp_api_messages").insert({
+        "connection_id": connection["id"],
+        "conversation_id": conversation["id"],
+        "yacht_id": yacht_id,
+        "asset_id": asset_id,
+        "wa_message_id": wa_message_id,
+        "direction": "inbound",
+        "from_wa_id": message.get("from"),
+        "to_phone_number_id": phone_number_id,
+        "sender_name": contact_name,
+        "message_type": message_type,
+        "message_text": clean_text_for_postgres(message_text),
+        "media_id": media_info.get("media_id"),
+        "media_mime_type": media_info.get("media_mime_type"),
+        "media_sha256": media_info.get("media_sha256"),
+        "timestamp_raw": timestamp_raw,
+        "timestamp_at": timestamp_at,
+        "raw_payload": message
+    }).execute()
+
+    supabase.table("whatsapp_conversations").update({
+        "contact_name": contact_name,
+        "message_count": next_index,
+        "first_message_at": conversation.get("first_message_at") or timestamp_at,
+        "last_message_at": timestamp_at,
+        "updated_at": "now()"
+    }).eq("id", conversation["id"]).execute()
+
+    if asset_id:
+        append_whatsapp_message_chunk(
+            asset_id=asset_id,
+            yacht_id=yacht_id,
+            security_level=1,
+            message_index=next_index,
+            sender_name=contact_name,
+            contact_wa_id=contact_wa_id,
+            message_text=message_text,
+            message_label=timestamp_at or timestamp_raw,
+            message_type=message_type
+        )
+
+        supabase.table("assets").update({
+            "summary": clean_text_for_postgres(
+                f"WhatsApp API conversation with {contact_name or contact_wa_id}\n"
+                f"Latest message: {message_text}\n"
+                f"Last message at: {timestamp_at or ''}\n"
+                f"Message count: {next_index}"
+            ),
+            "processing_status": "processed",
+            "processing_error": None
+        }).eq("id", asset_id).execute()
+
+
+def handle_whatsapp_webhook_payload(payload: dict):
+    saved_count = 0
+
+    for entry in payload.get("entry") or []:
+        for change in entry.get("changes") or []:
+            value = change.get("value") or {}
+            metadata = value.get("metadata") or {}
+            phone_number_id = metadata.get("phone_number_id")
+
+            connection = get_whatsapp_connection_by_phone_number_id(phone_number_id)
+
+            if not connection:
+                print("WHATSAPP WEBHOOK WARNING: no connection for phone_number_id:", phone_number_id)
+                continue
+
+            contacts_by_wa_id = {}
+
+            for contact in value.get("contacts") or []:
+                wa_id = contact.get("wa_id")
+                if wa_id:
+                    contacts_by_wa_id[wa_id] = contact
+
+            for message in value.get("messages") or []:
+                sender_wa_id = message.get("from")
+                contact = contacts_by_wa_id.get(sender_wa_id) or {
+                    "wa_id": sender_wa_id,
+                    "profile": {}
+                }
+
+                save_whatsapp_api_message(
+                    connection=connection,
+                    contact=contact,
+                    message=message,
+                    raw_value=value
+                )
+
+                saved_count += 1
+
+    return {
+        "received": True,
+        "saved": saved_count
+    }
+
+def reembed_all_asset_chunks(
+    admin_crew: dict,
+    batch_size: int = 100
+):
+    """
+    Recreates every accessible asset-chunk embedding using OpenAI.
+
+    Run this once after changing embedding providers.
+
+    This preserves:
+    - chunk content;
+    - asset relationships;
+    - permissions;
+    - metadata;
+    - chunk indexes.
+
+    Only the embedding column is changed.
+    """
+
+    _require_tier_1_admin(
+        admin_crew
+    )
+
+    clean_batch_size = max(
+        1,
+        min(
+            int(batch_size or 100),
+            500
+        )
+    )
+
+    offset = 0
+    updated_count = 0
+    failed = []
+
+    while True:
+        result = supabase.table(
+            "asset_chunks"
+        ).select(
+            "id, asset_id, content"
+        ).eq(
+            "yacht_id",
+            admin_crew["yacht_id"]
+        ).range(
+            offset,
+            offset + clean_batch_size - 1
+        ).execute()
+
+        rows = result.data or []
+
+        if not rows:
+            break
+
+        for row in rows:
+            chunk_id = row.get("id")
+            content = str(
+                row.get("content") or ""
+            ).strip()
+
+            if not chunk_id or not content:
+                failed.append({
+                    "chunk_id": chunk_id,
+                    "reason": "Missing chunk ID or content"
+                })
+                continue
+
+            try:
+                vector = embed(
+                    content,
+                    required=True
+                )
+
+                supabase.table(
+                    "asset_chunks"
+                ).update({
+                    "embedding": vector
+                }).eq(
+                    "id",
+                    chunk_id
+                ).eq(
+                    "yacht_id",
+                    admin_crew["yacht_id"]
+                ).execute()
+
+                updated_count += 1
+
+            except Exception as error:
+                failed.append({
+                    "chunk_id": chunk_id,
+                    "asset_id": row.get("asset_id"),
+                    "reason": (
+                        f"{type(error).__name__}: "
+                        f"{error}"
+                    )
+                })
+
+        offset += len(rows)
+
+        if len(rows) < clean_batch_size:
+            break
+
+    return {
+        "message": "OpenAI re-embedding completed",
+        "embedding_model": OPENAI_EMBEDDING_MODEL,
+        "embedding_dimensions": OPENAI_EMBEDDING_DIMENSIONS,
+        "updated_count": updated_count,
+        "failed_count": len(failed),
+        "failures": failed[:100]
+    }
 
 # ------------------------
 # YACHT
@@ -232,15 +1047,271 @@ def dev_create_admin(email: str, password: str, full_name: str, yacht_name: str)
         "crew": crew_res.data[0]
     }
 
+def get_request_ip(request: Request | None) -> str | None:
+    if not request:
+        return None
 
-def login(email: str, password: str):
+    cloudflare_ip = request.headers.get("cf-connecting-ip")
+    if cloudflare_ip:
+        return cloudflare_ip.strip()
+
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+
+    real_ip = request.headers.get("x-real-ip")
+    if real_ip:
+        return real_ip.strip()
+
+    if request.client and request.client.host:
+        return request.client.host
+
+    return None
+
+
+def parse_user_agent(user_agent: str | None) -> dict:
+    value = (user_agent or "").lower()
+
+    device_type = "desktop"
+    browser = "unknown"
+    operating_system = "unknown"
+
+    if "mobile" in value or "iphone" in value or "android" in value:
+        device_type = "mobile"
+
+    if "ipad" in value or "tablet" in value:
+        device_type = "tablet"
+
+    if "edg/" in value:
+        browser = "edge"
+    elif "chrome/" in value and "safari/" in value:
+        browser = "chrome"
+    elif "firefox/" in value:
+        browser = "firefox"
+    elif "safari/" in value and "chrome/" not in value:
+        browser = "safari"
+
+    if "windows" in value:
+        operating_system = "windows"
+    elif "mac os" in value or "macintosh" in value:
+        operating_system = "macos"
+    elif "iphone" in value or "ipad" in value or "ios" in value:
+        operating_system = "ios"
+    elif "android" in value:
+        operating_system = "android"
+    elif "linux" in value:
+        operating_system = "linux"
+
+    return {
+        "device_type": device_type,
+        "browser": browser,
+        "operating_system": operating_system
+    }
+
+
+def lookup_ip_geo(ip_address: str | None) -> dict:
+    if not ip_address:
+        return {}
+
+    if ip_address.startswith("127.") or ip_address in ["localhost", "::1"]:
+        return {}
+
+    if ip_address.startswith("10.") or ip_address.startswith("192.168."):
+        return {}
+
+    if ip_address.startswith("172."):
+        try:
+            second = int(ip_address.split(".")[1])
+            if 16 <= second <= 31:
+                return {}
+        except Exception:
+            pass
+
+    try:
+        response = requests.get(
+            f"https://ipapi.co/{ip_address}/json/",
+            timeout=4
+        )
+
+        if response.status_code >= 400:
+            print("IP GEO LOOKUP FAILED:", response.status_code, response.text[:200])
+            return {}
+
+        data = response.json()
+
+        return {
+            "geo_country": data.get("country_name"),
+            "geo_region": data.get("region"),
+            "geo_city": data.get("city"),
+            "geo_latitude": data.get("latitude"),
+            "geo_longitude": data.get("longitude"),
+            "geo_source": "ip"
+        }
+
+    except Exception as e:
+        print("IP GEO LOOKUP ERROR:", type(e).__name__, str(e))
+        return {}
+
+def reverse_geocode_browser_location(latitude: float | None, longitude: float | None) -> dict:
+    """
+    Converts browser latitude/longitude into country, region, and city.
+    """
+
+    if latitude is None or longitude is None:
+        return {}
+
+    try:
+        response = requests.get(
+            "https://nominatim.openstreetmap.org/reverse",
+            params={
+                "format": "jsonv2",
+                "lat": latitude,
+                "lon": longitude
+            },
+            headers={
+                "User-Agent": "BridgeOS/1.0"
+            },
+            timeout=6
+        )
+
+        if response.status_code >= 400:
+            print("REVERSE GEO LOOKUP FAILED:", response.status_code, response.text[:300])
+            return {}
+
+        data = response.json()
+        address = data.get("address") or {}
+
+        city = (
+            address.get("city")
+            or address.get("town")
+            or address.get("village")
+            or address.get("municipality")
+            or address.get("county")
+        )
+
+        return {
+            "geo_country": address.get("country"),
+            "geo_region": address.get("state") or address.get("region"),
+            "geo_city": city,
+            "geo_latitude": latitude,
+            "geo_longitude": longitude,
+            "geo_source": "browser"
+        }
+
+    except Exception as e:
+        print("REVERSE GEO LOOKUP ERROR:", type(e).__name__, str(e))
+        return {}
+
+
+def register_login_log(
+    user_id: str | None,
+    email: str | None,
+    login_type: str = "password",
+    success: bool = True,
+    request: Request | None = None,
+    client_geo: dict | None = None
+):
+    if not user_id:
+        print("LOGIN LOG SKIPPED: missing user_id")
+        return None
+
+    clean_email = (email or "").strip().lower()
+    login_time = datetime.now(timezone.utc).isoformat()
+
+    ip_address = get_request_ip(request)
+    user_agent = request.headers.get("user-agent") if request else None
+    parsed_agent = parse_user_agent(user_agent)
+
+    geo_payload = lookup_ip_geo(ip_address)
+
+    if client_geo:
+        browser_latitude = client_geo.get("latitude")
+        browser_longitude = client_geo.get("longitude")
+
+        reverse_geo = reverse_geocode_browser_location(
+            latitude=browser_latitude,
+            longitude=browser_longitude
+        )
+
+        geo_payload = {
+            "geo_country": reverse_geo.get("geo_country") or client_geo.get("country"),
+            "geo_region": reverse_geo.get("geo_region") or client_geo.get("region"),
+            "geo_city": reverse_geo.get("geo_city") or client_geo.get("city"),
+            "geo_latitude": browser_latitude,
+            "geo_longitude": browser_longitude,
+            "geo_source": "browser"
+        }
+
+    crew = None
+
+    try:
+        crew_res = auth_admin.table("crew") \
+            .select("id, yacht_id, email") \
+            .eq("id", user_id) \
+            .limit(1) \
+            .execute()
+
+        if crew_res.data:
+            crew = crew_res.data[0]
+
+    except Exception as e:
+        print("LOGIN LOG CREW LOOKUP ERROR:", type(e).__name__, str(e))
+
+    payload = {
+        "user_id": user_id,
+        "crew_id": crew.get("id") if crew else user_id,
+        "yacht_id": crew.get("yacht_id") if crew else None,
+        "email": clean_email or (crew.get("email") if crew else None),
+        "login_type": login_type,
+        "success": success,
+        "login_at": login_time,
+        "ip_address": ip_address,
+        "user_agent": user_agent,
+        "device_type": parsed_agent.get("device_type"),
+        "browser": parsed_agent.get("browser"),
+        "operating_system": parsed_agent.get("operating_system"),
+        "geo_country": geo_payload.get("geo_country"),
+        "geo_region": geo_payload.get("geo_region"),
+        "geo_city": geo_payload.get("geo_city"),
+        "geo_latitude": geo_payload.get("geo_latitude"),
+        "geo_longitude": geo_payload.get("geo_longitude"),
+        "geo_source": geo_payload.get("geo_source")
+    }
+
+    try:
+        log_res = auth_admin.table("login_logs").insert(payload).execute()
+
+        print("LOGIN LOG INSERT PAYLOAD:", payload)
+        print("LOGIN LOG INSERT RESPONSE:", log_res)
+
+        if not log_res.data:
+            raise Exception("Supabase returned no inserted login_logs row")
+
+        return log_res.data[0]
+
+    except Exception as e:
+        print("LOGIN LOG INSERT FAILED:", type(e).__name__, str(e))
+        raise HTTPException(
+            status_code=500,
+            detail=f"Login succeeded, but login_logs insert failed: {type(e).__name__}: {str(e)}"
+        )
+
+def login(
+    email: str,
+    password: str,
+    request: Request | None = None,
+    client_geo: dict | None = None
+):
     """
     Logs in a user using Supabase Auth and returns a clean token response.
+    Also writes one row to login_logs.
     """
+
+    clean_email = (email or "").strip().lower()
 
     try:
         auth_res = supabase.auth.sign_in_with_password({
-            "email": email,
+            "email": clean_email,
             "password": password
         })
     except Exception as e:
@@ -258,17 +1329,35 @@ def login(email: str, password: str):
     if not auth_res.session.access_token:
         raise HTTPException(status_code=401, detail="No access token returned from Supabase")
 
+    user_id = auth_res.user.id if auth_res.user else None
+    user_email = auth_res.user.email if auth_res.user else clean_email
+
+    login_log = register_login_log(
+        user_id=user_id,
+        email=user_email,
+        login_type="password",
+        success=True,
+        request=request,
+        client_geo=client_geo
+    )
+
     return {
         "access_token": auth_res.session.access_token,
         "refresh_token": auth_res.session.refresh_token,
         "token_type": "bearer",
         "user": {
-            "id": auth_res.user.id if auth_res.user else None,
-            "email": auth_res.user.email if auth_res.user else email
-        }
+            "id": user_id,
+            "email": user_email
+        },
+        "login_log": login_log
     }
 
-def dev_login(email: str, full_name: str = "Test Admin", yacht_name: str = "Test Yacht"):
+def dev_login(
+    email: str,
+    full_name: str = "Test Admin",
+    yacht_name: str = "Test Yacht",
+    request: Request | None = None
+):
     """
     DEV LOGIN ONLY.
 
@@ -324,6 +1413,27 @@ def dev_login(email: str, full_name: str = "Test Admin", yacht_name: str = "Test
 
         crew = crew_insert.data[0]
 
+    try:
+        supabase.table("login_logs").insert({
+            "user_id": user_id,
+            "crew_id": crew.get("id") if crew else user_id,
+            "yacht_id": crew.get("yacht_id") if crew else None,
+            "email": email,
+            "login_at": datetime.now(timezone.utc).isoformat(),
+            "login_type": "dev-login",
+            "success": True
+        }).execute()
+
+    except Exception as e:
+        print("DEV LOGIN LOG INSERT ERROR:", type(e).__name__, str(e))
+
+    login_log = register_login_log(
+        user_id=user_id,
+        email=email,
+        login_type="dev-login",
+        success=True,
+        request=request
+    )
     now = int(time.time())
 
     token = pyjwt.encode(
@@ -347,285 +1457,34 @@ def dev_login(email: str, full_name: str = "Test Admin", yacht_name: str = "Test
             "id": user_id,
             "email": email
         },
-        "crew": crew
+        "crew": crew,
+        "login_log": login_log
     }
 
 def chat_with_runpod_bridgeos(
     query: str,
     crew: dict,
-    chat_id: str
+    chat_id: str,
+    uploaded_asset_id: str | None = None
 ):
     """
-    Sends the BridgeOS chat request to the RunPod AI API.
+    Uses BridgeOS secure document retrieval for every document-based question.
 
     Important:
-    - The frontend calls the BridgeOS backend.
-    - The BridgeOS backend calls RunPod.
-    - Users should never see raw Internal Server Error messages.
-    - If RunPod fails, return the normal fallback answer.
+    - Searches documents already uploaded to Yacht Documentation.
+    - Uses the exact uploaded chat asset when one is attached.
+    - Does not answer factual questions without document evidence.
+    - Uses the existing deterministic document and numeric-answer pipeline.
     """
 
-    verify_chat_access(
-        chat_id=chat_id,
+    return chat(
+        query=query,
         crew_id=crew["id"],
-        yacht_id=crew["yacht_id"]
+        yacht_id=crew["yacht_id"],
+        security_level=int(crew["security_level"]),
+        chat_id=chat_id,
+        uploaded_asset_id=uploaded_asset_id
     )
-
-    supabase.table("messages").insert({
-        "chat_id": chat_id,
-        "yacht_id": crew["yacht_id"],
-        "crew_id": crew["id"],
-        "role": "user",
-        "content": query
-    }).execute()
-
-    if not RUNPOD_BASE_URL:
-        answer = FALLBACK_NO_DATA_ANSWER
-
-        supabase.table("messages").insert({
-            "chat_id": chat_id,
-            "yacht_id": crew["yacht_id"],
-            "crew_id": crew["id"],
-            "role": "assistant",
-            "content": answer
-        }).execute()
-
-        return {
-            "answer": answer,
-            "sources": [],
-            "provider": "runpod_bridgeos",
-            "error": True
-        }
-
-    if not BRIDGEOS_API_KEY:
-        answer = FALLBACK_NO_DATA_ANSWER
-
-        supabase.table("messages").insert({
-            "chat_id": chat_id,
-            "yacht_id": crew["yacht_id"],
-            "crew_id": crew["id"],
-            "role": "assistant",
-            "content": answer
-        }).execute()
-
-        return {
-            "answer": answer,
-            "sources": [],
-            "provider": "runpod_bridgeos",
-            "error": True
-        }
-
-    history_res = supabase.table("messages") \
-        .select("role, content") \
-        .eq("chat_id", chat_id) \
-        .eq("crew_id", crew["id"]) \
-        .eq("yacht_id", crew["yacht_id"]) \
-        .order("created_at", desc=False) \
-        .limit(20) \
-        .execute()
-
-    history = []
-
-    for message in history_res.data or []:
-        role = message.get("role")
-        content = message.get("content")
-
-        if role in ["user", "assistant"] and content:
-            history.append({
-                "role": role,
-                "content": content
-            })
-
-    backend_context = {
-        "crew": {
-            "id": crew.get("id"),
-            "email": crew.get("email"),
-            "full_name": crew.get("full_name"),
-            "role": crew.get("role"),
-            "position": crew.get("position"),
-            "phone_number": crew.get("phone_number"),
-            "security_level": crew.get("security_level"),
-            "yacht_id": crew.get("yacht_id"),
-            "yacht_name": crew.get("yacht_name")
-        }
-    }
-
-    try:
-        my_assets = list_my_assets(crew)
-
-        safe_assets = []
-
-        asset_rows = (
-            my_assets.get("data", [])
-            if isinstance(my_assets, dict)
-            else getattr(my_assets, "data", []) or []
-        )
-
-        for asset in asset_rows:
-            safe_assets.append({
-                "id": asset.get("id"),
-                "file_name": asset.get("file_name"),
-                "original_file_name": asset.get("original_file_name"),
-                "file_type": asset.get("file_type"),
-                "mime_type": asset.get("mime_type"),
-                "security_level": asset.get("security_level"),
-                "processing_status": asset.get("processing_status"),
-                "detected_year": asset.get("detected_year"),
-                "detected_event": asset.get("detected_event"),
-                "tags": asset.get("tags"),
-                "summary": asset.get("summary")
-            })
-
-        backend_context["assets"] = safe_assets[:50]
-
-    except Exception as e:
-        print("ASSET CONTEXT ERROR:", type(e).__name__, str(e))
-        backend_context["assets"] = []
-
-    url = f"{RUNPOD_BASE_URL.rstrip('/')}/api/bridgeos/chat"
-
-    try:
-        print("RUNPOD DEBUG: url:", url)
-        print("RUNPOD DEBUG: key present:", bool(BRIDGEOS_API_KEY))
-        print("RUNPOD DEBUG: key length:", len(BRIDGEOS_API_KEY or ""))
-        print("RUNPOD DEBUG: key last4:", (BRIDGEOS_API_KEY or "")[-4:])
-
-        response = requests.post(
-            url,
-            json={
-                "user_input": query,
-                "history": history,
-                "backend_context": backend_context
-            },
-            headers={
-                "Content-Type": "application/json",
-                "x-api-key": BRIDGEOS_API_KEY
-            },
-            timeout=180
-        )
-
-        print("RUNPOD DEBUG: status:", response.status_code)
-        print("RUNPOD DEBUG: response:", response.text[:500])
-
-    except requests.exceptions.Timeout:
-        print("RUNPOD TIMEOUT ERROR")
-
-        answer = FALLBACK_NO_DATA_ANSWER
-
-        supabase.table("messages").insert({
-            "chat_id": chat_id,
-            "yacht_id": crew["yacht_id"],
-            "crew_id": crew["id"],
-            "role": "assistant",
-            "content": answer
-        }).execute()
-
-        supabase.table("chats").update({
-            "updated_at": "now()"
-        }).eq("id", chat_id).eq("crew_id", crew["id"]).eq("yacht_id", crew["yacht_id"]).execute()
-
-        return {
-            "answer": answer,
-            "sources": [],
-            "provider": "runpod_bridgeos",
-            "error": True
-        }
-
-    except Exception as e:
-        print("RUNPOD REQUEST ERROR:", type(e).__name__, str(e))
-
-        answer = FALLBACK_NO_DATA_ANSWER
-
-        supabase.table("messages").insert({
-            "chat_id": chat_id,
-            "yacht_id": crew["yacht_id"],
-            "crew_id": crew["id"],
-            "role": "assistant",
-            "content": answer
-        }).execute()
-
-        supabase.table("chats").update({
-            "updated_at": "now()"
-        }).eq("id", chat_id).eq("crew_id", crew["id"]).eq("yacht_id", crew["yacht_id"]).execute()
-
-        return {
-            "answer": answer,
-            "sources": [],
-            "provider": "runpod_bridgeos",
-            "error": True
-        }
-
-    if response.status_code >= 400:
-        print("RUNPOD ERROR STATUS:", response.status_code)
-        print("RUNPOD ERROR RESPONSE:", response.text[:1000])
-
-        answer = FALLBACK_NO_DATA_ANSWER
-
-        supabase.table("messages").insert({
-            "chat_id": chat_id,
-            "yacht_id": crew["yacht_id"],
-            "crew_id": crew["id"],
-            "role": "assistant",
-            "content": answer
-        }).execute()
-
-        supabase.table("chats").update({
-            "updated_at": "now()"
-        }).eq("id", chat_id).eq("crew_id", crew["id"]).eq("yacht_id", crew["yacht_id"]).execute()
-
-        return {
-            "answer": answer,
-            "sources": [],
-            "provider": "runpod_bridgeos",
-            "error": True
-        }
-
-    try:
-        data = response.json()
-    except Exception:
-        print("RUNPOD JSON PARSE ERROR:", response.text[:1000])
-
-        answer = FALLBACK_NO_DATA_ANSWER
-
-        supabase.table("messages").insert({
-            "chat_id": chat_id,
-            "yacht_id": crew["yacht_id"],
-            "crew_id": crew["id"],
-            "role": "assistant",
-            "content": answer
-        }).execute()
-
-        supabase.table("chats").update({
-            "updated_at": "now()"
-        }).eq("id", chat_id).eq("crew_id", crew["id"]).eq("yacht_id", crew["yacht_id"]).execute()
-
-        return {
-            "answer": answer,
-            "sources": [],
-            "provider": "runpod_bridgeos",
-            "error": True
-        }
-
-    answer = data.get("response") or FALLBACK_NO_DATA_ANSWER
-
-    supabase.table("messages").insert({
-        "chat_id": chat_id,
-        "yacht_id": crew["yacht_id"],
-        "crew_id": crew["id"],
-        "role": "assistant",
-        "content": answer
-    }).execute()
-
-    supabase.table("chats").update({
-        "updated_at": "now()"
-    }).eq("id", chat_id).eq("crew_id", crew["id"]).eq("yacht_id", crew["yacht_id"]).execute()
-
-    return {
-        "answer": answer,
-        "sources": [],
-        "provider": "runpod_bridgeos",
-        "error": False
-    }
 # ------------------------
 # CREW
 # ------------------------
@@ -754,9 +1613,13 @@ def update_chat_title(chat_id: str, crew_id: str, yacht_id: str, title: str):
 def delete_chat(chat_id: str, crew_id: str, yacht_id: str):
     """
     Deletes a chat only if it belongs to this exact crew member.
-    Also removes its messages first.
 
-    Chat-linked assets are kept, but detached from the deleted chat.
+    Also deletes files uploaded inside that chat.
+
+    Important:
+    - Do NOT detach chat assets by setting chat_id = None.
+    - Detaching can violate the global asset hash uniqueness constraint.
+    - Chat-uploaded assets belong to that chat, so deleting the chat should delete those chat assets.
     """
 
     verify_chat_access(
@@ -766,6 +1629,57 @@ def delete_chat(chat_id: str, crew_id: str, yacht_id: str):
     )
 
     try:
+        # Find assets uploaded inside this chat.
+        chat_assets_res = supabase.table("assets") \
+            .select("id, storage_path, file_name, original_file_name") \
+            .eq("chat_id", chat_id) \
+            .eq("yacht_id", yacht_id) \
+            .execute()
+
+        chat_assets = chat_assets_res.data or []
+        chat_asset_ids = [
+            asset["id"]
+            for asset in chat_assets
+            if asset.get("id")
+        ]
+
+        # Delete chunks and access rows for chat assets.
+        if chat_asset_ids:
+            supabase.table("asset_chunks") \
+                .delete() \
+                .in_("asset_id", chat_asset_ids) \
+                .eq("yacht_id", yacht_id) \
+                .execute()
+
+            try:
+                supabase.table("asset_access") \
+                    .delete() \
+                    .in_("asset_id", chat_asset_ids) \
+                    .execute()
+            except Exception as e:
+                print("CHAT ASSET ACCESS DELETE WARNING:", type(e).__name__, str(e))
+
+            # Delete physical files from storage.
+            storage_paths = [
+                asset.get("storage_path")
+                for asset in chat_assets
+                if asset.get("storage_path")
+            ]
+
+            if storage_paths:
+                try:
+                    storage_admin.storage.from_(BUCKET_NAME).remove(storage_paths)
+                except Exception as e:
+                    print("CHAT ASSET STORAGE DELETE WARNING:", type(e).__name__, str(e))
+
+            # Delete asset rows.
+            supabase.table("assets") \
+                .delete() \
+                .in_("id", chat_asset_ids) \
+                .eq("yacht_id", yacht_id) \
+                .execute()
+
+        # Delete chat messages.
         supabase.table("messages") \
             .delete() \
             .eq("chat_id", chat_id) \
@@ -773,14 +1687,7 @@ def delete_chat(chat_id: str, crew_id: str, yacht_id: str):
             .eq("yacht_id", yacht_id) \
             .execute()
 
-        supabase.table("assets") \
-            .update({
-                "chat_id": None
-            }) \
-            .eq("chat_id", chat_id) \
-            .eq("yacht_id", yacht_id) \
-            .execute()
-
+        # Delete the chat itself.
         res = supabase.table("chats") \
             .delete() \
             .eq("id", chat_id) \
@@ -799,9 +1706,9 @@ def delete_chat(chat_id: str, crew_id: str, yacht_id: str):
 
     return {
         "message": "Chat deleted successfully",
-        "deleted_chat_id": chat_id
+        "deleted_chat_id": chat_id,
+        "deleted_chat_assets": len(chat_asset_ids)
     }
-
 
 def get_chat_messages(chat_id: str, crew_id: str, yacht_id: str):
     """
@@ -822,7 +1729,13 @@ def get_chat_messages(chat_id: str, crew_id: str, yacht_id: str):
         .order("created_at") \
         .execute()
 
-def repair_admin_login(email: str, password: str, full_name: str, yacht_name: str):
+def repair_admin_login(
+    email: str,
+    password: str,
+    full_name: str,
+    yacht_name: str,
+    request: Request | None = None
+):
     """
     TEMP SETUP / REPAIR LOGIN.
 
@@ -865,6 +1778,14 @@ def repair_admin_login(email: str, password: str, full_name: str, yacht_name: st
     if crew_res.data:
         crew = crew_res.data[0]
 
+        login_log = register_login_log(
+            user_id=user_id,
+            email=auth_res.user.email or email,
+            login_type="repair-admin-login",
+            success=True,
+            request=request
+        )
+
         return {
             "message": "Login successful. Crew profile already exists.",
             "access_token": auth_res.session.access_token,
@@ -874,7 +1795,8 @@ def repair_admin_login(email: str, password: str, full_name: str, yacht_name: st
                 "id": user_id,
                 "email": auth_res.user.email or email
             },
-            "crew": crew
+            "crew": crew,
+            "login_log": login_log
         }
 
     yacht_res = supabase.table("yachts") \
@@ -908,6 +1830,14 @@ def repair_admin_login(email: str, password: str, full_name: str, yacht_name: st
     if not crew_insert.data:
         raise HTTPException(status_code=500, detail="Could not create crew row")
 
+    login_log = register_login_log(
+        user_id=user_id,
+        email=auth_res.user.email or email,
+        login_type="repair-admin-login",
+        success=True,
+        request=request
+    )
+
     return {
         "message": "Login successful. Admin crew profile repaired.",
         "access_token": auth_res.session.access_token,
@@ -918,8 +1848,11 @@ def repair_admin_login(email: str, password: str, full_name: str, yacht_name: st
             "email": auth_res.user.email or email
         },
         "crew": crew_insert.data[0],
-        "yacht": yacht
+        "yacht": yacht,
+        "login_log": login_log
     }
+
+
 
 
 def create_crew(data: dict):
@@ -944,9 +1877,10 @@ def create_crew_user(
     MAIN account creates SUB accounts under the SAME yacht.
 
     MAIN decides security_level:
-    1 = can access all yacht assets/docs
-    2 = limited, only explicitly granted assets/docs
-    3 = limited, only explicitly granted assets/docs
+    1 = can access Tier 1, 2, and 3 documents
+    2 = can access Tier 2 and 3 documents
+    3 = can access Tier 3 documents only
+    4 = custom access only, must be manually granted files in asset_access
     """
 
     if int(admin_crew["security_level"]) != 1:
@@ -957,10 +1891,10 @@ def create_crew_user(
 
     security_level = int(security_level)
 
-    if security_level not in [1, 2, 3]:
+    if security_level not in [1, 2, 3, 4]:
         raise HTTPException(
             status_code=400,
-            detail="security_level must be 1, 2, or 3"
+            detail="security_level must be 1, 2, 3, or 4"
         )
 
     try:
@@ -1077,10 +2011,10 @@ def update_crew_user(
     if security_level is not None:
         security_level = int(security_level)
 
-        if security_level not in [1, 2, 3]:
+        if security_level not in [1, 2, 3, 4]:
             raise HTTPException(
                 status_code=400,
-                detail="security_level must be 1, 2, or 3"
+                detail="security_level must be 1, 2, 3, or 4"
             )
 
         updates["security_level"] = security_level
@@ -1334,14 +2268,31 @@ def delete_crew_user(
 
 def get_accessible_asset_ids(crew_id: str, yacht_id: str, security_level: int):
     """
-    Level 1:
-        Can access all assets for the yacht.
+    Synced document permission model.
 
-    Level 2 and 3:
-        Can only access assets explicitly granted in asset_access.
+    Document security_level:
+    1 = Tier 1 only
+    2 = Tier 1 and Tier 2
+    3 = Tier 1, Tier 2, and Tier 3
+    4 = Custom only
+
+    Crew security_level:
+    1 = admin/full access
+    2 = sees doc levels 2 and 3, plus manual grants
+    3 = sees doc level 3, plus manual grants
+    4 = custom only, manual grants only
+
+    Tier 4 documents:
+    - Tier 1 admins can always see/manage them.
+    - Tier 2, 3, and 4 users only see them if manually granted in asset_access.
     """
 
     security_level = int(security_level)
+
+    if security_level not in [1, 2, 3, 4]:
+        return []
+
+    allowed_ids = set()
 
     if security_level == 1:
         assets = supabase.table("assets") \
@@ -1349,17 +2300,38 @@ def get_accessible_asset_ids(crew_id: str, yacht_id: str, security_level: int):
             .eq("yacht_id", yacht_id) \
             .execute()
 
-        return [asset["id"] for asset in assets.data]
+        allowed_ids = {
+            asset["id"]
+            for asset in (assets.data or [])
+            if asset.get("id")
+        }
 
-    access = supabase.table("asset_access") \
+    elif security_level in [2, 3]:
+        base_assets = supabase.table("assets") \
+            .select("id") \
+            .eq("yacht_id", yacht_id) \
+            .gte("security_level", security_level) \
+            .lte("security_level", 3) \
+            .execute()
+
+        allowed_ids = {
+            asset["id"]
+            for asset in (base_assets.data or [])
+            if asset.get("id")
+        }
+
+    manual_access = supabase.table("asset_access") \
         .select("asset_id, assets!inner(yacht_id)") \
         .eq("crew_id", crew_id) \
         .eq("assets.yacht_id", yacht_id) \
         .execute()
 
-    return [row["asset_id"] for row in access.data]
+    for row in manual_access.data or []:
+        if row.get("asset_id"):
+            allowed_ids.add(row["asset_id"])
 
-
+    return list(allowed_ids)
+    
 def authorize_asset_access(
     asset_id: str,
     target_crew_id: str,
@@ -1419,6 +2391,975 @@ def list_my_assets(crew: dict):
         .eq("yacht_id", crew["yacht_id"]) \
         .order("created_at", desc=True) \
         .execute()
+
+# ------------------------
+# API CONNECTIONS
+# ------------------------
+
+def _require_tier_1_admin(crew: dict):
+    if not crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    if int(crew.get("security_level") or 4) != 1:
+        raise HTTPException(
+            status_code=403,
+            detail="Only Tier 1 admins can manage API connections"
+        )
+
+
+def _mask_secret(value: str | None) -> str | None:
+    if not value:
+        return None
+
+    value = str(value)
+
+    if len(value) <= 6:
+        return "***"
+
+    return f"{value[:3]}***{value[-4:]}"
+
+
+def _clean_api_connection(row: dict) -> dict:
+    clean = dict(row)
+    clean["api_key"] = _mask_secret(clean.get("api_key"))
+    return clean
+
+
+def create_api_connection(
+    admin_crew: dict,
+    name: str,
+    base_url: str,
+    auth_type: str = "none",
+    api_key: str | None = None,
+    extra_headers: dict | None = None,
+    security_level: int = 1
+):
+    """
+    Creates a reusable external API connection for this yacht.
+
+    auth_type:
+    - none
+    - bearer
+    - x-api-key
+    """
+
+    _require_tier_1_admin(admin_crew)
+
+    clean_name = (name or "").strip()
+    clean_base_url = (base_url or "").strip()
+    clean_auth_type = (auth_type or "none").strip().lower()
+
+    if not clean_name:
+        raise HTTPException(status_code=400, detail="Connection name is required")
+
+    if not clean_base_url:
+        raise HTTPException(status_code=400, detail="base_url is required")
+
+    if not clean_base_url.startswith("http://") and not clean_base_url.startswith("https://"):
+        raise HTTPException(
+            status_code=400,
+            detail="base_url must start with http:// or https://"
+        )
+
+    if clean_auth_type not in ["none", "bearer", "x-api-key"]:
+        raise HTTPException(
+            status_code=400,
+            detail="auth_type must be one of: none, bearer, x-api-key"
+        )
+
+    if clean_auth_type != "none" and not api_key:
+        raise HTTPException(
+            status_code=400,
+            detail="api_key is required when auth_type is bearer or x-api-key"
+        )
+
+    safe_headers = extra_headers or {}
+
+    if not isinstance(safe_headers, dict):
+        raise HTTPException(status_code=400, detail="extra_headers must be an object")
+
+    try:
+        res = supabase.table("api_connections").insert({
+            "yacht_id": admin_crew["yacht_id"],
+            "created_by": admin_crew["id"],
+            "name": clean_name,
+            "base_url": clean_base_url,
+            "auth_type": clean_auth_type,
+            "api_key": api_key,
+            "extra_headers": safe_headers,
+            "security_level": security_level
+        }).execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not create API connection: {str(e)}"
+        )
+
+    if not res.data:
+        raise HTTPException(status_code=400, detail="Could not create API connection")
+
+    return {
+        "message": "API connection created successfully",
+        "connection": _clean_api_connection(res.data[0])
+    }
+
+
+def list_api_connections(admin_crew: dict):
+    _require_tier_1_admin(admin_crew)
+
+    try:
+        res = supabase.table("api_connections") \
+            .select("*") \
+            .eq("yacht_id", admin_crew["yacht_id"]) \
+            .order("created_at", desc=True) \
+            .execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not list API connections: {str(e)}"
+        )
+
+    return {
+        "data": [_clean_api_connection(row) for row in (res.data or [])]
+    }
+
+
+def get_api_connection_for_admin(connection_id: str, admin_crew: dict) -> dict:
+    _require_tier_1_admin(admin_crew)
+
+    res = supabase.table("api_connections") \
+        .select("*") \
+        .eq("id", connection_id) \
+        .eq("yacht_id", admin_crew["yacht_id"]) \
+        .execute()
+
+    if not res.data:
+        raise HTTPException(status_code=404, detail="API connection not found")
+
+    return res.data[0]
+
+
+def delete_api_connection(connection_id: str, admin_crew: dict):
+    _require_tier_1_admin(admin_crew)
+
+    try:
+        res = supabase.table("api_connections") \
+            .delete() \
+            .eq("id", connection_id) \
+            .eq("yacht_id", admin_crew["yacht_id"]) \
+            .execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not delete API connection: {str(e)}"
+        )
+
+    if not res.data:
+        raise HTTPException(status_code=404, detail="API connection not found")
+
+    return {
+        "message": "API connection deleted successfully",
+        "deleted_connection_id": connection_id
+    }
+
+def sync_one_google_drive_file(
+    drive_file: dict,
+    connection: dict,
+    admin_crew: dict,
+    security_level: int
+) -> dict:
+    file_id = drive_file.get("id")
+    file_name = drive_file.get("name") or "google-drive-file"
+    mime_type = drive_file.get("mimeType") or ""
+
+    if not file_id:
+        return {
+            "file_name": file_name,
+            "status": "skipped",
+            "reason": "Missing Google Drive file id"
+        }
+
+    if mime_type == "application/vnd.google-apps.folder":
+        return {
+            "file_name": file_name,
+            "file_id": file_id,
+            "status": "skipped",
+            "reason": "Folder skipped"
+        }
+
+    if mime_type == "application/vnd.google-apps.document":
+        download_url = f"https://www.googleapis.com/drive/v3/files/{file_id}/export?mimeType=text/plain"
+        final_file_name = file_name if file_name.lower().endswith(".txt") else f"{file_name}.txt"
+
+    elif mime_type == "application/vnd.google-apps.spreadsheet":
+        download_url = f"https://www.googleapis.com/drive/v3/files/{file_id}/export?mimeType=text/csv"
+        final_file_name = file_name if file_name.lower().endswith(".csv") else f"{file_name}.csv"
+
+    elif mime_type == "application/vnd.google-apps.presentation":
+        download_url = f"https://www.googleapis.com/drive/v3/files/{file_id}/export?mimeType=text/plain"
+        final_file_name = file_name if file_name.lower().endswith(".txt") else f"{file_name}.txt"
+
+    else:
+        download_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
+        final_file_name = file_name
+
+    headers = {
+        "Accept": "*/*"
+    }
+
+    extra_headers = connection.get("extra_headers") or {}
+
+    if isinstance(extra_headers, dict):
+        headers.update(extra_headers)
+
+    auth_type = (connection.get("auth_type") or "none").lower()
+    api_key = connection.get("api_key")
+
+    if auth_type == "bearer" and api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    if auth_type == "x-api-key" and api_key:
+        headers["x-api-key"] = api_key
+
+    try:
+        response = requests.get(
+            download_url,
+            headers=headers,
+            timeout=API_SYNC_TIMEOUT_SECONDS
+        )
+    except Exception as e:
+        return {
+            "file_name": file_name,
+            "file_id": file_id,
+            "status": "failed",
+            "reason": f"{type(e).__name__}: {str(e)}"
+        }
+
+    if response.status_code >= 400:
+        return {
+            "file_name": file_name,
+            "file_id": file_id,
+            "status": "failed",
+            "reason": f"Google Drive returned {response.status_code}: {response.text[:500]}"
+        }
+
+    extracted_content = ""
+
+    try:
+        downloaded_bytes = response.content or b""
+        file_type = detect_file_type(final_file_name, response.headers.get("content-type"))
+
+        if file_type in ["pdf", "docx", "text"]:
+            extracted_content = extract_text_by_file_type(
+                file=io.BytesIO(downloaded_bytes),
+                filename=final_file_name,
+                file_type=file_type
+            )
+        else:
+            extracted_content = downloaded_bytes.decode("utf-8", errors="ignore")
+
+    except Exception as e:
+        return {
+            "file_name": file_name,
+            "file_id": file_id,
+            "status": "failed",
+            "reason": f"Could not extract text: {type(e).__name__}: {str(e)}"
+        }
+
+    extracted_content = (extracted_content or "").strip()
+
+    if not extracted_content:
+        return {
+            "file_name": file_name,
+            "file_id": file_id,
+            "status": "skipped",
+            "reason": "No readable text extracted"
+        }
+
+    source_header = f"""
+Google Drive source metadata:
+File name: {file_name}
+Google Drive file id: {file_id}
+Google Drive MIME type: {mime_type}
+Modified time: {drive_file.get("modifiedTime") or ""}
+Web link: {drive_file.get("webViewLink") or ""}
+""".strip()
+
+    final_content = f"{source_header}\n\n---\n\n{extracted_content}"
+
+    try:
+        seeded = seed_text_asset(
+            file_name=final_file_name,
+            content=final_content,
+            yacht_id=admin_crew["yacht_id"],
+            uploaded_by=admin_crew["id"],
+            security_level=security_level
+        )
+
+        return {
+            "file_name": final_file_name,
+            "file_id": file_id,
+            "status": "synced",
+            "asset_id": seeded.get("asset", {}).get("id"),
+            "duplicate": seeded.get("duplicate", False)
+        }
+
+    except Exception as e:
+        return {
+            "file_name": file_name,
+            "file_id": file_id,
+            "status": "failed",
+            "reason": f"Could not save asset: {type(e).__name__}: {str(e)}"
+        }
+
+def _gmail_b64url_decode(value: str | None) -> str:
+    """
+    Gmail message bodies are base64url encoded.
+    """
+
+    if not value:
+        return ""
+
+    try:
+        clean = value.replace("-", "+").replace("_", "/")
+        padding = len(clean) % 4
+
+        if padding:
+            clean += "=" * (4 - padding)
+
+        raw = base64.b64decode(clean.encode("utf-8"))
+
+        return raw.decode("utf-8", errors="ignore")
+
+    except Exception as e:
+        print("GMAIL BODY DECODE ERROR:", type(e).__name__, str(e))
+        return ""
+
+
+def _gmail_header(headers: list[dict], name: str) -> str:
+    if not headers:
+        return ""
+
+    for header in headers:
+        if str(header.get("name") or "").lower() == name.lower():
+            return str(header.get("value") or "").strip()
+
+    return ""
+
+
+def _extract_gmail_body_from_payload(payload: dict | None) -> str:
+    """
+    Extracts readable plain text from a Gmail message payload.
+    Prefers text/plain, falls back to text/html stripped roughly.
+    """
+
+    if not payload:
+        return ""
+
+    mime_type = payload.get("mimeType") or ""
+
+    body = payload.get("body") or {}
+    data = body.get("data")
+
+    if data and mime_type == "text/plain":
+        return _gmail_b64url_decode(data).strip()
+
+    parts = payload.get("parts") or []
+
+    plain_parts = []
+    html_parts = []
+
+    for part in parts:
+        part_mime = part.get("mimeType") or ""
+
+        if part_mime.startswith("multipart/"):
+            nested = _extract_gmail_body_from_payload(part)
+            if nested:
+                plain_parts.append(nested)
+            continue
+
+        part_body = part.get("body") or {}
+        part_data = part_body.get("data")
+
+        if not part_data:
+            continue
+
+        decoded = _gmail_b64url_decode(part_data).strip()
+
+        if not decoded:
+            continue
+
+        if part_mime == "text/plain":
+            plain_parts.append(decoded)
+        elif part_mime == "text/html":
+            html_parts.append(decoded)
+
+    if plain_parts:
+        return "\n\n".join(plain_parts).strip()
+
+    if html_parts:
+        html_text = "\n\n".join(html_parts)
+
+        # Basic HTML cleanup without adding another dependency.
+        import re
+
+        html_text = re.sub(r"<br\s*/?>", "\n", html_text, flags=re.I)
+        html_text = re.sub(r"</p\s*>", "\n", html_text, flags=re.I)
+        html_text = re.sub(r"<[^>]+>", " ", html_text)
+        html_text = re.sub(r"\s+", " ", html_text)
+
+        return html_text.strip()
+
+    if data:
+        return _gmail_b64url_decode(data).strip()
+
+    return ""
+
+
+def sync_one_gmail_message(
+    gmail_message: dict,
+    connection: dict,
+    admin_crew: dict,
+    security_level: int
+) -> dict:
+    """
+    Fetches one Gmail message, converts it into searchable text,
+    and saves it through the existing asset/chunk pipeline.
+    """
+
+    message_id = gmail_message.get("id")
+
+    if not message_id:
+        return {
+            "status": "skipped",
+            "reason": "Missing Gmail message id"
+        }
+
+    base_url = "https://gmail.googleapis.com/gmail/v1/users/me/messages"
+    url = f"{base_url}/{message_id}?format=full"
+
+    headers = {
+        "Accept": "application/json"
+    }
+
+    extra_headers = connection.get("extra_headers") or {}
+
+    if isinstance(extra_headers, dict):
+        headers.update(extra_headers)
+
+    auth_type = (connection.get("auth_type") or "none").lower()
+    api_key = connection.get("api_key")
+
+    if auth_type == "bearer" and api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    if auth_type == "x-api-key" and api_key:
+        headers["x-api-key"] = api_key
+
+    try:
+        response = requests.get(
+            url,
+            headers=headers,
+            timeout=API_SYNC_TIMEOUT_SECONDS
+        )
+    except Exception as e:
+        return {
+            "message_id": message_id,
+            "status": "failed",
+            "reason": f"{type(e).__name__}: {str(e)}"
+        }
+
+    if response.status_code >= 400:
+        return {
+            "message_id": message_id,
+            "status": "failed",
+            "reason": f"Gmail returned {response.status_code}: {response.text[:500]}"
+        }
+
+    try:
+        message = response.json()
+    except Exception as e:
+        return {
+            "message_id": message_id,
+            "status": "failed",
+            "reason": f"Could not parse Gmail JSON: {type(e).__name__}: {str(e)}"
+        }
+
+    payload = message.get("payload") or {}
+    headers_list = payload.get("headers") or []
+
+    subject = _gmail_header(headers_list, "Subject") or "(no subject)"
+    sender = _gmail_header(headers_list, "From")
+    to = _gmail_header(headers_list, "To")
+    cc = _gmail_header(headers_list, "Cc")
+    date_header = _gmail_header(headers_list, "Date")
+    snippet = message.get("snippet") or ""
+
+    body_text = _extract_gmail_body_from_payload(payload)
+
+    if not body_text and snippet:
+        body_text = snippet
+
+    if not body_text.strip():
+        return {
+            "message_id": message_id,
+            "subject": subject,
+            "status": "skipped",
+            "reason": "No readable email body"
+        }
+
+    internal_date = message.get("internalDate")
+    email_date = ""
+
+    if date_header:
+        email_date = date_header
+    elif internal_date:
+        try:
+            email_date = datetime.fromtimestamp(
+                int(internal_date) / 1000,
+                tz=timezone.utc
+            ).isoformat()
+        except Exception:
+            email_date = ""
+
+    final_content = f"""
+Gmail email source metadata:
+Gmail message id: {message_id}
+Thread id: {message.get("threadId") or ""}
+Subject: {subject}
+From: {sender}
+To: {to}
+Cc: {cc}
+Date: {email_date}
+Snippet: {snippet}
+
+---
+
+Email body:
+{body_text}
+""".strip()
+
+    safe_subject = safe_filename(subject)[:80] or "email"
+    final_file_name = f"email-{safe_subject}-{message_id}.txt"
+    
+    try:
+        seeded = seed_text_asset(
+            file_name=final_file_name,
+            content=final_content,
+            yacht_id=admin_crew["yacht_id"],
+            uploaded_by=admin_crew["id"],
+            security_level=security_level
+        )
+
+        return {
+            "message_id": message_id,
+            "subject": subject,
+            "from": sender,
+            "date": email_date,
+            "status": "synced",
+            "asset_id": seeded.get("asset", {}).get("id"),
+            "duplicate": seeded.get("duplicate", False)
+        }
+
+    except Exception as e:
+        return {
+            "message_id": message_id,
+            "subject": subject,
+            "status": "failed",
+            "reason": f"Could not save Gmail email: {type(e).__name__}: {str(e)}"
+        }
+
+
+def sync_gmail_messages_from_connection(
+    connection: dict,
+    admin_crew: dict,
+    security_level: int,
+    endpoint_path: str | None = None,
+    max_results: int | None = None
+) -> dict:
+    """
+    Lists Gmail messages and syncs each one into the existing searchable asset system.
+
+    Expected connection:
+    - base_url: https://gmail.googleapis.com/gmail/v1/users/me/messages
+    - auth_type: bearer
+    - api_key: Google OAuth access token with Gmail readonly scope
+    """
+
+    limit = int(max_results or GMAIL_SYNC_MAX_RESULTS)
+
+    if limit < 1:
+        limit = 1
+
+    if limit > 100:
+        limit = 100
+
+    base_url = connection["base_url"].rstrip("/")
+    clean_path = (endpoint_path or "").strip()
+
+    if clean_path:
+        url = f"{base_url}/{clean_path.lstrip('/')}"
+    else:
+        url = base_url
+
+    headers = {
+        "Accept": "application/json"
+    }
+
+    extra_headers = connection.get("extra_headers") or {}
+
+    if isinstance(extra_headers, dict):
+        headers.update(extra_headers)
+
+    auth_type = (connection.get("auth_type") or "none").lower()
+    api_key = connection.get("api_key")
+
+    if auth_type == "bearer" and api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    if auth_type == "x-api-key" and api_key:
+        headers["x-api-key"] = api_key
+
+    params = {
+        "maxResults": limit,
+        "q": "in:anywhere -in:chats"
+    }
+
+    try:
+        response = requests.get(
+            url,
+            headers=headers,
+            params=params,
+            timeout=API_SYNC_TIMEOUT_SECONDS
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Gmail request failed: {type(e).__name__}: {str(e)}"
+        )
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Gmail returned {response.status_code}: {response.text[:1000]}"
+        )
+
+    try:
+        data = response.json()
+    except Exception:
+        raise HTTPException(
+            status_code=502,
+            detail="Gmail returned invalid JSON"
+        )
+
+    messages = data.get("messages") or []
+
+    results = []
+
+    for gmail_message in messages:
+        result = sync_one_gmail_message(
+            gmail_message=gmail_message,
+            connection=connection,
+            admin_crew=admin_crew,
+            security_level=security_level
+        )
+        results.append(result)
+
+    synced_count = len([r for r in results if r.get("status") == "synced"])
+    skipped_count = len([r for r in results if r.get("status") == "skipped"])
+    failed_count = len([r for r in results if r.get("status") == "failed"])
+
+    return {
+        "message": "Gmail sync completed",
+        "provider": "gmail",
+        "synced_count": synced_count,
+        "skipped_count": skipped_count,
+        "failed_count": failed_count,
+        "results": results
+    }
+    
+
+
+def sync_api_connection(
+    connection_id: str,
+    admin_crew: dict,
+    endpoint_path: str | None = None,
+    method: str = "GET",
+    payload: dict | None = None,
+    file_name: str | None = None,
+    security_level: int = 1
+):
+    """
+    Calls the external API, converts the response into text, and saves it
+    as a searchable asset using the existing asset/chunk pipeline.
+    """
+
+    _require_tier_1_admin(admin_crew)
+
+    connection = get_api_connection_for_admin(connection_id=connection_id, admin_crew=admin_crew)
+
+    if security_level is None:
+        security_level = connection.get("security_level") or 1
+
+    security_level = int(security_level)
+
+    if security_level not in [1, 2, 3]:
+        raise HTTPException(status_code=400, detail="security_level must be 1, 2, or 3")
+
+    base_url = connection["base_url"].rstrip("/")
+    clean_path = (endpoint_path or "").strip()
+
+    if clean_path:
+        url = f"{base_url}/{clean_path.lstrip('/')}"
+    else:
+        url = base_url
+
+    headers = {
+        "Accept": "application/json"
+    }
+
+    extra_headers = connection.get("extra_headers") or {}
+
+    if isinstance(extra_headers, dict):
+        headers.update(extra_headers)
+
+    auth_type = (connection.get("auth_type") or "none").lower()
+    api_key = connection.get("api_key")
+
+    if auth_type == "bearer":
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    if auth_type == "x-api-key":
+        headers["x-api-key"] = api_key
+
+    clean_method = (method or "GET").upper()
+
+    if clean_method not in ["GET", "POST"]:
+        raise HTTPException(status_code=400, detail="method must be GET or POST")
+
+    try:
+        if clean_method == "POST":
+            response = requests.post(
+                url,
+                json=payload or {},
+                headers=headers,
+                timeout=API_SYNC_TIMEOUT_SECONDS
+            )
+        else:
+            response = requests.get(
+                url,
+                headers=headers,
+                timeout=API_SYNC_TIMEOUT_SECONDS
+            )
+
+    except Exception as e:
+        error_text = f"{type(e).__name__}: {str(e)}"
+
+        supabase.table("api_connections").update({
+            "last_synced_at": datetime.now(timezone.utc).isoformat(),
+            "last_sync_status": "failed",
+            "last_sync_error": error_text
+        }).eq("id", connection_id).eq("yacht_id", admin_crew["yacht_id"]).execute()
+
+        raise HTTPException(
+            status_code=502,
+            detail=f"External API request failed: {error_text}"
+        )
+
+    if response.status_code >= 400:
+        error_text = response.text[:1000]
+
+        supabase.table("api_connections").update({
+            "last_synced_at": datetime.now(timezone.utc).isoformat(),
+            "last_sync_status": "failed",
+            "last_sync_error": error_text
+        }).eq("id", connection_id).eq("yacht_id", admin_crew["yacht_id"]).execute()
+
+        raise HTTPException(
+            status_code=502,
+            detail=f"External API returned {response.status_code}: {error_text}"
+        )
+
+    content_type = response.headers.get("content-type", "")
+
+    # ------------------------
+    # GMAIL MESSAGE SYNC
+    # ------------------------
+    is_gmail_url = "gmail.googleapis.com/gmail/v1/users/me/messages" in url
+
+    if is_gmail_url:
+        try:
+            gmail_result = sync_gmail_messages_from_connection(
+                connection=connection,
+                admin_crew=admin_crew,
+                security_level=security_level,
+                endpoint_path=endpoint_path,
+                max_results=GMAIL_SYNC_MAX_RESULTS
+            )
+
+            supabase.table("api_connections").update({
+                "last_synced_at": datetime.now(timezone.utc).isoformat(),
+                "last_sync_status": "success" if gmail_result.get("synced_count", 0) > 0 else "failed",
+                "last_sync_error": None if gmail_result.get("synced_count", 0) > 0 else "No Gmail messages were synced"
+            }).eq("id", connection_id).eq("yacht_id", admin_crew["yacht_id"]).execute()
+
+            return {
+                "message": "Gmail email sync completed",
+                "connection_id": connection_id,
+                "url": url,
+                **gmail_result
+            }
+
+        except HTTPException:
+            raise
+
+        except Exception as e:
+            error_text = f"{type(e).__name__}: {str(e)}"
+
+            supabase.table("api_connections").update({
+                "last_synced_at": datetime.now(timezone.utc).isoformat(),
+                "last_sync_status": "failed",
+                "last_sync_error": error_text
+            }).eq("id", connection_id).eq("yacht_id", admin_crew["yacht_id"]).execute()
+
+            raise HTTPException(
+                status_code=502,
+                detail=f"Gmail sync failed: {error_text}"
+            )
+
+    # ------------------------
+    # GOOGLE DRIVE FOLDER / FILE CONTENT SYNC
+    # ------------------------
+    is_google_drive_url = "www.googleapis.com/drive/v3/files" in url
+
+    if is_google_drive_url and "application/json" in content_type:
+        try:
+            data = response.json()
+        except Exception:
+            data = None
+
+        if isinstance(data, dict) and isinstance(data.get("files"), list):
+            results = []
+
+            for drive_file in data.get("files") or []:
+                result = sync_one_google_drive_file(
+                    drive_file=drive_file,
+                    connection=connection,
+                    admin_crew=admin_crew,
+                    security_level=security_level
+                )
+                results.append(result)
+
+            synced_count = len([r for r in results if r.get("status") == "synced"])
+            skipped_count = len([r for r in results if r.get("status") == "skipped"])
+            failed_count = len([r for r in results if r.get("status") == "failed"])
+
+            supabase.table("api_connections").update({
+                "last_synced_at": datetime.now(timezone.utc).isoformat(),
+                "last_sync_status": "success" if synced_count > 0 else "failed",
+                "last_sync_error": None if synced_count > 0 else "No Google Drive files were synced"
+            }).eq("id", connection_id).eq("yacht_id", admin_crew["yacht_id"]).execute()
+
+            return {
+                "message": "Google Drive content sync completed",
+                "connection_id": connection_id,
+                "url": url,
+                "provider": "google_drive",
+                "synced_count": synced_count,
+                "skipped_count": skipped_count,
+                "failed_count": failed_count,
+                "results": results
+            }
+
+    try:
+        if "application/json" in content_type:
+            extracted_content = json.dumps(response.json(), indent=2, ensure_ascii=False)
+        else:
+            extracted_content = response.text
+    except Exception:
+        extracted_content = response.text
+
+    extracted_content = clean_text_for_postgres(extracted_content)
+
+    if not extracted_content.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="External API returned empty content"
+        )
+
+    final_file_name = (
+        file_name
+        or f"api-{connection.get('name', 'connection')}-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.json"
+    )
+
+    asset_result = seed_text_asset(
+        file_name=final_file_name,
+        content=extracted_content,
+        yacht_id=admin_crew["yacht_id"],
+        uploaded_by=admin_crew["id"],
+        security_level=security_level
+    )
+
+    supabase.table("api_connections").update({
+        "last_synced_at": datetime.now(timezone.utc).isoformat(),
+        "last_sync_status": "success",
+        "last_sync_error": None
+    }).eq("id", connection_id).eq("yacht_id", admin_crew["yacht_id"]).execute()
+
+    return {
+        "message": "API connection synced successfully",
+        "connection_id": connection_id,
+        "url": url,
+        "asset_result": asset_result
+    }
+
+
+def ingest_api_data_directly(
+    admin_crew: dict,
+    source_name: str,
+    content: dict | list | str,
+    file_name: str | None = None,
+    security_level: int = 1
+):
+    """
+    Allows a client system to push data directly into BridgeOS by API.
+    This is useful for Zapier, Make, webhooks, CRMs, PMS systems, etc.
+    """
+
+    _require_tier_1_admin(admin_crew)
+
+    security_level = int(security_level)
+
+    if security_level not in [1, 2, 3]:
+        raise HTTPException(
+            status_code=400,
+            detail="security_level must be 1, 2, or 3"
+        )
+
+    clean_source_name = (source_name or "api-data").strip()
+
+    if isinstance(content, str):
+        extracted_content = content
+    else:
+        extracted_content = json.dumps(content, indent=2, ensure_ascii=False)
+
+    extracted_content = clean_text_for_postgres(extracted_content)
+
+    if not extracted_content.strip():
+        raise HTTPException(status_code=400, detail="content is required")
+
+    final_file_name = (
+        file_name
+        or f"{clean_source_name}-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.json"
+    )
+
+    return seed_text_asset(
+        file_name=final_file_name,
+        content=extracted_content,
+        yacht_id=admin_crew["yacht_id"],
+        uploaded_by=admin_crew["id"],
+        security_level=security_level
+    )
 
 
 def get_asset_status(asset_id: str, yacht_id: str):
@@ -1508,12 +3449,15 @@ def create_asset_preview(asset_id: str, crew: dict):
         or "Document preview"
     )
 
-    extracted_text = (
-        asset.get("extracted_text")
-        or asset.get("ocr_text")
-        or asset.get("visual_description")
-        or ""
-    )
+    visual_description = asset.get("visual_description") or ""
+    ocr_text = asset.get("ocr_text") or ""
+    normal_text = asset.get("extracted_text") or ""
+
+    extracted_text = "\n\n".join([
+        "Image visual description:\n" + visual_description if visual_description else "",
+        "OCR text:\n" + ocr_text if ocr_text else "",
+        "Extracted document text:\n" + normal_text if normal_text else ""
+    ]).strip()
 
     storage_path = asset.get("storage_path")
     mime_type = asset.get("mime_type") or "application/octet-stream"
@@ -1579,6 +3523,152 @@ def get_asset_for_download(asset_id: str, crew: dict):
 
     return res.data[0]
 
+def move_asset_to_folder(
+    asset_id: str,
+    folder_name: str | None,
+    admin_crew: dict
+):
+    """
+    Moves one asset into another virtual folder.
+
+    Folders are virtual:
+    - There is no folders table.
+    - A folder exists because assets have folder_name.
+    - Moving a file means updating assets.folder_name.
+    """
+
+    if int(admin_crew["security_level"]) != 1:
+        raise HTTPException(
+            status_code=403,
+            detail="Only Tier 1 admins can move assets"
+        )
+
+    clean_folder_name = (folder_name or "").strip()
+
+    asset_res = supabase.table("assets") \
+        .select("*") \
+        .eq("id", asset_id) \
+        .eq("yacht_id", admin_crew["yacht_id"]) \
+        .execute()
+
+    if not asset_res.data:
+        raise HTTPException(status_code=404, detail="Asset not found")
+
+    folder_security_level = None
+
+    if clean_folder_name:
+        existing_folder_res = supabase.table("assets") \
+            .select("folder_security_level, security_level") \
+            .eq("yacht_id", admin_crew["yacht_id"]) \
+            .eq("folder_name", clean_folder_name) \
+            .limit(1) \
+            .execute()
+
+        if existing_folder_res.data:
+            existing_folder = existing_folder_res.data[0]
+            folder_security_level = (
+                existing_folder.get("folder_security_level")
+                or existing_folder.get("security_level")
+            )
+
+    try:
+        moved_res = supabase.table("assets") \
+            .update({
+                "folder_name": clean_folder_name or None,
+                "folder_security_level": folder_security_level
+            }) \
+            .eq("id", asset_id) \
+            .eq("yacht_id", admin_crew["yacht_id"]) \
+            .execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not move asset: {str(e)}"
+        )
+
+    if not moved_res.data:
+        raise HTTPException(status_code=404, detail="Asset not found")
+
+    return {
+        "message": "Asset moved successfully",
+        "asset": moved_res.data[0]
+    }
+
+def rename_asset(
+    asset_id: str,
+    new_name: str,
+    admin_crew: dict
+):
+    """
+    Renames one asset for display in Yacht Documentation.
+
+    Database sync:
+    - assets.original_file_name
+    - assets.file_name
+    - assets.previous_file_name
+    - assets.renamed_at
+    - assets.renamed_by
+
+    It does not rename the physical storage path.
+    """
+
+    if int(admin_crew["security_level"]) != 1:
+        raise HTTPException(
+            status_code=403,
+            detail="Only Tier 1 admins can rename assets"
+        )
+
+    clean_name = (new_name or "").strip()
+
+    if not clean_name:
+        raise HTTPException(status_code=400, detail="File name is required")
+
+    if len(clean_name) > 180:
+        clean_name = clean_name[:180]
+
+    asset_res = supabase.table("assets") \
+        .select("*") \
+        .eq("id", asset_id) \
+        .eq("yacht_id", admin_crew["yacht_id"]) \
+        .execute()
+
+    if not asset_res.data:
+        raise HTTPException(status_code=404, detail="Asset not found")
+
+    asset = asset_res.data[0]
+
+    previous_name = (
+        asset.get("original_file_name")
+        or asset.get("file_name")
+        or ""
+    )
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    renamed_res = supabase.table("assets") \
+        .update({
+            "original_file_name": clean_name,
+            "file_name": clean_name,
+            "previous_file_name": previous_name,
+            "renamed_at": now,
+            "renamed_by": admin_crew["id"]
+        }) \
+        .eq("id", asset_id) \
+        .eq("yacht_id", admin_crew["yacht_id"]) \
+        .execute()
+
+    if not renamed_res.data:
+        raise HTTPException(status_code=404, detail="Asset not found")
+
+    return {
+        "message": "Asset renamed successfully",
+        "previous_file_name": previous_name,
+        "new_file_name": clean_name,
+        "renamed_at": now,
+        "renamed_by": admin_crew["id"],
+        "asset": renamed_res.data[0]
+    }
+    
 def delete_asset(asset_id: str, admin_crew: dict):
     """
     Deletes one asset from:
@@ -1655,14 +3745,233 @@ def delete_asset(asset_id: str, admin_crew: dict):
         "deleted_file_name": asset.get("original_file_name") or asset.get("file_name")
     }
 
+
+
+def create_asset_folder(
+    folder_name: str,
+    security_level: int,
+    admin_crew: dict
+):
+    """
+    Creates an empty folder in asset_folders.
+
+    Uses service-role Supabase client because backend already checked:
+    - logged-in user
+    - crew profile
+    - Tier 1 admin
+    - yacht_id ownership
+    """
+
+    if int(admin_crew["security_level"]) != 1:
+        raise HTTPException(
+            status_code=403,
+            detail="Only Tier 1 admins can create folders"
+        )
+
+    clean_name = (folder_name or "").strip()
+
+    if not clean_name:
+        raise HTTPException(status_code=400, detail="Folder name is required")
+
+    if len(clean_name) > 180:
+        clean_name = clean_name[:180]
+
+    security_level = int(security_level)
+
+    if security_level not in [1, 2, 3, 4]:
+        raise HTTPException(
+            status_code=400,
+            detail="security_level must be 1, 2, 3, or 4"
+        )
+
+    try:
+        existing = storage_admin.table("asset_folders") \
+            .select("*") \
+            .eq("yacht_id", admin_crew["yacht_id"]) \
+            .ilike("name", clean_name) \
+            .limit(1) \
+            .execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not check existing folder: {str(e)}"
+        )
+
+    if existing.data:
+        raise HTTPException(
+            status_code=409,
+            detail="A folder with this name already exists"
+        )
+
+    try:
+        res = storage_admin.table("asset_folders").insert({
+            "yacht_id": admin_crew["yacht_id"],
+            "name": clean_name,
+            "security_level": security_level,
+            "created_by": admin_crew["id"]
+        }).execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not create folder: {str(e)}"
+        )
+
+    if not res.data:
+        raise HTTPException(status_code=400, detail="Could not create folder")
+
+    return {
+        "message": "Folder created successfully",
+        "folder": res.data[0]
+    }
+
+
+def list_my_asset_folders(crew: dict):
+    """
+    Lists folders visible to the current user.
+    Uses service role because backend already knows the user's yacht and tier.
+    """
+
+    security_level = int(crew["security_level"])
+
+    query = storage_admin.table("asset_folders") \
+        .select("*") \
+        .eq("yacht_id", crew["yacht_id"])
+
+    if security_level == 1:
+        return query.order("created_at", desc=True).execute()
+
+    if security_level in [2, 3]:
+        return query \
+            .gte("security_level", security_level) \
+            .lte("security_level", 3) \
+            .order("created_at", desc=True) \
+            .execute()
+
+    return {"data": []}
+
+
+def rename_asset_folder(
+    old_folder_name: str,
+    new_folder_name: str,
+    admin_crew: dict
+):
+    """
+    Renames a folder in both:
+    - assets.folder_name
+    - asset_folders.name
+
+    Works even if folder is empty.
+    """
+
+    if int(admin_crew["security_level"]) != 1:
+        raise HTTPException(
+            status_code=403,
+            detail="Only Tier 1 admins can rename folders"
+        )
+
+    clean_old_name = (old_folder_name or "").strip()
+    clean_new_name = (new_folder_name or "").strip()
+
+    if not clean_old_name:
+        raise HTTPException(status_code=400, detail="Current folder name is required")
+
+    if not clean_new_name:
+        raise HTTPException(status_code=400, detail="New folder name is required")
+
+    if len(clean_new_name) > 180:
+        clean_new_name = clean_new_name[:180]
+
+    if clean_old_name == clean_new_name:
+        return {
+            "message": "Folder name unchanged",
+            "old_folder_name": clean_old_name,
+            "new_folder_name": clean_new_name,
+            "updated_count": 0
+        }
+
+    existing_old_folder = storage_admin.table("asset_folders") \
+        .select("*") \
+        .eq("yacht_id", admin_crew["yacht_id"]) \
+        .eq("name", clean_old_name) \
+        .limit(1) \
+        .execute()
+
+    existing_old_assets = storage_admin.table("assets") \
+        .select("id") \
+        .eq("yacht_id", admin_crew["yacht_id"]) \
+        .eq("folder_name", clean_old_name) \
+        .limit(1) \
+        .execute()
+
+    if not existing_old_folder.data and not existing_old_assets.data:
+        raise HTTPException(status_code=404, detail="Folder not found")
+
+    existing_new = storage_admin.table("asset_folders") \
+        .select("id") \
+        .eq("yacht_id", admin_crew["yacht_id"]) \
+        .ilike("name", clean_new_name) \
+        .limit(1) \
+        .execute()
+
+    if existing_new.data:
+        raise HTTPException(
+            status_code=409,
+            detail="A folder with this name already exists"
+        )
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    renamed_assets_res = storage_admin.table("assets") \
+        .update({
+            "folder_name": clean_new_name,
+            "renamed_at": now,
+            "renamed_by": admin_crew["id"]
+        }) \
+        .eq("yacht_id", admin_crew["yacht_id"]) \
+        .eq("folder_name", clean_old_name) \
+        .execute()
+
+    if existing_old_folder.data:
+        storage_admin.table("asset_folders") \
+            .update({
+                "name": clean_new_name,
+                "renamed_at": now,
+                "renamed_by": admin_crew["id"]
+            }) \
+            .eq("yacht_id", admin_crew["yacht_id"]) \
+            .eq("name", clean_old_name) \
+            .execute()
+    else:
+        storage_admin.table("asset_folders") \
+            .insert({
+                "yacht_id": admin_crew["yacht_id"],
+                "name": clean_new_name,
+                "security_level": 1,
+                "created_by": admin_crew["id"],
+                "renamed_at": now,
+                "renamed_by": admin_crew["id"]
+            }) \
+            .execute()
+
+    return {
+        "message": "Folder renamed successfully",
+        "old_folder_name": clean_old_name,
+        "new_folder_name": clean_new_name,
+        "updated_count": len(renamed_assets_res.data or []),
+        "assets": renamed_assets_res.data or []
+    }
+
+
 def delete_folder_assets(folder_name: str, admin_crew: dict):
     """
-    Deletes every asset inside one folder_name for this yacht.
+    Deletes a folder.
 
-    Folder is virtual:
-    - There is no folders table.
-    - Folder exists because assets have folder_name.
-    - Deleting the folder means deleting all assets with that folder_name.
+    If folder has files:
+    - deletes all assets inside it
+    - deletes asset_folders row
+
+    If folder is empty:
+    - deletes only asset_folders row
     """
 
     if int(admin_crew["security_level"]) != 1:
@@ -1676,7 +3985,14 @@ def delete_folder_assets(folder_name: str, admin_crew: dict):
     if not clean_folder_name:
         raise HTTPException(status_code=400, detail="Folder name is required")
 
-    folder_assets_res = supabase.table("assets") \
+    folder_row_res = storage_admin.table("asset_folders") \
+        .select("*") \
+        .eq("yacht_id", admin_crew["yacht_id"]) \
+        .eq("name", clean_folder_name) \
+        .limit(1) \
+        .execute()
+
+    folder_assets_res = storage_admin.table("assets") \
         .select("id, file_name, original_file_name, folder_name") \
         .eq("yacht_id", admin_crew["yacht_id"]) \
         .eq("folder_name", clean_folder_name) \
@@ -1684,8 +4000,8 @@ def delete_folder_assets(folder_name: str, admin_crew: dict):
 
     folder_assets = folder_assets_res.data or []
 
-    if not folder_assets:
-        raise HTTPException(status_code=404, detail="Folder not found or empty")
+    if not folder_row_res.data and not folder_assets:
+        raise HTTPException(status_code=404, detail="Folder not found")
 
     deleted = []
 
@@ -1697,13 +4013,24 @@ def delete_folder_assets(folder_name: str, admin_crew: dict):
 
         deleted.append(result)
 
+    try:
+        storage_admin.table("asset_folders") \
+            .delete() \
+            .eq("yacht_id", admin_crew["yacht_id"]) \
+            .eq("name", clean_folder_name) \
+            .execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Folder assets were deleted, but folder row could not be removed: {str(e)}"
+        )
+
     return {
         "message": "Folder deleted successfully",
         "folder_name": clean_folder_name,
         "deleted_count": len(deleted),
         "deleted_assets": deleted
     }
-
 def seed_text_asset(
     file_name: str,
     content: str,
@@ -2104,6 +4431,132 @@ def get_pending_document_for_download(
 
     return res.data[0]
 
+def transcribe_audio(
+    file,
+    filename: str,
+    mime_type: str | None = None
+) -> str:
+    """
+    Sends a voice note to the RunPod speech-to-text endpoint.
+
+    Expected RunPod response:
+    {
+        "text": "transcribed message"
+    }
+
+    It also accepts:
+    {
+        "transcript": "transcribed message"
+    }
+    """
+
+    if not RUNPOD_BASE_URL:
+        raise HTTPException(
+            status_code=500,
+            detail="RUNPOD_BASE_URL is missing"
+        )
+
+    if not BRIDGEOS_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="BRIDGEOS_API_KEY is missing"
+        )
+
+    try:
+        file.seek(0)
+        audio_bytes = file.read()
+        file.seek(0)
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not read voice note: {str(e)}"
+        )
+
+    if not audio_bytes:
+        raise HTTPException(
+            status_code=400,
+            detail="The voice note is empty"
+        )
+
+    # Maximum 25 MB.
+    if len(audio_bytes) > 25 * 1024 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail="Voice note must be smaller than 25 MB"
+        )
+
+    url = f"{RUNPOD_BASE_URL.rstrip('/')}/api/bridgeos/transcribe"
+
+    try:
+        response = requests.post(
+            url,
+            files={
+                "file": (
+                    filename or "voice-note.webm",
+                    audio_bytes,
+                    mime_type or "audio/webm"
+                )
+            },
+            headers={
+                "x-api-key": BRIDGEOS_API_KEY
+            },
+            timeout=180
+        )
+
+        print("VOICE TRANSCRIPTION DEBUG URL:", url)
+        print("VOICE TRANSCRIPTION DEBUG STATUS:", response.status_code)
+        print("VOICE TRANSCRIPTION DEBUG RESPONSE:", response.text[:500])
+
+    except requests.exceptions.Timeout:
+        raise HTTPException(
+            status_code=504,
+            detail="Voice transcription timed out"
+        )
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Could not connect to the voice transcription service: "
+                f"{type(e).__name__}: {str(e)}"
+            )
+        )
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Voice transcription returned {response.status_code}: "
+                f"{response.text[:500]}"
+            )
+        )
+
+    try:
+        data = response.json()
+    except Exception:
+        raise HTTPException(
+            status_code=502,
+            detail="Voice transcription returned invalid JSON"
+        )
+
+    transcript = (
+        data.get("text")
+        or data.get("transcript")
+        or data.get("response")
+        or data.get("result", {}).get("text")
+        or ""
+    )
+
+    transcript = clean_text_for_postgres(str(transcript or ""))
+
+    if not transcript:
+        raise HTTPException(
+            status_code=422,
+            detail="No speech could be detected in the voice note"
+        )
+
+    return transcript
+
 def upload_asset(
     file,
     filename: str,
@@ -2124,12 +4577,16 @@ def upload_asset(
 
     clean_filename = safe_filename(filename)
     file_type = detect_file_type(clean_filename, mime_type)
+
+    if clean_filename.lower().endswith(".zip"):
+        file_type = "whatsapp_zip"
+
     security_level = int(security_level)
 
-    if security_level not in [1, 2, 3]:
+    if security_level not in [1, 2, 3, 4]:
         raise HTTPException(
             status_code=400,
-            detail="security_level must be 1, 2, or 3"
+            detail="security_level must be 1, 2, 3, or 4"
         )
         
     if chat_id:
@@ -2251,7 +4708,8 @@ def upload_asset(
             file_type=file_type,
             yacht_id=yacht_id,
             chat_id=chat_id,
-            security_level=security_level
+            security_level=security_level,
+            uploaded_by=uploaded_by
         )
     except Exception as e:
         supabase.table("assets").update({
@@ -2322,10 +4780,16 @@ def process_uploaded_asset(
     file_type: str,
     yacht_id: str,
     chat_id: str | None = None,
-    security_level: int = 1
+    security_level: int = 1,
+    uploaded_by: str | None = None
 ):
     """
     Converts a raw uploaded file into searchable memory.
+
+    Important:
+    - PDFs are allowed to reach OCR even when normal text extraction is empty.
+    - A document fails only after every applicable extraction method fails.
+    - Extracted text and OCR text are both saved and chunked.
     """
 
     try:
@@ -2337,33 +4801,439 @@ def process_uploaded_asset(
         extracted_text = ""
         visual_description = ""
         ocr_text = ""
+        whatsapp_messages = []
+        whatsapp_source_text_file_name = None
 
-        if file_type in ["text", "pdf", "docx"]:
+        original_file_type = file_type
+
+        # =====================================================
+        # WHATSAPP ZIP
+        # =====================================================
+        if file_type == "whatsapp_zip":
             file.seek(0)
+
+            (
+                extracted_text,
+                whatsapp_messages,
+                whatsapp_source_text_file_name
+            ) = extract_whatsapp_zip_payload(
+                file=file,
+                filename=filename
+            )
+
+            extracted_text = clean_text_for_postgres(
+                extracted_text
+            )
+
+            file_type = "whatsapp_chat"
+
+        # =====================================================
+        # AUDIO
+        # =====================================================
+        elif file_type == "audio":
+            file.seek(0)
+
+            extracted_text = transcribe_audio(
+                file=file,
+                filename=filename,
+                mime_type=None
+            )
+
+            extracted_text = clean_text_for_postgres(
+                extracted_text
+            )
+
+            if not extracted_text.strip():
+                raise ValueError(
+                    "The audio file did not contain detectable speech."
+                )
+
+        # =====================================================
+        # TEXT / DOCX
+        # =====================================================
+        elif file_type in ["text", "docx"]:
+            file.seek(0)
+
             extracted_text = extract_text_by_file_type(
                 file=file,
                 filename=filename,
                 file_type=file_type
             )
 
-            extracted_text = clean_text_for_postgres(extracted_text)
+            extracted_text = clean_text_for_postgres(
+                extracted_text
+            )
 
-        if file_type == "image":
-            file.seek(0)
-            visual_description = describe_image(file, filename)
+            if (
+                file_type == "text"
+                and is_whatsapp_export_text(
+                    extracted_text,
+                    filename
+                )
+            ):
+                (
+                    extracted_text,
+                    whatsapp_messages
+                ) = normalise_whatsapp_export_text(
+                    text=extracted_text,
+                    filename=filename
+                )
 
-            file.seek(0)
-            ocr_text = extract_ocr_from_image(file, filename)
+                extracted_text = clean_text_for_postgres(
+                    extracted_text
+                )
 
-        combined_text = "\n\n".join([
+                whatsapp_source_text_file_name = filename
+                file_type = "whatsapp_chat"
+
+            if not extracted_text.strip():
+                raise ValueError(
+                    f"No readable text was extracted from {filename}."
+                )
+
+        # =====================================================
+        # PDF
+        # =====================================================
+        elif file_type == "pdf":
+            # First try normal PDF text extraction.
+            try:
+                file.seek(0)
+
+                extracted_text = extract_text_by_file_type(
+                    file=file,
+                    filename=filename,
+                    file_type="pdf"
+                )
+
+                extracted_text = clean_text_for_postgres(
+                    extracted_text
+                )
+
+            except Exception as extraction_error:
+                print(
+                    "PDF NORMAL TEXT EXTRACTION ERROR:",
+                    {
+                        "asset_id": asset_id,
+                        "filename": filename,
+                        "error_type": type(
+                            extraction_error
+                        ).__name__,
+                        "error": str(extraction_error)
+                    }
+                )
+
+                extracted_text = ""
+
+            extracted_clean = extracted_text.strip()
+
+            digit_count = sum(
+                character.isdigit()
+                for character in extracted_clean
+            )
+
+            lower_filename = (
+                filename or ""
+            ).lower()
+
+            financial_file_words = [
+                "invoice",
+                "receipt",
+                "quote",
+                "quotation",
+                "statement",
+                "purchase",
+                "order",
+                "bill",
+                "payment",
+                "expense",
+                "tax",
+                "vat"
+            ]
+
+            likely_financial_pdf = any(
+                word in lower_filename
+                for word in financial_file_words
+            )
+
+            should_run_pdf_ocr = (
+                not extracted_clean
+                or len(extracted_clean) < 300
+                or digit_count < 8
+                or likely_financial_pdf
+            )
+
+            print(
+                "PDF EXTRACTION DECISION:",
+                {
+                    "asset_id": asset_id,
+                    "filename": filename,
+                    "normal_text_characters": len(
+                        extracted_clean
+                    ),
+                    "normal_text_digit_count": (
+                        digit_count
+                    ),
+                    "likely_financial_pdf": (
+                        likely_financial_pdf
+                    ),
+                    "run_ocr": should_run_pdf_ocr
+                }
+            )
+
+            if should_run_pdf_ocr:
+                try:
+                    file.seek(0)
+
+                    pdf_ocr_text = (
+                        extract_ocr_from_pdf_pages(
+                            file=file,
+                            filename=filename,
+                            max_pages=30
+                        )
+                    )
+
+                    pdf_ocr_text = (
+                        clean_text_for_postgres(
+                            pdf_ocr_text
+                        )
+                    )
+
+                    if (
+                        pdf_ocr_text
+                        and pdf_ocr_text
+                        != "NO_READABLE_TEXT"
+                    ):
+                        ocr_text = pdf_ocr_text
+
+                except Exception as ocr_error:
+                    print(
+                        "PDF OCR ERROR:",
+                        {
+                            "asset_id": asset_id,
+                            "filename": filename,
+                            "error_type": type(
+                                ocr_error
+                            ).__name__,
+                            "error": str(ocr_error)
+                        }
+                    )
+
+                    ocr_text = ""
+
+            # Do not fail until normal extraction AND OCR both fail.
+            if (
+                not extracted_text.strip()
+                and not ocr_text.strip()
+            ):
+                raise ValueError(
+                    f"No readable text or OCR text was extracted "
+                    f"from {filename}. The PDF may be damaged, "
+                    f"encrypted, empty, or unsupported."
+                )
+
+        # =====================================================
+        # IMAGE
+        # =====================================================
+        elif file_type == "image":
+            try:
+                file.seek(0)
+
+                visual_description = describe_image(
+                    file,
+                    filename
+                )
+
+                visual_description = (
+                    clean_text_for_postgres(
+                        visual_description
+                    )
+                )
+
+            except Exception as description_error:
+                print(
+                    "IMAGE DESCRIPTION ERROR:",
+                    {
+                        "asset_id": asset_id,
+                        "filename": filename,
+                        "error_type": type(
+                            description_error
+                        ).__name__,
+                        "error": str(description_error)
+                    }
+                )
+
+                visual_description = ""
+
+            try:
+                file.seek(0)
+
+                ocr_text = extract_ocr_from_image(
+                    file,
+                    filename
+                )
+
+                ocr_text = clean_text_for_postgres(
+                    ocr_text
+                )
+
+                if ocr_text == "NO_READABLE_TEXT":
+                    ocr_text = ""
+
+            except Exception as ocr_error:
+                print(
+                    "IMAGE OCR ERROR:",
+                    {
+                        "asset_id": asset_id,
+                        "filename": filename,
+                        "error_type": type(
+                            ocr_error
+                        ).__name__,
+                        "error": str(ocr_error)
+                    }
+                )
+
+                ocr_text = ""
+
+            if (
+                not visual_description.strip()
+                and not ocr_text.strip()
+            ):
+                raise ValueError(
+                    f"No visual description or OCR text was "
+                    f"extracted from {filename}."
+                )
+
+        # =====================================================
+        # OTHER FILE TYPES
+        # =====================================================
+        else:
+            try:
+                file.seek(0)
+
+                extracted_text = extract_text_by_file_type(
+                    file=file,
+                    filename=filename,
+                    file_type=file_type
+                )
+
+                extracted_text = (
+                    clean_text_for_postgres(
+                        extracted_text
+                    )
+                )
+
+            except Exception as extraction_error:
+                print(
+                    "GENERIC FILE EXTRACTION ERROR:",
+                    {
+                        "asset_id": asset_id,
+                        "filename": filename,
+                        "file_type": file_type,
+                        "error_type": type(
+                            extraction_error
+                        ).__name__,
+                        "error": str(extraction_error)
+                    }
+                )
+
+                extracted_text = ""
+
+            if not extracted_text.strip():
+                raise ValueError(
+                    f"No readable content was extracted "
+                    f"from {filename}."
+                )
+
+        # =====================================================
+        # BUILD COMPLETE SEARCHABLE TEXT
+        # =====================================================
+        actual_document_content = "\n\n".join(
+            part.strip()
+            for part in [
+                extracted_text,
+                visual_description,
+                ocr_text
+            ]
+            if str(part or "").strip()
+            and str(part or "").strip() != "NO_READABLE_TEXT"
+        ).strip()
+
+        if not actual_document_content:
+            raise ValueError(
+                f"No readable content was extracted from {filename}. "
+                f"file_type={file_type}. "
+                "The file must not be marked as processed."
+            )
+        
+        combined_parts = [
             f"File name: {filename}",
-            f"File type: {file_type}",
-            f"Extracted text:\n{extracted_text}" if extracted_text else "",
-            f"Image visual description:\n{visual_description}" if visual_description else "",
-            f"OCR text:\n{ocr_text}" if ocr_text else ""
-        ]).strip()
+            f"File type: {file_type}"
+        ]
 
-        detected_date, date_source = extract_date_from_filename(filename)
+        if extracted_text.strip():
+            combined_parts.append(
+                "Extracted text:\n"
+                + extracted_text.strip()
+            )
+
+        if visual_description.strip():
+            combined_parts.append(
+                "Image visual description:\n"
+                + visual_description.strip()
+            )
+
+        if ocr_text.strip():
+            combined_parts.append(
+                "OCR text:\n"
+                + ocr_text.strip()
+            )
+
+        combined_text = "\n\n".join(
+            combined_parts
+        ).strip()
+
+        print(
+            "FINAL DOCUMENT EXTRACTION RESULT:",
+            {
+                "asset_id": asset_id,
+                "filename": filename,
+                "original_file_type": (
+                    original_file_type
+                ),
+                "final_file_type": file_type,
+                "extracted_text_characters": len(
+                    extracted_text
+                ),
+                "ocr_text_characters": len(
+                    ocr_text
+                ),
+                "visual_description_characters": len(
+                    visual_description
+                ),
+                "combined_characters": len(
+                    combined_text
+                ),
+                "extracted_preview": (
+                    extracted_text[:500]
+                ),
+                "ocr_preview": ocr_text[:500]
+            }
+        )
+
+        if not combined_text.strip():
+            raise ValueError(
+                f"No searchable content was created "
+                f"for {filename}."
+            )
+
+        # =====================================================
+        # METADATA
+        # =====================================================
+        detected_date, date_source = (
+            extract_date_from_filename(
+                filename
+            )
+        )
 
         detected_year = None
         detected_month = None
@@ -2374,28 +5244,63 @@ def process_uploaded_asset(
             detected_month = detected_date.month
             detected_day = detected_date.day
         else:
-            detected_year = extract_year_from_text(combined_text)
+            detected_year = extract_year_from_text(
+                combined_text
+            )
 
-        detected_event = detect_event(combined_text)
-        tags = generate_basic_tags(combined_text)
+        detected_event = detect_event(
+            combined_text
+        )
 
-        summary = combined_text[:1500] if combined_text else None
+        tags = generate_basic_tags(
+            combined_text
+        )
 
-        supabase.table("assets").update({
-            "extracted_text": extracted_text or None,
-            "visual_description": visual_description or None,
-            "ocr_text": ocr_text or None,
-            "detected_date": detected_date.isoformat() if detected_date else None,
-            "detected_year": detected_year,
-            "detected_month": detected_month,
-            "detected_day": detected_day,
-            "date_source": date_source,
-            "detected_event": detected_event,
-            "tags": tags,
-            "summary": summary,
-            "processing_status": "processed"
-        }).eq("id", asset_id).execute()
+        summary = combined_text[:1500]
 
+        # =====================================================
+        # SAVE PROCESSED ASSET
+        # =====================================================
+        update_result = (
+            supabase.table("assets")
+            .update({
+                "file_type": file_type,
+                "extracted_text": (
+                    extracted_text or None
+                ),
+                "visual_description": (
+                    visual_description or None
+                ),
+                "ocr_text": ocr_text or None,
+                "detected_date": (
+                    detected_date.isoformat()
+                    if detected_date
+                    else None
+                ),
+                "detected_year": detected_year,
+                "detected_month": detected_month,
+                "detected_day": detected_day,
+                "date_source": date_source,
+                "detected_event": detected_event,
+                "tags": tags,
+                "summary": summary,
+                "processing_status": "processed",
+                "processing_error": None
+            })
+            .eq("id", asset_id)
+            .eq("yacht_id", yacht_id)
+            .execute()
+        )
+
+        if not update_result.data:
+            raise RuntimeError(
+                "The extracted document could not be "
+                "saved to the assets table."
+            )
+
+        # =====================================================
+        # CREATE SEARCHABLE CHUNKS
+        # =====================================================
         create_asset_chunks(
             asset_id=asset_id,
             yacht_id=yacht_id,
@@ -2411,11 +5316,74 @@ def process_uploaded_asset(
             security_level=security_level
         )
 
+        # =====================================================
+        # SAVE WHATSAPP STRUCTURED HISTORY
+        # =====================================================
+        if whatsapp_messages:
+            try:
+                save_whatsapp_chat_history(
+                    asset_id=asset_id,
+                    yacht_id=yacht_id,
+                    chat_id=chat_id,
+                    uploaded_by=uploaded_by,
+                    original_file_name=filename,
+                    source_text_file_name=(
+                        whatsapp_source_text_file_name
+                    ),
+                    messages=whatsapp_messages
+                )
+
+            except Exception as whatsapp_error:
+                print(
+                    "WHATSAPP STRUCTURED SAVE ERROR:",
+                    {
+                        "asset_id": asset_id,
+                        "error_type": type(
+                            whatsapp_error
+                        ).__name__,
+                        "error": str(whatsapp_error)
+                    }
+                )
+
+        print(
+            "ASSET PROCESSING COMPLETED:",
+            {
+                "asset_id": asset_id,
+                "filename": filename,
+                "file_type": file_type,
+                "status": "processed"
+            }
+        )
+
     except Exception as e:
-        supabase.table("assets").update({
-            "processing_status": "failed",
-            "processing_error": str(e)
-        }).eq("id", asset_id).execute()
+        error_message = (
+            f"{type(e).__name__}: {str(e)}"
+        )
+
+        print(
+            "ASSET PROCESSING FAILED:",
+            {
+                "asset_id": asset_id,
+                "filename": filename,
+                "file_type": file_type,
+                "error": error_message
+            }
+        )
+
+        try:
+            supabase.table("assets").update({
+                "processing_status": "failed",
+                "processing_error": (
+                    error_message[:4000]
+                )
+            }).eq("id", asset_id).execute()
+
+        except Exception as update_error:
+            print(
+                "FAILED STATUS UPDATE ERROR:",
+                type(update_error).__name__,
+                str(update_error)
+            )
 
         raise
 
@@ -2434,11 +5402,72 @@ def create_asset_chunks(
     security_level: int = 1
 ):
     """
-    Creates searchable chunks for asset metadata, text, OCR, and image captions.
+    Creates searchable chunks for actual extracted document content.
+
+    A metadata chunk is included, but metadata alone is not enough
+    to treat the asset as searchable.
     """
 
     tags = tags or []
+
+    clean_extracted_text = str(extracted_text or "").strip()
+    clean_visual_description = str(
+        visual_description or ""
+    ).strip()
+    clean_ocr_text = str(ocr_text or "").strip()
+
+    if clean_ocr_text == "NO_READABLE_TEXT":
+        clean_ocr_text = ""
+
+    actual_content_exists = bool(
+        clean_extracted_text
+        or clean_visual_description
+        or clean_ocr_text
+    )
+
+    if not actual_content_exists:
+        raise ValueError(
+            f"No actual searchable content exists for asset {asset_id}"
+        )
+
+    try:
+        supabase.table("asset_chunks") \
+            .delete() \
+            .eq("asset_id", asset_id) \
+            .eq("yacht_id", yacht_id) \
+            .execute()
+
+    except Exception as error:
+        print(
+            "OLD ASSET CHUNK DELETE ERROR:",
+            type(error).__name__,
+            str(error)
+        )
+
     rows = []
+
+    def create_embedding_safely(content: str):
+        try:
+            vector = embed(content)
+
+            if not isinstance(vector, list):
+                return None
+
+            if not vector:
+                return None
+
+            if not any(float(value or 0) != 0 for value in vector):
+                return None
+
+            return vector
+
+        except Exception as error:
+            print(
+                "CHUNK EMBEDDING ERROR:",
+                type(error).__name__,
+                str(error)
+            )
+            return None
 
     metadata_content = f"""
 File name: {filename}
@@ -2455,20 +5484,97 @@ Tags: {", ".join(tags)}
         "content": metadata_content,
         "content_type": "metadata",
         "chunk_index": 0,
-        "detected_date": detected_date.isoformat() if detected_date else None,
+        "detected_date": (
+            detected_date.isoformat()
+            if detected_date
+            else None
+        ),
         "detected_year": detected_year,
         "tags": tags,
-        "embedding": embed(metadata_content)
+        "embedding": create_embedding_safely(
+            metadata_content
+        )
     })
 
-    if visual_description:
-        content = f"""
-Image visual description:
-{visual_description}
+    next_chunk_index = 1
 
+    if clean_extracted_text:
+        text_chunks = chunk_text(
+            clean_extracted_text,
+            chunk_size=1800,
+            overlap=300
+        )
+
+        for chunk in text_chunks:
+            chunk_content = f"""
 File name: {filename}
-Detected year: {detected_year or ""}
-Tags: {", ".join(tags)}
+Document text:
+{chunk}
+""".strip()
+
+            rows.append({
+                "asset_id": asset_id,
+                "yacht_id": yacht_id,
+                "chat_id": chat_id,
+                "security_level": security_level,
+                "content": chunk_content,
+                "content_type": "document_text",
+                "chunk_index": next_chunk_index,
+                "detected_date": (
+                    detected_date.isoformat()
+                    if detected_date
+                    else None
+                ),
+                "detected_year": detected_year,
+                "tags": tags,
+                "embedding": create_embedding_safely(
+                    chunk_content
+                )
+            })
+
+            next_chunk_index += 1
+
+    if clean_ocr_text:
+        ocr_chunks = chunk_text(
+            clean_ocr_text,
+            chunk_size=1800,
+            overlap=300
+        )
+
+        for chunk in ocr_chunks:
+            chunk_content = f"""
+File name: {filename}
+OCR document text:
+{chunk}
+""".strip()
+
+            rows.append({
+                "asset_id": asset_id,
+                "yacht_id": yacht_id,
+                "chat_id": chat_id,
+                "security_level": security_level,
+                "content": chunk_content,
+                "content_type": "ocr",
+                "chunk_index": next_chunk_index,
+                "detected_date": (
+                    detected_date.isoformat()
+                    if detected_date
+                    else None
+                ),
+                "detected_year": detected_year,
+                "tags": tags,
+                "embedding": create_embedding_safely(
+                    chunk_content
+                )
+            })
+
+            next_chunk_index += 1
+
+    if clean_visual_description:
+        visual_content = f"""
+File name: {filename}
+Image visual description:
+{clean_visual_description}
 """.strip()
 
         rows.append({
@@ -2476,72 +5582,115 @@ Tags: {", ".join(tags)}
             "yacht_id": yacht_id,
             "chat_id": chat_id,
             "security_level": security_level,
-            "content": content,
+            "content": visual_content,
             "content_type": "image_caption",
-            "chunk_index": 0,
-            "detected_date": detected_date.isoformat() if detected_date else None,
+            "chunk_index": next_chunk_index,
+            "detected_date": (
+                detected_date.isoformat()
+                if detected_date
+                else None
+            ),
             "detected_year": detected_year,
             "tags": tags,
-            "embedding": embed(content)
+            "embedding": create_embedding_safely(
+                visual_content
+            )
         })
 
-    if ocr_text:
-        for index, chunk in enumerate(chunk_text(ocr_text)):
-            rows.append({
-                "asset_id": asset_id,
-                "yacht_id": yacht_id,
-                "chat_id": chat_id,
-                "security_level": security_level,
-                "content": chunk,
-                "content_type": "ocr",
-                "chunk_index": index,
-                "detected_date": detected_date.isoformat() if detected_date else None,
-                "detected_year": detected_year,
-                "tags": tags,
-                "embedding": embed(chunk)
-            })
+    actual_content_rows = [
+        row
+        for row in rows
+        if row.get("content_type") != "metadata"
+    ]
 
-    if extracted_text:
-        for index, chunk in enumerate(chunk_text(extracted_text)):
-            rows.append({
-                "asset_id": asset_id,
-                "yacht_id": yacht_id,
-                "chat_id": chat_id,
-                "security_level": security_level,
-                "content": chunk,
-                "content_type": "text",
-                "chunk_index": index,
-                "detected_date": detected_date.isoformat() if detected_date else None,
-                "detected_year": detected_year,
-                "tags": tags,
-                "embedding": embed(chunk)
-            })
+    if not actual_content_rows:
+        raise ValueError(
+            f"Only metadata was generated for asset {asset_id}. "
+            "No document text or OCR chunks were created."
+        )
 
-    if rows:
-        supabase.table("asset_chunks").insert(rows).execute()
+    for start in range(0, len(rows), 200):
+        batch = rows[start:start + 200]
 
-def build_context_from_asset_results(results: list[dict]) -> str:
+        result = (
+            supabase.table("asset_chunks")
+            .insert(batch)
+            .execute()
+        )
+
+        if not result.data:
+            raise RuntimeError(
+                f"Supabase returned no inserted chunks "
+                f"for asset {asset_id}"
+            )
+
+    verification = (
+        supabase.table("asset_chunks")
+        .select("id, content_type")
+        .eq("asset_id", asset_id)
+        .eq("yacht_id", yacht_id)
+        .execute()
+    )
+
+    inserted_rows = verification.data or []
+
+    inserted_actual_content_rows = [
+        row
+        for row in inserted_rows
+        if row.get("content_type") != "metadata"
+    ]
+
+    if not inserted_actual_content_rows:
+        raise RuntimeError(
+            f"No real document chunks were found after inserting "
+            f"asset {asset_id}"
+        )
+
+    print(
+        "ASSET CHUNKS CREATED:",
+        {
+            "asset_id": asset_id,
+            "total_chunk_count": len(inserted_rows),
+            "actual_content_chunk_count": len(
+                inserted_actual_content_rows
+            ),
+            "text_characters": len(
+                clean_extracted_text
+            ),
+            "ocr_characters": len(
+                clean_ocr_text
+            )
+        }
+    )
+
+def build_context_from_asset_results(
+    results: list[dict]
+) -> str:
     """
-    Builds the private context sent to the LLM.
-
-    Important:
-    - Do not include file_url.
-    - Do not include storage_path.
-    - Only include text/chunks that already passed yacht/user access checks.
+    Builds private document context without exposing storage information.
     """
 
     parts = []
 
-    for index, row in enumerate(results, start=1):
+    for index, row in enumerate(results or [], start=1):
+        content = str(
+            row.get("search_text")
+            or row.get("content")
+            or ""
+        ).strip()
+
+        if not content:
+            continue
+
         part = f"""
 SOURCE {index}
-File name: {row.get("file_name")}
+File name: {row.get("original_file_name") or row.get("file_name")}
 File type: {row.get("file_type")}
 Content type: {row.get("content_type")}
 Detected year: {row.get("detected_year")}
 
 Content:
-{row.get("content")}
+{content}
 """.strip()
 
         parts.append(part)
@@ -2565,15 +5714,16 @@ def get_uploaded_chat_asset_rows(
     if not uploaded_asset_id:
         return []
 
-    accessible_asset_ids = get_accessible_asset_ids(
-        crew_id=crew_id,
-        yacht_id=yacht_id,
-        security_level=security_level
-    )
+    asset_owner_check = supabase.table("assets") \
+        .select("id, uploaded_by, chat_id, yacht_id") \
+        .eq("id", uploaded_asset_id) \
+        .eq("yacht_id", yacht_id) \
+        .eq("chat_id", chat_id) \
+        .eq("uploaded_by", crew_id) \
+        .execute()
 
-    if uploaded_asset_id not in accessible_asset_ids:
+    if not asset_owner_check.data:
         raise HTTPException(status_code=403, detail="No access to this uploaded file")
-
     asset_res = supabase.table("assets") \
         .select("""
             id,
@@ -2742,80 +5892,458 @@ def build_sources_from_asset_results(results: list[dict]) -> list[dict]:
 
     return sources
 
+def is_bad_uploaded_file_answer(answer: str, query: str) -> bool:
+    """
+    Generic quality guard for uploaded-file answers.
+    Prevents lazy, one-word, vague, or non-answer replies.
+    No content hard-coding.
+    """
+
+    clean_answer = (answer or "").strip()
+    clean_query = (query or "").strip().lower()
+
+    if not clean_answer:
+        return True
+
+    lower_answer = clean_answer.lower().strip(" .,!?\n\t")
+
+    bad_short_answers = {
+        "good",
+        "bad",
+        "yes",
+        "no",
+        "maybe",
+        "ok",
+        "okay",
+        "fine",
+        "unclear",
+        "not sure",
+    }
+
+    if lower_answer in bad_short_answers:
+        return True
+
+    if len(clean_answer.split()) < 8:
+        return True
+
+    vague_phrases = [
+        "the uploaded file appears",
+        "the uploaded file is",
+        "the image appears",
+        "the image is",
+    ]
+
+    asks_specific_followup = any(
+        phrase in clean_query
+        for phrase in [
+            "what type",
+            "what kind",
+            "why",
+            "is this good",
+            "good or no",
+            "tell me more",
+            "explain",
+            "calculate",
+            "how much",
+            "total",
+        ]
+    )
+
+    if asks_specific_followup and any(clean_answer.lower().startswith(p) for p in vague_phrases):
+        return True
+
+    return False
+
+def is_weak_uploaded_answer(answer: str, query: str) -> bool:
+    """
+    Blocks lazy/caption-like answers for uploaded images/files.
+    """
+
+    clean_answer = (answer or "").strip()
+    clean_query = (query or "").strip().lower()
+
+    if not clean_answer:
+        return True
+
+    lower_answer = clean_answer.lower().strip()
+
+    if len(clean_answer.split()) < 12:
+        return True
+
+    bad_exact_answers = {
+        "good.",
+        "good",
+        "bad.",
+        "bad",
+        "yes.",
+        "yes",
+        "no.",
+        "no",
+        "maybe.",
+        "maybe",
+        "it depends.",
+        "it depends",
+    }
+
+    if lower_answer in bad_exact_answers:
+        return True
+
+    weak_starts = [
+        "the uploaded file is an image",
+        "the uploaded file appears",
+        "the image shows",
+        "the image appears",
+        "this image shows",
+        "based on the uploaded image, i can provide",
+        "based on the visual description",
+    ]
+
+    specific_question_markers = [
+        "is it good",
+        "is this good",
+        "good or no",
+        "recommend",
+        "buy",
+        "buying",
+        "what type",
+        "what kind",
+        "tell me more",
+        "why",
+        "calculate",
+        "total",
+        "how much",
+    ]
+
+    is_specific_question = any(marker in clean_query for marker in specific_question_markers)
+
+    if is_specific_question and any(lower_answer.startswith(start) for start in weak_starts):
+        return True
+
+    vague_phrases = [
+        "it is difficult to determine",
+        "cannot be determined",
+        "without more information",
+    ]
+
+    # This is only weak if it says limitation but gives no useful next step/evidence.
+    if is_specific_question:
+        has_vague = any(phrase in lower_answer for phrase in vague_phrases)
+        has_useful_next_step = any(
+            phrase in lower_answer
+            for phrase in [
+                "check",
+                "inspect",
+                "survey",
+                "engine",
+                "maintenance",
+                "price",
+                "condition",
+                "visible",
+                "evidence",
+                "before buying",
+            ]
+        )
+
+        if has_vague and not has_useful_next_step:
+            return True
+
+    return False
+
 def answer_from_uploaded_chat_asset(
     query: str,
     context: str,
     matched_rows: list[dict]
 ):
     """
-    Special mode for files/photos/docs uploaded inside the chatbot.
+    Answers questions about a file, image or document uploaded
+    inside the current chat.
 
-    This is NOT Yacht Documentation search.
-    This answers only from the file the user just uploaded in the chat.
+    Documents provide all facts.
+    OpenAI may only make verified evidence cohesive.
     """
 
-    clean_context = (context or "").strip()
+    clean_query = clean_text_for_postgres(
+        str(query or "")
+    ).strip()
 
-    if not clean_context:
+    clean_context = clean_text_for_postgres(
+        str(context or "")
+    ).strip()
+
+    clean_rows = deduplicate_context_rows(
+        matched_rows or []
+    )
+
+    if not clean_query:
+        return {
+            "answer": "Please enter a question.",
+            "sources": []
+        }
+
+    if not clean_context or not clean_rows:
         return {
             "answer": (
-                "I received the uploaded file, but I could not read or analyze its contents yet. "
-                "Please try uploading it again, or check the backend processing_error for this asset."
+                "I received the uploaded file, but I could not find "
+                "readable information in it that answers the question."
             ),
             "sources": []
         }
 
-    try:
-        answer = ask_llm(
-            query=query,
-            context=f"""
-You are BridgeOS.
-
-The user just uploaded a file/photo/document inside the chatbot and asked a question about it.
-
-You must answer using ONLY the uploaded file context below.
-
-Important rules:
-- This is a chatbot upload, not Yacht Documentation.
-- Do NOT say "Please ask your admin to upload it" because the user already uploaded it.
-- Do NOT search other yacht documents.
-- Do NOT use general knowledge unless it is only to describe what is visible/readable in the uploaded file.
-- If it is a photo, use "Image visual description" and "OCR text" if available.
-- If it is a document, use "Extracted document text" if available.
-- If the user asks "what is this about?", summarize what the uploaded file/photo appears to contain.
-- If the user asks to analyze it, analyze only what is visible or written in the uploaded file.
-- If the uploaded context is weak, say exactly what you can see/read and say what is unclear.
-- Never use the fallback "Sorry, I don't have this data yet. Please ask your admin to upload it." in this uploaded-file mode.
-
-User question:
-{query}
-
-Uploaded file context:
-{clean_context}
-""".strip()
+    strict_result = (
+        answer_only_from_verified_document_evidence(
+            query=clean_query,
+            matched_rows=clean_rows
         )
+    )
 
-        answer = str(answer or "").strip()
+    if not isinstance(strict_result, dict):
+        return {
+            "answer": FALLBACK_NO_DATA_ANSWER,
+            "sources": []
+        }
 
-    except Exception as e:
-        print("UPLOADED CHAT ASSET LLM ERROR:", type(e).__name__, str(e))
-        answer = ""
+    answer = clean_text_for_postgres(
+        str(
+            strict_result.get("answer")
+            or ""
+        )
+    ).strip()
+
+    sources = strict_result.get(
+        "sources"
+    )
 
     if not answer:
-        answer = (
-            "I received the uploaded file, but I could not generate an analysis from it. "
-            "Please try again or check whether the file was processed successfully."
-        )
+        answer = FALLBACK_NO_DATA_ANSWER
 
-    sources = []
-
-    if matched_rows:
-        sources = build_sources_from_asset_results([matched_rows[0]])
+    if not isinstance(sources, list):
+        sources = []
 
     return {
         "answer": answer,
         "sources": sources
     }
+    
+def get_asset_permissions(
+    asset_id: str,
+    admin_crew: dict
+):
+    """
+    Returns current document permissions.
+
+    Synced permission sources:
+    - assets.security_level controls automatic Tier 1 / 2 / 3 access.
+    - asset_access controls manual custom grants, including Tier 4 users.
+    """
+
+    if int(admin_crew["security_level"]) != 1:
+        raise HTTPException(
+            status_code=403,
+            detail="Only Tier 1 admins can view asset permissions"
+        )
+
+    asset_res = supabase.table("assets") \
+        .select("*") \
+        .eq("id", asset_id) \
+        .eq("yacht_id", admin_crew["yacht_id"]) \
+        .execute()
+
+    if not asset_res.data:
+        raise HTTPException(status_code=404, detail="Asset not found for this yacht")
+
+    asset = asset_res.data[0]
+    asset_security_level = int(asset.get("security_level") or 1)
+
+    crew_res = supabase.table("crew") \
+        .select("id, email, full_name, role, position, security_level") \
+        .eq("yacht_id", admin_crew["yacht_id"]) \
+        .order("security_level") \
+        .order("full_name") \
+        .execute()
+
+    access_res = supabase.table("asset_access") \
+        .select("asset_id, crew_id, granted_by, created_at") \
+        .eq("asset_id", asset_id) \
+        .execute()
+
+    manual_access_by_crew_id = {
+        row["crew_id"]: row
+        for row in (access_res.data or [])
+        if row.get("crew_id")
+    }
+
+    people = []
+
+    for crew in crew_res.data or []:
+        crew_security_level = int(crew.get("security_level") or 4)
+
+        if crew_security_level in [1, 2, 3]:
+            has_tier_access = asset_security_level >= crew_security_level
+        else:
+            has_tier_access = False
+
+        has_manual_access = crew["id"] in manual_access_by_crew_id
+
+        people.append({
+            "crew_id": crew["id"],
+            "email": crew.get("email"),
+            "full_name": crew.get("full_name"),
+            "role": crew.get("role"),
+            "position": crew.get("position"),
+            "security_level": crew_security_level,
+            "has_tier_access": has_tier_access,
+            "has_manual_access": has_manual_access,
+            "can_view": has_tier_access or has_manual_access,
+            "manual_access_row": manual_access_by_crew_id.get(crew["id"])
+        })
+
+    return {
+        "asset": {
+            "id": asset["id"],
+            "file_name": asset.get("file_name"),
+            "original_file_name": asset.get("original_file_name"),
+            "security_level": asset_security_level
+        },
+        "tier_options": [
+            {
+                "security_level": 1,
+                "label": "Tier 1 only",
+                "description": "Tier 1 users can view automatically. Others need manual access."
+            },
+            {
+                "security_level": 2,
+                "label": "Tier 1 and Tier 2",
+                "description": "Tier 1 and Tier 2 users can view automatically. Tier 3 and 4 need manual access."
+            },
+            {
+                "security_level": 3,
+                "label": "Tier 1, Tier 2, and Tier 3",
+                "description": "Tier 1, Tier 2, and Tier 3 users can view automatically. Tier 4 still needs manual access."
+            }
+        ],
+        "people": people
+    }
+
+
+def update_asset_permissions(
+    asset_id: str,
+    security_level: int,
+    crew_ids: list[str],
+    admin_crew: dict
+):
+    """
+    Updates document permissions and keeps database in sync.
+
+    Database sync:
+    - assets.security_level controls automatic Tier 1 / 2 / 3 access.
+    - asset_chunks.security_level stays synced for retrieval.
+    - asset_access controls manual grants for Tier 4 and optional extra grants for Tier 2/3.
+    """
+
+    if int(admin_crew["security_level"]) != 1:
+        raise HTTPException(
+            status_code=403,
+            detail="Only Tier 1 admins can update asset permissions"
+        )
+
+    security_level = int(security_level)
+
+    if security_level not in [1, 2, 3]:
+        raise HTTPException(
+            status_code=400,
+            detail="Document security_level must be 1, 2, or 3. Tier 4 is custom user access only."
+        )
+
+    asset_res = supabase.table("assets") \
+        .select("*") \
+        .eq("id", asset_id) \
+        .eq("yacht_id", admin_crew["yacht_id"]) \
+        .execute()
+
+    if not asset_res.data:
+        raise HTTPException(status_code=404, detail="Asset not found for this yacht")
+
+    clean_crew_ids = []
+
+    for crew_id in crew_ids or []:
+        clean_crew_id = str(crew_id).strip()
+
+        if clean_crew_id and clean_crew_id not in clean_crew_ids:
+            clean_crew_ids.append(clean_crew_id)
+
+    if clean_crew_ids:
+        crew_res = supabase.table("crew") \
+            .select("id") \
+            .eq("yacht_id", admin_crew["yacht_id"]) \
+            .in_("id", clean_crew_ids) \
+            .execute()
+
+        valid_crew_ids = {
+            row["id"]
+            for row in (crew_res.data or [])
+        }
+
+        missing_ids = [
+            crew_id
+            for crew_id in clean_crew_ids
+            if crew_id not in valid_crew_ids
+        ]
+
+        if missing_ids:
+            raise HTTPException(
+                status_code=404,
+                detail="One or more crew members were not found for this yacht"
+            )
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    try:
+        supabase.table("assets") \
+            .update({
+                "security_level": security_level,
+                "permissions_updated_at": now,
+                "permissions_updated_by": admin_crew["id"]
+            }) \
+            .eq("id", asset_id) \
+            .eq("yacht_id", admin_crew["yacht_id"]) \
+            .execute()
+
+        supabase.table("asset_chunks") \
+            .update({
+                "security_level": security_level
+            }) \
+            .eq("asset_id", asset_id) \
+            .eq("yacht_id", admin_crew["yacht_id"]) \
+            .execute()
+
+        supabase.table("asset_access") \
+            .delete() \
+            .eq("asset_id", asset_id) \
+            .execute()
+
+        rows = [
+            {
+                "asset_id": asset_id,
+                "crew_id": crew_id,
+                "granted_by": admin_crew["id"]
+            }
+            for crew_id in clean_crew_ids
+        ]
+
+        if rows:
+            supabase.table("asset_access").insert(rows).execute()
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not update asset permissions: {str(e)}"
+        )
+
+    return get_asset_permissions(
+        asset_id=asset_id,
+        admin_crew=admin_crew
+    )
+    
 # ------------------------
 # DOCUMENT ACCESS
 # ------------------------
@@ -2856,53 +6384,6 @@ def authorize_document_access(
         "crew_id": target_crew_id,
         "granted_by": granted_by
     }).execute()
-
-
-def get_accessible_asset_ids(crew_id: str, yacht_id: str, security_level: int):
-    """
-    File security model:
-
-    User Tier 1:
-        Can access files with security_level 1, 2, or 3.
-
-    User Tier 2:
-        Can access files with security_level 2 or 3.
-
-    User Tier 3:
-        Can access files with security_level 3 only.
-
-    Extra explicit access:
-        Level 2/3 users may also access assets granted in asset_access.
-    """
-
-    security_level = int(security_level)
-
-    if security_level not in [1, 2, 3]:
-        return []
-
-    # Tier rule:
-    # lower number = more powerful user
-    # lower number file = more sensitive file
-    base_assets = supabase.table("assets") \
-        .select("id") \
-        .eq("yacht_id", yacht_id) \
-        .gte("security_level", security_level) \
-        .execute()
-
-    allowed_ids = {asset["id"] for asset in (base_assets.data or [])}
-
-    # Optional explicit grants.
-    # Useful if a Tier 3 user needs one specific Tier 1 or Tier 2 file.
-    access = supabase.table("asset_access") \
-        .select("asset_id, assets!inner(yacht_id)") \
-        .eq("crew_id", crew_id) \
-        .eq("assets.yacht_id", yacht_id) \
-        .execute()
-
-    for row in access.data or []:
-        allowed_ids.add(row["asset_id"])
-
-    return list(allowed_ids)
 
 def list_documents_for_admin(admin_crew: dict):
     """
@@ -2945,30 +6426,6 @@ def list_my_documents(crew: dict):
 # ------------------------
 # DOCUMENT TEXT CHUNKING
 # ------------------------
-
-def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 150):
-    """
-    Splits document text into overlapping chunks.
-    """
-
-    if not text:
-        return []
-
-    chunks = []
-    start = 0
-    text_length = len(text)
-
-    while start < text_length:
-        end = start + chunk_size
-        chunk = text[start:end].strip()
-
-        if chunk:
-            chunks.append(chunk)
-
-        start += chunk_size - overlap
-
-    return chunks
-
 
 def save_document_chunks(document_id: str, yacht_id: str, text: str):
     """
@@ -3389,7 +6846,7 @@ def keyword_search_asset_chunks(
     yacht_id: str,
     allowed_asset_ids: list[str],
     year_filter: int | None = None,
-    limit: int = 8
+    limit: int = 40
 ) -> list[dict]:
     """
     Compatibility wrapper.
@@ -3539,27 +6996,65 @@ def get_previous_user_query(chat_id: str, current_query: str) -> str:
 
 def build_memory_aware_retrieval_input(query: str, chat_id: str) -> str:
     """
-    Builds a retrieval query using the previous user message as chat memory.
+    Rewrites follow-up questions into standalone document-search questions.
 
-    The previous message is used only to resolve context.
-    The answer must still come from uploaded document chunks.
+    No hardcoded topics, products, vendors, food names, years, or document names.
     """
 
-    previous_query = get_previous_user_query(
+    clean_query = str(query or "").strip()
+
+    if not clean_query:
+        return ""
+
+    recent_user_context = get_recent_user_context(
         chat_id=chat_id,
-        current_query=query
+        current_query=clean_query,
+        limit=6
     )
 
-    if not previous_query:
-        return query
+    if not recent_user_context.strip():
+        return clean_query
 
-    return f"""
-Previous user request in this chat:
-{previous_query}
+    try:
+        rewritten = ask_llm(
+            query=clean_query,
+            context=f"""
+You rewrite the latest user message into a complete standalone search query for document retrieval.
 
-Current user request:
-{query}
+Use only the previous user messages to understand the user's intent.
+
+Rules:
+- Do not answer the question.
+- Do not add facts.
+- Do not invent values.
+- Do not invent document names.
+- Do not use assistant replies.
+- Preserve the latest user-requested item, date, person, object, category, or subject.
+- If the latest message is a follow-up, rewrite it as a full standalone question using the previous user message pattern.
+- If the latest message is already standalone, return it unchanged.
+- Return plain text only.
+- No explanations.
+
+Previous user messages:
+{recent_user_context}
+
+Latest user message:
+{clean_query}
+
+Standalone search query:
 """.strip()
+        )
+
+        rewritten = str(rewritten or "").strip()
+
+        if rewritten:
+            print("LOCAL CHAT DEBUG: rewritten retrieval query:", rewritten)
+            return rewritten
+
+    except Exception as e:
+        print("MEMORY AWARE QUERY REWRITE ERROR:", type(e).__name__, str(e))
+
+    return clean_query
 
 def get_latest_chat_asset_id(
     chat_id: str,
@@ -3606,6 +7101,6493 @@ def get_latest_chat_asset_id(
 # ------------------------
 # CHAT SECURE
 # ------------------------
+def is_file_listing_query(query: str) -> bool:
+    """
+    Detects genuine requests to list or count available documents.
+
+    Examples treated as listing requests:
+    - What invoices do we have?
+    - List our SOPs.
+    - What SOPs are available for fire safety?
+    - Show our invoices and procedures for maintenance.
+    - How many policies are uploaded?
+
+    Examples not treated as listing requests:
+    - What does the fire safety SOP say?
+    - Explain the maintenance procedure.
+    - What is required by this policy?
+    """
+
+    clean = normalise_search_text(
+        str(query or "")
+    )
+
+    if not clean:
+        return False
+
+    words = set(
+        clean.split()
+    )
+
+    document_words = {
+        "file",
+        "files",
+        "document",
+        "documents",
+        "doc",
+        "docs",
+        "asset",
+        "assets",
+        "upload",
+        "uploads",
+        "uploaded",
+
+        "invoice",
+        "invoices",
+        "receipt",
+        "receipts",
+        "bill",
+        "bills",
+
+        "sop",
+        "sops",
+        "procedure",
+        "procedures",
+        "policy",
+        "policies",
+        "manual",
+        "manuals",
+        "guideline",
+        "guidelines",
+        "instruction",
+        "instructions",
+
+        "pdf",
+        "pdfs",
+        "docx",
+        "image",
+        "images",
+        "photo",
+        "photos",
+    }
+
+    listing_words = {
+        "list",
+        "show",
+        "which",
+        "available",
+        "uploaded",
+        "uploads",
+        "stored",
+        "exist",
+        "have",
+        "has",
+    }
+
+    counting_words = {
+        "count",
+        "number",
+        "many",
+        "total",
+    }
+
+    listing_phrases = [
+        "what files",
+        "what documents",
+        "what invoices",
+        "what receipts",
+        "what bills",
+        "what sops",
+        "what procedures",
+        "what policies",
+        "what manuals",
+        "what do we have",
+        "what are our",
+        "which files",
+        "which documents",
+        "which invoices",
+        "which sops",
+        "show me",
+        "list all",
+        "how many",
+        "number of",
+    ]
+
+    content_question_phrases = [
+        "what does",
+        "what do the",
+        "what is stated",
+        "what does it say",
+        "what does the document say",
+        "according to",
+        "explain",
+        "summarise",
+        "summarize",
+        "analyse",
+        "analyze",
+        "describe",
+        "tell me what",
+        "what is required",
+        "what are the requirements",
+        "how should",
+        "how do we",
+        "when should",
+        "why should",
+        "who should",
+    ]
+
+    has_document_reference = bool(
+        words.intersection(
+            document_words
+        )
+    )
+
+    if not has_document_reference:
+        return False
+
+    # Questions asking about document contents must continue through
+    # normal document retrieval and OpenAI answering.
+    if any(
+        phrase in clean
+        for phrase in content_question_phrases
+    ):
+        return False
+
+    has_listing_word = bool(
+        words.intersection(
+            listing_words
+        )
+    )
+
+    has_counting_word = bool(
+        words.intersection(
+            counting_words
+        )
+    )
+
+    has_listing_phrase = any(
+        phrase in clean
+        for phrase in listing_phrases
+    )
+
+    return bool(
+        has_listing_word
+        or has_counting_word
+        or has_listing_phrase
+    )
+    
+def answer_file_listing_directly(
+    query: str,
+    rows: list[dict]
+) -> dict:
+    """
+    Directly answers uploaded-file listing and counting questions.
+
+    Important:
+    - Counts unique assets, not chunks.
+    - Can count all documents or a requested file category.
+    - Can list matching files.
+    - Does not call the LLM.
+    - Does not return the no-data fallback when matching assets exist.
+    """
+
+    clean_query = normalise_search_text(
+        str(query or "")
+    )
+
+    if not rows:
+        return {
+            "answer": (
+                "There are no accessible processed files "
+                "available for this account."
+            ),
+            "sources": []
+        }
+
+    # =========================================================
+    # DEDUPLICATE BY ASSET
+    # =========================================================
+
+    unique_rows = []
+    seen_asset_ids = set()
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        asset_id = str(
+            row.get("asset_id")
+            or row.get("id")
+            or ""
+        ).strip()
+
+        if not asset_id:
+            continue
+
+        if asset_id in seen_asset_ids:
+            continue
+
+        seen_asset_ids.add(
+            asset_id
+        )
+
+        unique_rows.append(row)
+
+    if not unique_rows:
+        return {
+            "answer": (
+                "There are no accessible processed files "
+                "available for this account."
+            ),
+            "sources": []
+        }
+
+    # =========================================================
+    # DETERMINE WHETHER THE USER WANTS A COUNT OR A LIST
+    # =========================================================
+
+    query_words = set(
+        clean_query.split()
+    )
+
+    count_request = (
+        "how many" in clean_query
+        or "number of" in clean_query
+        or "count" in query_words
+        or "number" in query_words
+        or "total" in query_words
+    )
+
+    # =========================================================
+    # GENERIC FILE CATEGORY MATCHING
+    # =========================================================
+
+    def row_file_name(row: dict) -> str:
+        return clean_text_for_postgres(
+            str(
+                row.get("original_file_name")
+                or row.get("file_name")
+                or row.get("title")
+                or "Untitled document"
+            )
+        ).strip()
+
+    def row_file_type(row: dict) -> str:
+        return normalise_search_text(
+            str(
+                row.get("file_type")
+                or ""
+            )
+        )
+
+    def row_searchable_text(row: dict) -> str:
+        return normalise_search_text(
+            " ".join([
+                row_file_name(row),
+                str(
+                    row.get("content")
+                    or ""
+                ),
+                str(
+                    row.get("summary")
+                    or ""
+                ),
+                str(
+                    row.get("mime_type")
+                    or ""
+                ),
+                str(
+                    row.get("file_type")
+                    or ""
+                ),
+            ])
+        )
+
+    requested_category = "files"
+
+    if (
+        "invoice" in query_words
+        or "invoices" in query_words
+    ):
+        requested_category = "invoices"
+
+    elif (
+        "receipt" in query_words
+        or "receipts" in query_words
+    ):
+        requested_category = "receipts"
+
+    elif (
+        "pdf" in query_words
+        or "pdfs" in query_words
+    ):
+        requested_category = "PDF files"
+
+    elif "docx" in query_words:
+        requested_category = "DOCX files"
+
+    elif (
+        "image" in query_words
+        or "images" in query_words
+        or "photo" in query_words
+        or "photos" in query_words
+    ):
+        requested_category = "images"
+
+    elif (
+        "document" in query_words
+        or "documents" in query_words
+        or "doc" in query_words
+        or "docs" in query_words
+    ):
+        requested_category = "documents"
+
+    filtered_rows = []
+
+    for row in unique_rows:
+        file_name = row_file_name(
+            row
+        )
+
+        file_name_lower = (
+            file_name.lower()
+        )
+
+        file_type = row_file_type(
+            row
+        )
+
+        searchable_text = (
+            row_searchable_text(
+                row
+            )
+        )
+
+        include_row = True
+
+        if requested_category == "invoices":
+            include_row = (
+                "invoice"
+                in searchable_text
+            )
+
+        elif requested_category == "receipts":
+            include_row = (
+                "receipt"
+                in searchable_text
+            )
+
+        elif requested_category == "PDF files":
+            include_row = (
+                file_type == "pdf"
+                or file_name_lower.endswith(
+                    ".pdf"
+                )
+            )
+
+        elif requested_category == "DOCX files":
+            include_row = (
+                file_type == "docx"
+                or file_name_lower.endswith(
+                    ".docx"
+                )
+            )
+
+        elif requested_category == "images":
+            include_row = (
+                file_type == "image"
+                or file_name_lower.endswith(
+                    (
+                        ".jpg",
+                        ".jpeg",
+                        ".png",
+                        ".webp",
+                        ".heic",
+                        ".gif",
+                    )
+                )
+            )
+
+        if include_row:
+            filtered_rows.append(
+                row
+            )
+
+    count = len(
+        filtered_rows
+    )
+
+    # =========================================================
+    # COUNT ANSWER
+    # =========================================================
+
+    if count_request:
+        if count == 0:
+            answer = (
+                f"There are no accessible processed "
+                f"{requested_category} uploaded."
+            )
+
+        elif count == 1:
+            singular_labels = {
+                "files": "file",
+                "documents": "document",
+                "invoices": "invoice",
+                "receipts": "receipt",
+                "PDF files": "PDF file",
+                "DOCX files": "DOCX file",
+                "images": "image",
+            }
+
+            singular_label = (
+                singular_labels.get(
+                    requested_category,
+                    requested_category
+                )
+            )
+
+            answer = (
+                f"There is 1 accessible processed "
+                f"{singular_label} uploaded."
+            )
+
+        else:
+            answer = (
+                f"There are {count} accessible processed "
+                f"{requested_category} uploaded."
+            )
+
+        # Include the names after the count so the result can be checked.
+        if filtered_rows:
+            answer_lines = [
+                answer,
+                "",
+                "Files counted:"
+            ]
+
+            for row in filtered_rows:
+                answer_lines.append(
+                    "- " + row_file_name(
+                        row
+                    )
+                )
+
+            answer = "\n".join(
+                answer_lines
+            )
+
+        return {
+            "answer": answer,
+            "sources": (
+                build_sources_from_asset_results(
+                    filtered_rows
+                )
+            )
+        }
+
+    # =========================================================
+    # LIST ANSWER
+    # =========================================================
+
+    if not filtered_rows:
+        return {
+            "answer": (
+                f"There are no accessible processed "
+                f"{requested_category} uploaded."
+            ),
+            "sources": []
+        }
+
+    answer_lines = [
+        (
+            f"The accessible processed "
+            f"{requested_category} are:"
+        )
+    ]
+
+    for row in filtered_rows:
+        file_name = row_file_name(
+            row
+        )
+
+        file_type = str(
+            row.get("file_type")
+            or ""
+        ).strip()
+
+        processing_status = str(
+            row.get("processing_status")
+            or ""
+        ).strip()
+
+        details = []
+
+        if file_type:
+            details.append(
+                file_type
+            )
+
+        if processing_status:
+            details.append(
+                processing_status
+            )
+
+        if details:
+            answer_lines.append(
+                f"- {file_name} "
+                f"({', '.join(details)})"
+            )
+
+        else:
+            answer_lines.append(
+                f"- {file_name}"
+            )
+
+    return {
+        "answer": "\n".join(
+            answer_lines
+        ),
+        "sources": (
+            build_sources_from_asset_results(
+                filtered_rows
+            )
+        )
+    }
+
+def get_asset_metadata_rows_for_listing(
+    query: str,
+    yacht_id: str,
+    allowed_asset_ids: list[str],
+    limit: int = 500
+) -> list[dict]:
+    """
+    Loads metadata and readable text for every accessible processed asset.
+
+    Important:
+    - This function does not pre-filter only invoices.
+    - It supports mixed questions such as invoices plus SOPs.
+    - Category and topic filtering happens later inside
+      answer_file_listing_directly().
+    """
+
+    if not yacht_id:
+        return []
+
+    if not allowed_asset_ids:
+        return []
+
+    try:
+        safe_limit = int(
+            limit or 500
+        )
+    except Exception:
+        safe_limit = 500
+
+    if safe_limit < 1:
+        safe_limit = 500
+
+    if safe_limit > 1000:
+        safe_limit = 1000
+
+    try:
+        res = (
+            supabase.table("assets")
+            .select("""
+                id,
+                yacht_id,
+                chat_id,
+                security_level,
+                file_name,
+                original_file_name,
+                file_type,
+                mime_type,
+                processing_status,
+                processing_error,
+                summary,
+                extracted_text,
+                visual_description,
+                ocr_text,
+                detected_year,
+                tags,
+                created_at
+            """)
+            .eq("yacht_id", yacht_id)
+            .in_("id", allowed_asset_ids)
+            .eq("processing_status", "processed")
+            .order("created_at", desc=True)
+            .limit(safe_limit)
+            .execute()
+        )
+
+    except Exception as error:
+        print(
+            "ASSET METADATA LISTING ERROR:",
+            {
+                "error_type": type(error).__name__,
+                "error": str(error),
+                "yacht_id": yacht_id,
+                "allowed_asset_count": len(
+                    allowed_asset_ids
+                )
+            }
+        )
+
+        return []
+
+    rows = []
+
+    for asset in res.data or []:
+        if not isinstance(asset, dict):
+            continue
+
+        asset_id = str(
+            asset.get("id")
+            or ""
+        ).strip()
+
+        if not asset_id:
+            continue
+
+        file_name = clean_text_for_postgres(
+            str(
+                asset.get("original_file_name")
+                or asset.get("file_name")
+                or "Untitled document"
+            )
+        ).strip()
+
+        summary = clean_text_for_postgres(
+            str(
+                asset.get("summary")
+                or ""
+            )
+        ).strip()
+
+        extracted_text = clean_text_for_postgres(
+            str(
+                asset.get("extracted_text")
+                or ""
+            )
+        ).strip()
+
+        visual_description = clean_text_for_postgres(
+            str(
+                asset.get("visual_description")
+                or ""
+            )
+        ).strip()
+
+        ocr_text = clean_text_for_postgres(
+            str(
+                asset.get("ocr_text")
+                or ""
+            )
+        ).strip()
+
+        tags = asset.get("tags") or []
+
+        if not isinstance(tags, list):
+            tags = []
+
+        content = f"""
+File name: {file_name}
+File type: {asset.get("file_type") or ""}
+MIME type: {asset.get("mime_type") or ""}
+Processing status: {asset.get("processing_status") or ""}
+Detected year: {asset.get("detected_year") or ""}
+Tags: {", ".join(str(tag) for tag in tags)}
+
+Summary:
+{summary}
+
+Extracted document text:
+{extracted_text[:8000]}
+
+OCR document text:
+{ocr_text[:8000]}
+
+Image visual description:
+{visual_description[:3000]}
+""".strip()
+
+        rows.append({
+            "asset_id": asset_id,
+            "id": asset_id,
+            "yacht_id": asset.get(
+                "yacht_id"
+            ),
+            "chat_id": asset.get(
+                "chat_id"
+            ),
+            "security_level": asset.get(
+                "security_level"
+            ),
+            "content": content,
+            "search_text": content,
+            "summary": summary,
+            "extracted_text": extracted_text,
+            "ocr_text": ocr_text,
+            "visual_description": visual_description,
+            "content_type": "asset_metadata_listing",
+            "chunk_index": 0,
+            "detected_date": None,
+            "detected_year": asset.get(
+                "detected_year"
+            ),
+            "tags": tags,
+            "file_name": asset.get(
+                "file_name"
+            ),
+            "original_file_name": asset.get(
+                "original_file_name"
+            ),
+            "file_type": asset.get(
+                "file_type"
+            ),
+            "mime_type": asset.get(
+                "mime_type"
+            ),
+            "processing_status": asset.get(
+                "processing_status"
+            ),
+            "processing_error": asset.get(
+                "processing_error"
+            ),
+            "created_at": asset.get(
+                "created_at"
+            )
+        })
+
+    print(
+        "ASSET METADATA LISTING RESULT:",
+        {
+            "query": query,
+            "asset_count": len(rows)
+        }
+    )
+
+    return rows
+ 
+def parse_llm_json_response(raw_text: str) -> dict | None:
+    if not raw_text:
+        return None
+
+    text = str(raw_text).strip()
+
+    if text.startswith("```"):
+        text = text.strip("`").strip()
+
+        if text.lower().startswith("json"):
+            text = text[4:].strip()
+
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    start = text.find("{")
+    end = text.rfind("}")
+
+    if start == -1 or end == -1 or end <= start:
+        return None
+
+    try:
+        return json.loads(text[start:end + 1])
+    except Exception:
+        return None
+
+def build_numbered_context_from_asset_results(rows):
+    parts = []
+
+    for index, row in enumerate(rows or [], start=1):
+        file_name = (
+            row.get("original_file_name")
+            or row.get("file_name")
+            or row.get("title")
+            or "Unknown source"
+        )
+
+        content = row.get("content") or row.get("text") or ""
+
+        if not str(content).strip():
+            continue
+
+        parts.append(
+            f"""
+[SOURCE {index}]
+File: {file_name}
+Content:
+{str(content).strip()}
+""".strip()
+        )
+
+    return "\n\n---\n\n".join(parts)
+
+
+def normalise_for_source_check(value):
+    return " ".join(str(value or "").lower().split())
+
+
+def source_quote_exists_in_row(row, quote):
+    if not row:
+        return False
+
+    row_text = normalise_for_source_check(
+        row.get("content")
+        or row.get("text")
+        or ""
+    )
+
+    if not row_text:
+        return False
+
+    quote_text = normalise_for_source_check(quote)
+
+    if not quote_text:
+        # If the source number is valid but the quote is empty, do not approve blindly.
+        return False
+
+    # Exact normalised quote match.
+    if quote_text in row_text:
+        return True
+
+    # Soft fallback:
+    # Sometimes the LLM copies evidence with punctuation, line breaks, or small spacing differences.
+    # Accept it only if most meaningful words from the quote appear in the selected source.
+    quote_words = [
+        word
+        for word in quote_text.split()
+        if len(word) >= 4
+    ]
+
+    if len(quote_words) < 4:
+        return False
+
+    matched_words = [
+        word
+        for word in quote_words
+        if word in row_text
+    ]
+
+    return len(matched_words) / max(len(quote_words), 1) >= 0.75
+
+def extract_protected_answer_tokens(
+    value: str
+) -> set[str]:
+    """
+    Extracts values OpenAI must never invent or silently change.
+
+    Protected values include:
+    - monetary amounts;
+    - currencies;
+    - percentages;
+    - dates;
+    - times;
+    - general numbers;
+    - reference-style identifiers.
+    """
+
+    text = clean_text_for_postgres(
+        str(value or "")
+    )
+
+    patterns = [
+        # Currency code or currency symbol followed by a number.
+        (
+            r"(?:USD|EUR|GBP|AED|SAR|QAR|CAD|AUD|"
+            r"US\$|CA\$|AU\$|\$|€|£)"
+            r"\s*-?\d[\d,\.\s]*"
+        ),
+
+        # Number followed by currency code.
+        (
+            r"-?\d[\d,\.\s]*"
+            r"\s*(?:USD|EUR|GBP|AED|SAR|QAR|CAD|AUD)"
+        ),
+
+        # Percentages.
+        r"-?\d+(?:[.,]\d+)?\s*%",
+
+        # Numeric dates.
+        r"\b\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4}\b",
+
+        # Times.
+        r"\b\d{1,2}:\d{2}(?::\d{2})?\b",
+
+        # Identifiers such as INV-2026-14 or PO/1188.
+        r"\b[A-Za-z]{2,}[-_/]\d[A-Za-z0-9\-_/]*\b",
+
+        # General numbers.
+        r"\b-?\d+(?:[.,]\d+)*\b",
+    ]
+
+    output = set()
+
+    for pattern in patterns:
+        matches = re.findall(
+            pattern,
+            text,
+            flags=re.IGNORECASE
+        )
+
+        for match in matches:
+            clean_match = " ".join(
+                str(match or "").lower().split()
+            ).strip()
+
+            if clean_match:
+                output.add(
+                    clean_match
+                )
+
+    return output
+
+def validate_protected_tokens_against_evidence(
+    answer: str,
+    evidence_quotes: list[str]
+) -> bool:
+    """
+    Rejects an answer when it contains a protected value that does not
+    appear in the verified exact quotations.
+
+    This provides a deterministic check for numbers, dates, currencies,
+    percentages and identifiers.
+    """
+
+    clean_answer = clean_text_for_postgres(
+        str(answer or "")
+    ).strip()
+
+    clean_quotes = [
+        clean_text_for_postgres(
+            str(quote or "")
+        ).strip()
+        for quote in evidence_quotes or []
+        if str(quote or "").strip()
+    ]
+
+    if not clean_answer or not clean_quotes:
+        return False
+
+    answer_tokens = extract_protected_answer_tokens(
+        clean_answer
+    )
+
+    if not answer_tokens:
+        return True
+
+    evidence_text = " ".join(
+        clean_quotes
+    ).lower()
+
+    evidence_text = " ".join(
+        evidence_text.split()
+    )
+
+    for token in answer_tokens:
+        normalised_token = " ".join(
+            token.lower().split()
+        )
+
+        if normalised_token not in evidence_text:
+            print(
+                "UNSUPPORTED ANSWER TOKEN:",
+                {
+                    "token": token,
+                    "answer": clean_answer[:1000]
+                }
+            )
+
+            return False
+
+    return True
+
+def answer_only_from_verified_document_evidence(
+    query: str,
+    matched_rows: list[dict]
+) -> dict:
+    """
+    Produces a cohesive answer from one or more retrieved documents.
+
+    The documents provide every fact.
+
+    OpenAI is allowed only to:
+    - identify relevant facts;
+    - combine facts from several sources;
+    - remove repetition;
+    - make the language cohesive;
+    - match the format to the question.
+
+    OpenAI is not allowed to add facts.
+    """
+
+    clean_query = clean_text_for_postgres(
+        str(query or "")
+    ).strip()
+
+    clean_rows = deduplicate_context_rows(
+        matched_rows or []
+    )
+
+    if not clean_query or not clean_rows:
+        return {
+            "answer": FALLBACK_NO_DATA_ANSWER,
+            "sources": []
+        }
+
+    numbered_context = (
+        build_numbered_context_from_asset_results(
+            clean_rows
+        )
+    )
+
+    numbered_context = clean_text_for_postgres(
+        str(numbered_context or "")
+    ).strip()
+
+    if not numbered_context:
+        return {
+            "answer": FALLBACK_NO_DATA_ANSWER,
+            "sources": []
+        }
+
+    try:
+        raw_response = ask_llm(
+            query=clean_query,
+            context=f"""
+You are a strict document evidence composer.
+
+The numbered document sources below are the ONLY allowed source of facts.
+
+Your role is limited to:
+
+1. Identify the exact information needed to answer the user's question.
+2. Find all relevant pieces across every numbered source.
+3. Combine facts when different documents contain different parts
+   of the answer.
+4. Remove unnecessary repetition.
+5. Organise the facts cohesively.
+6. Match the format to the question.
+
+You must NOT contribute factual knowledge.
+
+Return ONLY valid JSON in this exact form:
+
+{{
+  "answer": "the cohesive final answer",
+  "claims": [
+    {{
+      "claim": "one factual statement used in the answer",
+      "source_number": 1,
+      "evidence_quote": "an exact quotation copied from that source"
+    }}
+  ]
+}}
+
+ABSOLUTE RULES:
+
+- Every factual statement in "answer" must be represented in "claims".
+- Every claim must have one valid source_number.
+- Every evidence_quote must be copied exactly from that source.
+- Do not paraphrase the evidence_quote.
+- A claim may make the quotation grammatically cohesive, but it must
+  not add any factual detail absent from the quotation.
+- Search all sources before answering.
+- Do not stop after the first relevant source.
+- Use multiple sources when they contain different requested facts.
+- Never use general knowledge.
+- Never guess missing details.
+- Never infer a cause, reason, intent, responsibility, approval,
+  relationship, completion status or conclusion unless directly stated.
+- Preserve names exactly.
+- Preserve dates exactly.
+- Preserve times exactly.
+- Preserve quantities exactly.
+- Preserve amounts exactly.
+- Preserve currencies exactly.
+- Preserve percentages exactly.
+- Preserve document identifiers exactly.
+- Do not silently correct document values.
+- Do not calculate new values unless an exact deterministic calculation
+  result is already explicitly included in the source context.
+- Do not add source names inside the answer text.
+
+Match the answer structure to the question:
+
+- A direct factual question gets a direct answer.
+- A list request gets a list.
+- A comparison gets a clear comparison.
+- A procedure gets ordered steps.
+- A summary gets a cohesive summary.
+- A who/when/where question directly provides those fields.
+- A yes/no question gives yes or no only when the evidence explicitly
+  establishes it.
+
+If some requested information is present and another requested part
+is absent:
+- answer with the supported information;
+- explicitly state which requested part was not found;
+- do not guess the missing part.
+
+If the sources contain none of the requested information, return:
+
+{{
+  "answer": "{FALLBACK_NO_DATA_ANSWER}",
+  "claims": []
+}}
+
+User question:
+{clean_query}
+
+Numbered document sources:
+{numbered_context}
+""".strip()
+        )
+
+    except Exception as error:
+        print(
+            "STRICT DOCUMENT ANSWER REQUEST ERROR:",
+            type(error).__name__,
+            str(error)
+        )
+
+        return {
+            "answer": FALLBACK_NO_DATA_ANSWER,
+            "sources": []
+        }
+
+    parsed_response = parse_llm_json_response(
+        raw_response
+    )
+
+    if not isinstance(parsed_response, dict):
+        print(
+            "STRICT DOCUMENT ANSWER INVALID JSON:",
+            str(raw_response or "")[:1000]
+        )
+
+        return {
+            "answer": FALLBACK_NO_DATA_ANSWER,
+            "sources": []
+        }
+
+    answer = clean_text_for_postgres(
+        str(
+            parsed_response.get("answer")
+            or ""
+        )
+    ).strip()
+
+    claims = parsed_response.get(
+        "claims"
+    )
+
+    if (
+        not answer
+        or answer == FALLBACK_NO_DATA_ANSWER
+        or not isinstance(claims, list)
+        or not claims
+    ):
+        return {
+            "answer": FALLBACK_NO_DATA_ANSWER,
+            "sources": []
+        }
+
+    verified_rows = []
+    verified_quotes = []
+    seen_row_keys = set()
+
+    for claim_index, claim_data in enumerate(
+        claims,
+        start=1
+    ):
+        if not isinstance(claim_data, dict):
+            print(
+                "STRICT CLAIM IS NOT AN OBJECT:",
+                claim_index
+            )
+
+            return {
+                "answer": FALLBACK_NO_DATA_ANSWER,
+                "sources": []
+            }
+
+        claim_text = clean_text_for_postgres(
+            str(
+                claim_data.get("claim")
+                or ""
+            )
+        ).strip()
+
+        evidence_quote = clean_text_for_postgres(
+            str(
+                claim_data.get("evidence_quote")
+                or claim_data.get("quote")
+                or ""
+            )
+        ).strip()
+
+        try:
+            source_number = int(
+                claim_data.get("source_number")
+            )
+        except Exception:
+            print(
+                "STRICT CLAIM HAS INVALID SOURCE:",
+                claim_index
+            )
+
+            return {
+                "answer": FALLBACK_NO_DATA_ANSWER,
+                "sources": []
+            }
+
+        source_index = source_number - 1
+
+        if (
+            not claim_text
+            or not evidence_quote
+            or source_index < 0
+            or source_index >= len(clean_rows)
+        ):
+            print(
+                "STRICT CLAIM IS INCOMPLETE:",
+                claim_index
+            )
+
+            return {
+                "answer": FALLBACK_NO_DATA_ANSWER,
+                "sources": []
+            }
+
+        selected_row = clean_rows[
+            source_index
+        ]
+
+        if not source_quote_exists_in_row(
+            selected_row,
+            evidence_quote
+        ):
+            print(
+                "STRICT CLAIM QUOTE NOT FOUND:",
+                {
+                    "claim_index": claim_index,
+                    "source_number": source_number,
+                    "quote": evidence_quote[:500]
+                }
+            )
+
+            return {
+                "answer": FALLBACK_NO_DATA_ANSWER,
+                "sources": []
+            }
+
+        # Ensure protected values in the individual claim are present
+        # in that claim's exact quotation.
+        if not validate_protected_tokens_against_evidence(
+            answer=claim_text,
+            evidence_quotes=[evidence_quote]
+        ):
+            print(
+                "STRICT CLAIM ADDED A PROTECTED VALUE:",
+                claim_index
+            )
+
+            return {
+                "answer": FALLBACK_NO_DATA_ANSWER,
+                "sources": []
+            }
+
+        verified_quotes.append(
+            evidence_quote
+        )
+
+        row_key = (
+            selected_row.get("asset_id"),
+            selected_row.get("chunk_index"),
+            selected_row.get("content_type")
+        )
+
+        if row_key not in seen_row_keys:
+            seen_row_keys.add(
+                row_key
+            )
+
+            verified_rows.append(
+                selected_row
+            )
+
+    # Deterministically reject unsupported numbers, dates,
+    # amounts, percentages and identifiers in the final answer.
+    if not validate_protected_tokens_against_evidence(
+        answer=answer,
+        evidence_quotes=verified_quotes
+    ):
+        return {
+            "answer": FALLBACK_NO_DATA_ANSWER,
+            "sources": []
+        }
+
+    # Final semantic validation using only the already verified quotes.
+    try:
+        validation_response = ask_llm(
+            query=clean_query,
+            context=f"""
+You are validating whether a proposed answer contains only facts from
+verified exact document quotations.
+
+Return ONLY valid JSON:
+
+{{
+  "supported": true
+}}
+
+or:
+
+{{
+  "supported": false
+}}
+
+Set "supported" to true only when every factual statement in the
+proposed answer is explicitly supported by the verified quotations.
+
+Connecting grammar, reordering and removing repetition are allowed.
+
+Set "supported" to false if the answer introduces any unsupported:
+
+- person;
+- organisation;
+- date;
+- time;
+- number;
+- quantity;
+- amount;
+- currency;
+- percentage;
+- identifier;
+- event;
+- action;
+- status;
+- condition;
+- cause;
+- reason;
+- conclusion;
+- recommendation;
+- relationship;
+- responsibility;
+- approval;
+- intent.
+
+Set "supported" to false when the answer claims a requested fact was
+not found but that statement is contradicted by the quotations.
+
+Do not explain.
+Do not rewrite the answer.
+Return JSON only.
+
+User question:
+{clean_query}
+
+Proposed answer:
+{answer}
+
+Verified exact quotations:
+{json.dumps(
+    verified_quotes,
+    ensure_ascii=False,
+    indent=2
+)}
+""".strip()
+        )
+
+        validation_data = parse_llm_json_response(
+            validation_response
+        )
+
+        if (
+            not isinstance(validation_data, dict)
+            or validation_data.get("supported") is not True
+        ):
+            print(
+                "STRICT FINAL ANSWER FAILED VALIDATION:",
+                validation_response
+            )
+
+            return {
+                "answer": FALLBACK_NO_DATA_ANSWER,
+                "sources": []
+            }
+
+    except Exception as error:
+        print(
+            "STRICT FINAL ANSWER VALIDATION ERROR:",
+            type(error).__name__,
+            str(error)
+        )
+
+        return {
+            "answer": FALLBACK_NO_DATA_ANSWER,
+            "sources": []
+        }
+
+    return {
+        "answer": answer,
+        "sources": build_sources_from_asset_results(
+            verified_rows
+        )
+    }
+
+
+
+def verified_source_rows_from_llm_result(parsed, matched_rows):
+    if not parsed or not isinstance(parsed, dict):
+        return []
+
+    if not bool(parsed.get("document_used")):
+        return []
+
+    used_sources = parsed.get("used_sources") or []
+
+    if not isinstance(used_sources, list):
+        return []
+
+    verified_rows = []
+
+    for used_source in used_sources:
+        if not isinstance(used_source, dict):
+            continue
+
+        try:
+            source_number = int(used_source.get("source_number"))
+        except Exception:
+            continue
+
+        quote = str(used_source.get("evidence_quote") or "").strip()
+
+        if source_number <= 0:
+            continue
+
+        index = source_number - 1
+
+        if index < 0 or index >= len(matched_rows):
+            continue
+
+        row = matched_rows[index]
+
+        if source_quote_exists_in_row(row, quote):
+            verified_rows.append(row)
+        else:
+            print(
+                "SOURCE VERIFICATION FAILED:",
+                {
+                    "source_number": source_number,
+                    "quote": quote[:200]
+                }
+            )
+
+    return verified_rows
+
+def build_sources_from_asset_results(results: list[dict]) -> list[dict]:
+    seen = set()
+    sources = []
+
+    missing_name_asset_ids = []
+
+    for row in results or []:
+        asset_id = row.get("asset_id")
+
+        if not asset_id or asset_id in seen:
+            continue
+
+        file_name = (
+            row.get("original_file_name")
+            or row.get("file_name")
+            or row.get("title")
+        )
+
+        if not file_name:
+            missing_name_asset_ids.append(asset_id)
+
+        seen.add(asset_id)
+
+    asset_name_lookup = {}
+
+    if missing_name_asset_ids:
+        try:
+            asset_res = supabase.table("assets") \
+                .select("id, file_name, original_file_name, file_type") \
+                .in_("id", missing_name_asset_ids) \
+                .execute()
+
+            for asset in asset_res.data or []:
+                asset_name_lookup[asset.get("id")] = (
+                    asset.get("original_file_name")
+                    or asset.get("file_name")
+                    or "Untitled document"
+                )
+
+        except Exception as e:
+            print("SOURCE NAME LOOKUP ERROR:", type(e).__name__, str(e))
+
+    seen = set()
+
+    for row in results or []:
+        asset_id = row.get("asset_id")
+
+        if not asset_id or asset_id in seen:
+            continue
+
+        seen.add(asset_id)
+
+        file_name = (
+            row.get("original_file_name")
+            or row.get("file_name")
+            or row.get("title")
+            or asset_name_lookup.get(asset_id)
+            or "Untitled document"
+        )
+
+        sources.append({
+            "asset_id": asset_id,
+            "title": file_name,
+            "file_name": file_name
+        })
+
+    return sources
+
+    
+def validate_answer_supported_by_source(query: str, answer: str, source_row: dict) -> bool:
+    """
+    Checks whether one selected source directly supports the answer
+    to the user's exact question.
+
+    This prevents:
+    - hallucinated answers
+    - loosely related documents being used as sources
+    - random retrieved chunks being shown as source cards
+    """
+
+    clean_query = str(query or "").strip()
+    clean_answer = str(answer or "").strip()
+
+    if not clean_query or not clean_answer:
+        return False
+
+    if clean_answer == FALLBACK_NO_DATA_ANSWER:
+        return False
+
+    source_content = str(source_row.get("content") or "").strip()
+
+    if not source_content:
+        return False
+
+    try:
+        raw = ask_llm(
+            query=clean_query,
+            context=f"""
+You are validating whether a document source directly supports an answer.
+
+Return ONLY valid JSON:
+
+{{
+  "supported": true
+}}
+
+or:
+
+{{
+  "supported": false
+}}
+
+Rules:
+- supported=true ONLY if the source text directly answers the user's exact question.
+- supported=true ONLY if the answer is clearly grounded in this source text.
+- supported=false if the source is only loosely related.
+- supported=false if the source is about a similar topic but does not answer the exact question.
+- supported=false if the answer uses outside knowledge.
+- supported=false if the answer adds facts not present in the source.
+- supported=false if the source would not be enough for a human to verify the answer.
+- Do not explain.
+- Return JSON only.
+
+User question:
+{clean_query}
+
+Answer:
+{clean_answer}
+
+Source text:
+{source_content}
+""".strip()
+        )
+
+        parsed = parse_llm_json_response(raw)
+
+        if parsed and isinstance(parsed, dict):
+            return bool(parsed.get("supported"))
+
+    except Exception as e:
+        print("SOURCE SUPPORT VALIDATION ERROR:", type(e).__name__, str(e))
+
+    return False
+
+def classify_bridgeos_query_scope(query: str) -> str:
+    """
+    Conservative deterministic gate.
+
+    conversational = safe to answer without documents
+    factual = must be answered from documents only
+
+    No hardcoded products, vendors, file names, document topics, or question examples.
+    """
+
+    clean = " ".join(str(query or "").strip().lower().split())
+
+    if not clean:
+        return "conversational"
+
+    stripped = clean.strip(" .,!?\n\t")
+
+    conversational_exact = {
+        "hi",
+        "hello",
+        "hey",
+        "hiya",
+        "good morning",
+        "good afternoon",
+        "good evening",
+        "thanks",
+        "thank you",
+        "thank you very much",
+        "ok",
+        "okay",
+        "cool",
+        "great",
+        "nice",
+        "bye",
+        "goodbye",
+    }
+
+    if stripped in conversational_exact:
+        return "conversational"
+
+    app_help_phrases = [
+        "what can you do",
+        "how can you help",
+        "how do i use",
+        "how do i upload",
+        "how can i upload",
+        "how do i search",
+        "how can i search",
+        "help me search",
+        "help me find",
+        "what can i ask",
+    ]
+
+    if any(phrase in stripped for phrase in app_help_phrases):
+        return "conversational"
+
+    # Anything else needs document proof.
+    return "factual"
+    
+
+def get_recent_user_context(chat_id: str, current_query: str, limit: int = 6) -> str:
+    """
+    Gets recent user messages only.
+
+    This is used to resolve follow-ups.
+    Assistant replies are intentionally excluded so fallback/sorry answers do not pollute the rewrite.
+    """
+
+    try:
+        res = supabase.table("messages") \
+            .select("role, content, created_at") \
+            .eq("chat_id", chat_id) \
+            .eq("role", "user") \
+            .order("created_at", desc=True) \
+            .limit(limit) \
+            .execute()
+
+        rows = list(reversed(res.data or []))
+
+        current_clean = str(current_query or "").strip()
+        parts = []
+
+        for row in rows:
+            content = str(row.get("content") or "").strip()
+
+            if not content:
+                continue
+
+            # Skip the current message because chat() already inserted it.
+            if content == current_clean:
+                continue
+
+            parts.append(content)
+
+        return "\n".join(parts)
+
+    except Exception as e:
+        print("RECENT USER CONTEXT ERROR:", type(e).__name__, str(e))
+        return ""
+
+def filter_rows_that_directly_answer_query(query: str, rows: list[dict]) -> list[dict]:
+    """
+    Keeps only rows that directly contain the answer to the user's exact question.
+
+    No hardcoded topics, products, brands, vendors, yacht terms, files, or specific questions.
+    """
+
+    clean_query = str(query or "").strip()
+
+    if not clean_query or not rows:
+        return []
+
+    candidate_rows = rows[:100]
+    context = build_context_from_asset_results(candidate_rows)
+
+    if not context.strip():
+        return []
+
+    try:
+        raw = ask_llm(
+            query=clean_query,
+            context=f"""
+You are checking retrieved document chunks for a document-based assistant.
+
+Return ONLY valid JSON:
+
+{{
+  "direct_source_numbers": [1]
+}}
+
+or:
+
+{{
+  "direct_source_numbers": []
+}}
+
+Rules:
+- Select a source ONLY if it directly contains the information needed to answer the user's exact question.
+- Do not select a source because it is generally related.
+- Do not select a source because it mentions a similar topic.
+- Do not select a source if the answer would require outside knowledge.
+- Do not select a source if it does not contain the actual answer.
+- If none of the sources directly answer the exact question, return an empty list.
+- Do not explain.
+- Return JSON only.
+
+User question:
+{clean_query}
+
+Retrieved sources:
+{context}
+""".strip()
+        )
+
+        parsed = parse_llm_json_response(raw)
+
+        if not parsed or not isinstance(parsed, dict):
+            return []
+
+        numbers = parsed.get("direct_source_numbers") or []
+
+        if not isinstance(numbers, list):
+            return []
+
+        direct_rows = []
+
+        for number in numbers:
+            try:
+                index = int(number) - 1
+            except Exception:
+                continue
+
+            if 0 <= index < len(candidate_rows):
+                direct_rows.append(candidate_rows[index])
+
+        return direct_rows
+
+    except Exception as e:
+        print("DIRECT SOURCE FILTER ERROR:", type(e).__name__, str(e))
+        return []
+
+def get_previous_assistant_source_asset_ids(
+    chat_id: str,
+    crew_id: str,
+    yacht_id: str,
+    limit: int = 6
+) -> list[str]:
+    """
+    Gets source asset ids from the most recent assistant answer that had sources.
+
+    Used for follow-up questions so BridgeOS expands from the same document
+    instead of searching unrelated documents.
+    """
+
+    try:
+        res = supabase.table("messages") \
+            .select("role, sources, created_at") \
+            .eq("chat_id", chat_id) \
+            .eq("crew_id", crew_id) \
+            .eq("yacht_id", yacht_id) \
+            .eq("role", "assistant") \
+            .order("created_at", desc=True) \
+            .limit(limit) \
+            .execute()
+
+        for row in res.data or []:
+            row_sources = row.get("sources") or []
+
+            if not isinstance(row_sources, list):
+                continue
+
+            asset_ids = []
+
+            for source in row_sources:
+                if not isinstance(source, dict):
+                    continue
+
+                asset_id = source.get("asset_id")
+
+                if asset_id and asset_id not in asset_ids:
+                    asset_ids.append(asset_id)
+
+            if asset_ids:
+                return asset_ids
+
+    except Exception as e:
+        print("PREVIOUS ASSISTANT SOURCES ERROR:", type(e).__name__, str(e))
+
+    return []
+
+def is_contextual_followup_query(query: str, chat_id: str) -> bool:
+    """
+    Detects whether the latest user message depends on earlier chat context.
+
+    No hardcoded topics, products, vendors, or document names.
+    """
+
+    clean_query = str(query or "").strip()
+
+    if not clean_query:
+        return False
+
+    recent_user_context = get_recent_user_context(
+        chat_id=chat_id,
+        current_query=clean_query,
+        limit=6
+    )
+
+    if not recent_user_context.strip():
+        return False
+
+    try:
+        raw = ask_llm(
+            query=clean_query,
+            context=f"""
+Classify whether the latest user message depends on previous user messages.
+
+Return ONLY one word:
+
+followup
+
+or
+
+standalone
+
+Definitions:
+- followup = the latest message is incomplete without previous context, asks to continue, asks for more detail, asks "what about..." another item, or refers back to the previous topic.
+- standalone = the latest message is complete by itself.
+
+Rules:
+- Do not answer the user.
+- Do not explain.
+- Return only followup or standalone.
+
+Previous user messages:
+{recent_user_context}
+
+Latest user message:
+{clean_query}
+""".strip()
+        )
+
+        value = str(raw or "").strip().lower()
+
+        return value == "followup"
+
+    except Exception as e:
+        print("FOLLOWUP CLASSIFIER ERROR:", type(e).__name__, str(e))
+        return False
+
+# ------------------------
+# GENERIC DOCUMENT CONTEXT EXPANSION
+# ------------------------
+
+def get_row_text_for_relevance(row) -> str:
+    """
+    Returns the searchable text from an asset chunk row.
+    Generic: works for PDFs, DOCX, text, OCR, WhatsApp, tables, etc.
+    """
+
+    if not row:
+        return ""
+
+    return str(
+        row.get("content")
+        or row.get("text")
+        or row.get("summary")
+        or ""
+    )
+
+
+def normalise_search_text(value: str) -> str:
+    value = value or ""
+    value = value.lower()
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
+
+
+def meaningful_terms_from_query(query: str) -> list[str]:
+    """
+    Generic query terms, not domain-specific.
+    Used only to avoid expanding totally unrelated documents.
+    """
+
+    text = normalise_search_text(query)
+
+    stopwords = {
+        "a", "an", "the", "and", "or", "of", "to", "in", "on", "for", "from",
+        "with", "by", "is", "are", "was", "were", "be", "been", "being",
+        "it", "this", "that", "these", "those", "i", "me", "my", "we", "our",
+        "you", "your", "they", "them", "their", "what", "which", "who", "where",
+        "when", "why", "how", "many", "much", "give", "tell", "show", "find",
+        "list", "count", "currently", "please", "can", "could", "would", "should"
+    }
+
+    terms = []
+
+    for word in text.split():
+        if len(word) < 3:
+            continue
+
+        if word in stopwords:
+            continue
+
+        terms.append(word)
+
+    # Deduplicate while preserving order.
+    seen = set()
+    final_terms = []
+
+    for term in terms:
+        if term not in seen:
+            seen.add(term)
+            final_terms.append(term)
+
+    return final_terms
+
+
+def row_relevance_score_for_query(query: str, row) -> float:
+    """
+    Generic overlap scoring.
+    This does NOT answer the question.
+    It only prevents obviously unrelated assets from being expanded.
+    """
+
+    row_text = normalise_search_text(get_row_text_for_relevance(row))
+    terms = meaningful_terms_from_query(query)
+
+    if not row_text or not terms:
+        return 0.0
+
+    hits = 0
+
+    for term in terms:
+        if term in row_text:
+            hits += 1
+
+    return hits / max(len(terms), 1)
+
+
+def ordered_unique_asset_ids_from_rows(rows: list[dict], max_assets: int = 3) -> list[str]:
+    asset_ids = []
+
+    for row in rows or []:
+        asset_id = row.get("asset_id")
+
+        if not asset_id:
+            continue
+
+        if asset_id not in asset_ids:
+            asset_ids.append(asset_id)
+
+        if len(asset_ids) >= max_assets:
+            break
+
+    return asset_ids
+
+
+def choose_relevant_asset_ids_for_query(
+    query: str,
+    matched_rows: list[dict],
+    max_assets: int = 2
+) -> list[str]:
+    """
+    Chooses which matched document(s) should be expanded to full-document context.
+
+    This is generic:
+    - no crew terms
+    - no invoice terms
+    - no WhatsApp terms
+    - no document-specific hard-coding
+
+    It uses only retrieval order + generic term overlap.
+    """
+
+    if not matched_rows:
+        return []
+
+    asset_scores = {}
+    asset_order_bonus = {}
+
+    for index, row in enumerate(matched_rows):
+        asset_id = row.get("asset_id")
+
+        if not asset_id:
+            continue
+
+        score = row_relevance_score_for_query(query, row)
+
+        # Retrieval order matters, but should not overpower relevance.
+        order_bonus = max(0.0, 1.0 - (index * 0.03))
+
+        asset_scores[asset_id] = asset_scores.get(asset_id, 0.0) + score + order_bonus
+        asset_order_bonus[asset_id] = max(asset_order_bonus.get(asset_id, 0.0), order_bonus)
+
+    if not asset_scores:
+        return ordered_unique_asset_ids_from_rows(matched_rows, max_assets=max_assets)
+
+    ranked = sorted(
+        asset_scores.items(),
+        key=lambda item: item[1],
+        reverse=True
+    )
+
+    selected = []
+
+    for asset_id, score in ranked:
+        if score <= 0:
+            continue
+
+        selected.append(asset_id)
+
+        if len(selected) >= max_assets:
+            break
+
+    if selected:
+        return selected
+
+    return ordered_unique_asset_ids_from_rows(matched_rows, max_assets=max_assets)
+
+
+def get_full_asset_rows_for_context(
+    yacht_id: str,
+    asset_id: str,
+    security_level: int,
+    max_rows: int = 400
+) -> list[dict]:
+    """
+    Loads the full chunk set for one document, ordered by chunk_index.
+
+    Important:
+    - Joins assets so source cards can show the real document name.
+    - Without this, expanded rows only contain asset_chunks fields and the UI shows "Untitled document".
+    """
+
+    if not asset_id:
+        return []
+
+    try:
+        res = supabase.table("asset_chunks") \
+            .select("""
+                asset_id,
+                yacht_id,
+                chat_id,
+                security_level,
+                content,
+                content_type,
+                chunk_index,
+                detected_date,
+                detected_year,
+                tags,
+                assets!inner (
+                    id,
+                    file_name,
+                    original_file_name,
+                    file_type,
+                    mime_type
+                )
+            """) \
+            .eq("yacht_id", yacht_id) \
+            .eq("asset_id", asset_id) \
+            .order("chunk_index", desc=False) \
+            .limit(max_rows) \
+            .execute()
+
+        rows = []
+
+        for row in res.data or []:
+            asset_data = row.get("assets") or {}
+
+            rows.append({
+                "asset_id": row.get("asset_id"),
+                "yacht_id": row.get("yacht_id"),
+                "chat_id": row.get("chat_id"),
+                "security_level": row.get("security_level"),
+                "content": row.get("content"),
+                "content_type": row.get("content_type"),
+                "chunk_index": row.get("chunk_index"),
+                "detected_date": row.get("detected_date"),
+                "detected_year": row.get("detected_year"),
+                "tags": row.get("tags"),
+                "file_name": asset_data.get("file_name"),
+                "original_file_name": asset_data.get("original_file_name"),
+                "file_type": asset_data.get("file_type"),
+                "mime_type": asset_data.get("mime_type")
+            })
+
+        return rows
+
+    except Exception as e:
+        print("FULL ASSET CONTEXT LOAD ERROR:", type(e).__name__, str(e), asset_id)
+        return []
+
+
+def trim_rows_for_context_limit(
+    rows: list[dict],
+    max_chars: int = 120000,
+    preserve_all_rows: bool = False
+) -> list[dict]:
+    """
+    Limits focused-answer context without silently removing later rows.
+
+    For comprehensive and whole-document requests, all rows are preserved
+    and will be processed in smaller batches later.
+    """
+
+    clean_rows = []
+
+    for row in rows or []:
+        row_text = get_row_text_for_relevance(row).strip()
+
+        if row_text:
+            clean_rows.append(row)
+
+    if preserve_all_rows:
+        return clean_rows
+
+    trimmed = []
+    total_chars = 0
+
+    for row in clean_rows:
+        row_text = get_row_text_for_relevance(row)
+        row_length = len(row_text)
+
+        if total_chars + row_length > max_chars:
+            continue
+
+        trimmed.append(row)
+        total_chars += row_length
+
+    return trimmed
+
+def deduplicate_context_rows(rows: list[dict]) -> list[dict]:
+    """
+    Removes duplicate content while preserving document order.
+    """
+
+    unique_rows = []
+    seen = set()
+
+    for row in rows or []:
+        normalised_content = normalise_search_text(
+            get_row_text_for_relevance(row)
+        )
+
+        if not normalised_content:
+            continue
+
+        key = (
+            row.get("asset_id"),
+            normalised_content
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        unique_rows.append(row)
+
+    return unique_rows
+
+def split_context_rows_into_batches(
+    rows: list[dict],
+    max_chars_per_batch: int = 30000
+) -> list[list[dict]]:
+    """
+    Splits source rows into model-sized batches without splitting rows.
+    """
+
+    batches = []
+    current_batch = []
+    current_chars = 0
+
+    for row in rows or []:
+        row_text = get_row_text_for_relevance(row).strip()
+
+        if not row_text:
+            continue
+
+        row_size = len(row_text)
+
+        if (
+            current_batch
+            and current_chars + row_size > max_chars_per_batch
+        ):
+            batches.append(current_batch)
+            current_batch = []
+            current_chars = 0
+
+        current_batch.append(row)
+        current_chars += row_size
+
+    if current_batch:
+        batches.append(current_batch)
+
+    return batches
+
+def extract_relevant_information_from_batches(
+    query: str,
+    rows: list[dict],
+    answer_depth: str
+) -> tuple[str, list[dict]]:
+    """
+    Inspects every document batch before creating the final answer.
+    """
+
+    batches = split_context_rows_into_batches(
+        rows=rows,
+        max_chars_per_batch=30000
+    )
+
+    extracted_parts = []
+    relevant_rows = []
+
+    for batch_index, batch_rows in enumerate(batches, start=1):
+        batch_context = build_context_from_asset_results(batch_rows)
+
+        try:
+            raw = ask_llm(
+                query=query,
+                context=f"""
+You are extracting evidence from one part of a larger document context.
+
+The final answer will be created later after every document part has
+been inspected.
+
+Rules:
+- Use only this document part.
+- Extract every distinct item that directly relates to the exact user request.
+- Do not summarise away details.
+- Preserve relevant names, values, dates, conditions, exceptions,
+  warnings, requirements and procedural steps.
+- Do not use outside knowledge.
+- Do not invent missing details.
+- If this document part contains no directly relevant information,
+  return exactly:
+NO_RELEVANT_INFORMATION
+- Return plain text only.
+- Do not add an introduction or conclusion.
+
+Requested answer depth:
+{answer_depth}
+
+User request:
+{query}
+
+Document part {batch_index} of {len(batches)}:
+
+{batch_context}
+""".strip()
+)
+
+            extracted = str(raw or "").strip()
+
+        except Exception as e:
+            print(
+                "BATCH EXTRACTION ERROR:",
+                batch_index,
+                type(e).__name__,
+                str(e)
+            )
+            extracted = ""
+
+        if (
+            extracted
+            and extracted != "NO_RELEVANT_INFORMATION"
+        ):
+            extracted_parts.append(
+                f"Evidence part {batch_index}:\n{extracted}"
+            )
+            relevant_rows.extend(batch_rows)
+
+    return (
+        "\n\n".join(extracted_parts).strip(),
+        deduplicate_context_rows(relevant_rows)
+    )
+
+
+def expand_retrieved_rows_to_full_relevant_documents(
+    query: str,
+    matched_rows: list[dict],
+    yacht_id: str,
+    security_level: int,
+    answer_depth: str = "focused",
+    max_assets: int | None = None,
+    max_rows_per_asset: int | None = None,
+    max_context_chars: int = 180000
+) -> list[dict]:
+    """
+    Expands initially retrieved chunks into complete relevant document context.
+
+    Behaviour:
+
+    focused:
+        The final answer should be concise, but up to five documents
+        may contribute different parts of the answer.
+
+    comprehensive:
+        Inspect up to ten relevant documents and preserve broad context.
+
+    document:
+        Inspect the strongest complete document.
+
+    This function does not answer the question.
+    It only loads accessible source material.
+    """
+
+    if not matched_rows:
+        return []
+
+    clean_query = clean_text_for_postgres(
+        str(query or "")
+    ).strip()
+
+    clean_answer_depth = str(
+        answer_depth or "focused"
+    ).strip().lower()
+
+    if clean_answer_depth not in {
+        "focused",
+        "comprehensive",
+        "document"
+    }:
+        clean_answer_depth = "focused"
+
+    try:
+        clean_security_level = int(
+            security_level
+        )
+    except Exception:
+        clean_security_level = 4
+
+    if max_assets is None:
+        if clean_answer_depth == "comprehensive":
+            max_assets = 10
+
+        elif clean_answer_depth == "document":
+            max_assets = 1
+
+        else:
+            # A direct question can still require facts from several files.
+            max_assets = 5
+
+    max_assets = max(
+        1,
+        min(
+            int(max_assets),
+            20
+        )
+    )
+
+    if max_rows_per_asset is None:
+        if clean_answer_depth in {
+            "comprehensive",
+            "document"
+        }:
+            max_rows_per_asset = 5000
+        else:
+            max_rows_per_asset = 1500
+
+    max_rows_per_asset = max(
+        1,
+        int(max_rows_per_asset)
+    )
+
+    selected_asset_ids = choose_relevant_asset_ids_for_query(
+        query=clean_query,
+        matched_rows=matched_rows,
+        max_assets=max_assets
+    )
+
+    if not selected_asset_ids:
+        selected_asset_ids = ordered_unique_asset_ids_from_rows(
+            matched_rows,
+            max_assets=max_assets
+        )
+
+    if not selected_asset_ids:
+        return deduplicate_context_rows(
+            matched_rows
+        )
+
+    expanded_rows = []
+    total_characters = 0
+
+    for asset_id in selected_asset_ids:
+        if not asset_id:
+            continue
+
+        try:
+            chunk_response = (
+                supabase.table("asset_chunks")
+                .select(
+                    "id, asset_id, yacht_id, chat_id, "
+                    "security_level, content, content_type, "
+                    "chunk_index, detected_date, detected_year, "
+                    "tags, assets(file_name, original_file_name)"
+                )
+                .eq("asset_id", asset_id)
+                .eq("yacht_id", yacht_id)
+                .order("chunk_index")
+                .limit(max_rows_per_asset)
+                .execute()
+            )
+
+            asset_rows = chunk_response.data or []
+
+        except Exception as error:
+            print(
+                "FULL DOCUMENT EXPANSION ERROR:",
+                {
+                    "asset_id": asset_id,
+                    "error_type": type(error).__name__,
+                    "error": str(error)
+                }
+            )
+
+            asset_rows = []
+
+        if not asset_rows:
+            asset_rows = [
+                row
+                for row in matched_rows
+                if row.get("asset_id") == asset_id
+            ]
+
+        for row in asset_rows:
+            if not isinstance(row, dict):
+                continue
+
+            row_yacht_id = row.get("yacht_id")
+
+            if (
+                row_yacht_id
+                and str(row_yacht_id) != str(yacht_id)
+            ):
+                continue
+
+            row_security_level = row.get(
+                "security_level"
+            )
+
+            if (
+                clean_security_level != 1
+                and row_security_level is not None
+            ):
+                try:
+                    if int(row_security_level) < clean_security_level:
+                        continue
+                except Exception:
+                    continue
+
+            row_content = clean_text_for_postgres(
+                str(
+                    row.get("content")
+                    or row.get("text")
+                    or ""
+                )
+            ).strip()
+
+            if not row_content:
+                continue
+
+            remaining_characters = (
+                max_context_chars
+                - total_characters
+            )
+
+            if remaining_characters <= 0:
+                break
+
+            if len(row_content) > remaining_characters:
+                row_content = row_content[
+                    :remaining_characters
+                ]
+
+            clean_row = dict(row)
+            clean_row["content"] = row_content
+
+            nested_asset = row.get("assets")
+
+            if isinstance(nested_asset, dict):
+                clean_row["file_name"] = (
+                    clean_row.get("file_name")
+                    or nested_asset.get("file_name")
+                )
+
+                clean_row["original_file_name"] = (
+                    clean_row.get("original_file_name")
+                    or nested_asset.get(
+                        "original_file_name"
+                    )
+                )
+
+            expanded_rows.append(
+                clean_row
+            )
+
+            total_characters += len(
+                row_content
+            )
+
+        if total_characters >= max_context_chars:
+            break
+
+    if not expanded_rows:
+        return deduplicate_context_rows(
+            matched_rows
+        )
+
+    return deduplicate_context_rows(
+        expanded_rows
+    )
+    
+# ------------------------
+# GENERIC NUMERIC TABLE / LIST COMPARISON
+# ------------------------
+
+def parse_numeric_comparison_query(query: str):
+    """
+    Detects generic numeric comparison questions.
+
+    Examples:
+    - less than 10
+    - below 5
+    - under 3
+    - more than 100
+    - greater than 12
+    - at least 8
+    - no more than 20
+
+    This is NOT domain-specific.
+    """
+
+    q = (query or "").lower()
+
+    patterns = [
+        ("lte", r"(?:less than or equal to|lower than or equal to|at most|no more than|maximum of|<=)\s*(\d+(?:\.\d+)?)"),
+        ("gte", r"(?:greater than or equal to|more than or equal to|at least|no less than|minimum of|>=)\s*(\d+(?:\.\d+)?)"),
+        ("lt", r"(?:less than|lower than|below|under|fewer than|<)\s*(\d+(?:\.\d+)?)"),
+        ("gt", r"(?:greater than|more than|above|over|>)\s*(\d+(?:\.\d+)?)"),
+        ("eq", r"(?:equal to|equals|exactly|=)\s*(\d+(?:\.\d+)?)"),
+    ]
+
+    for operator, pattern in patterns:
+        match = re.search(pattern, q)
+
+        if match:
+            try:
+                threshold = Decimal(match.group(1))
+            except InvalidOperation:
+                return None
+
+            return {
+                "operator": operator,
+                "threshold": threshold
+            }
+
+    return None
+
+
+def compare_numeric_value(
+    value: Decimal,
+    comparison_operator: str,
+    threshold: Decimal
+) -> bool:
+    if comparison_operator == "lt":
+        return value < threshold
+
+    if comparison_operator == "lte":
+        return value <= threshold
+
+    if comparison_operator == "gt":
+        return value > threshold
+
+    if comparison_operator == "gte":
+        return value >= threshold
+
+    if comparison_operator == "eq":
+        return value == threshold
+
+    return False
+
+def format_number_for_answer(value):
+    try:
+        number = Decimal(str(value))
+
+        if number == number.to_integral_value():
+            return str(number.quantize(Decimal("1")))
+
+        return format(number.normalize(), "f")
+
+    except Exception:
+        return str(value)
+
+def extract_numeric_rows_with_llm(
+    query: str,
+    context: str
+) -> list[dict]:
+    """
+    Generic row extractor.
+
+    The LLM is only allowed to extract rows and numbers.
+    It is NOT allowed to decide the comparison result.
+    Python performs the numeric comparison afterwards.
+    """
+
+    raw = ask_llm(
+        query=query,
+        context=f"""
+You are a strict document table/list extractor.
+
+The user is asking a numeric comparison question.
+
+Your job:
+- Find the table, list, log, form, or section in the document context that is most relevant to the user's question.
+- Extract ALL relevant rows/items from that table/list/section.
+- Do NOT perform the comparison.
+- Do NOT decide who matches.
+- Do NOT skip rows.
+- Do NOT invent rows.
+- Use only the document context.
+
+Return ONLY valid JSON in this exact shape:
+
+{{
+  "rows": [
+    {{
+      "label": "row/person/item label copied from the document",
+      "numeric_values": [10, 8, 12],
+      "evidence": "exact row or nearby text copied from the document"
+    }}
+  ]
+}}
+
+Rules:
+- "label" should identify the row/item/person/entity.
+- "numeric_values" must contain every numeric value in that row that is relevant to the user's comparison.
+- If the relevant table has multiple date/value columns, include all relevant numbers from that row.
+- If a row has no relevant numeric values, do not include it.
+- Evidence must be copied from the document context.
+- Do not include commentary outside JSON.
+
+User question:
+{query}
+
+Document context:
+{context}
+""".strip()
+    )
+
+    parsed = parse_llm_json_response(raw)
+
+    if not parsed or not isinstance(parsed, dict):
+        return []
+
+    rows = parsed.get("rows") or []
+
+    clean_rows = []
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        label = str(row.get("label") or "").strip()
+        evidence = str(row.get("evidence") or "").strip()
+        numeric_values = row.get("numeric_values") or []
+
+        if not label or not numeric_values:
+            continue
+
+        clean_numbers = []
+
+        for value in numeric_values:
+            try:
+                clean_value = Decimal(str(value))
+            except InvalidOperation:
+                continue
+
+            clean_numbers.append(clean_value)
+
+        if not clean_numbers:
+            continue
+
+        clean_rows.append({
+            "label": label,
+            "numeric_values": clean_numbers,
+            "evidence": evidence
+        })
+
+    return clean_rows
+
+
+def answer_numeric_comparison_from_context(
+    query: str,
+    context: str,
+    matched_rows: list[dict]
+):
+    """
+    Answers generic numeric comparison questions deterministically.
+
+    The LLM extracts rows/numbers.
+    Python compares the numbers.
+    This prevents hallucinated comparisons such as saying 10 is less than 10.
+    """
+
+    comparison = parse_numeric_comparison_query(query)
+
+    if not comparison:
+        return None
+
+    extracted_rows = extract_numeric_rows_with_llm(
+        query=query,
+        context=context
+    )
+
+    print("NUMERIC COMPARISON DEBUG extracted_rows:", len(extracted_rows))
+
+    if not extracted_rows:
+        return None
+
+    operator = comparison["operator"]
+    threshold = comparison["threshold"]
+
+    matching_rows = []
+
+    for row in extracted_rows:
+        matching_values = [
+            value
+            for value in row["numeric_values"]
+            if compare_numeric_value(value, operator, threshold)
+        ]
+
+        if matching_values:
+            matching_rows.append({
+                "label": row["label"],
+                "matching_values": matching_values,
+                "evidence": row.get("evidence") or ""
+            })
+
+    operator_text = {
+        "lt": "less than",
+        "lte": "less than or equal to",
+        "gt": "greater than",
+        "gte": "greater than or equal to",
+        "eq": "equal to"
+    }.get(operator, "matching")
+
+    threshold_text = format_number_for_answer(threshold)
+
+    if not matching_rows:
+        answer = f"No matching rows were found with values {operator_text} {threshold_text} in the provided document context."
+    else:
+        parts = []
+
+        for item in matching_rows:
+            values_text = ", ".join(
+                format_number_for_answer(value)
+                for value in item["matching_values"]
+            )
+
+            parts.append(f"{item['label']} ({values_text})")
+
+        answer = (
+            f"The rows with values {operator_text} {threshold_text} are: "
+            + "; ".join(parts)
+            + "."
+        )
+
+    sources = build_sources_from_asset_results(matched_rows[:3])
+
+    return {
+        "answer": answer,
+        "sources": sources
+    }
+
+def classify_answer_depth(query: str) -> str:
+    """
+    Determines how much source information must be inspected.
+
+    Returns:
+    - focused:
+      A narrow question, but several documents may still contribute.
+    - comprehensive:
+      The user requests all relevant information about a subject.
+    - document:
+      The user asks to inspect one complete document.
+
+    Important:
+    "focused" does NOT mean one document.
+    It only means the final answer should be concise.
+    """
+
+    clean_query = clean_text_for_postgres(
+        str(query or "")
+    ).strip()
+
+    if not clean_query:
+        return "focused"
+
+    try:
+        raw = ask_llm(
+            query=clean_query,
+            context="""
+Classify the amount of source information the user is requesting.
+
+Return exactly one of these words:
+
+focused
+comprehensive
+document
+
+Definitions:
+
+focused:
+The user asks a specific question and wants a direct answer.
+The answer may still require combining facts from several documents.
+
+comprehensive:
+The user asks for all information, every relevant detail, a full list,
+all entries, all steps, all requirements, all actions, all findings,
+or a complete explanation about a subject.
+
+document:
+The user explicitly asks to summarise, review, analyse, explain,
+or extract information from one complete file or document.
+
+Rules:
+- Classify only the requested answer depth.
+- Do not answer the user's question.
+- Do not decide how many documents contain the answer.
+- Do not assume a focused answer comes from only one document.
+- Do not identify or invent document names.
+- Return one word only.
+""".strip()
+        )
+
+        value = str(
+            raw or ""
+        ).strip().lower()
+
+        if value in {
+            "focused",
+            "comprehensive",
+            "document"
+        }:
+            return value
+
+    except Exception as error:
+        print(
+            "ANSWER DEPTH CLASSIFIER ERROR:",
+            type(error).__name__,
+            str(error)
+        )
+
+    return "focused"
+
+def create_voice_note_and_answer(
+    file,
+    filename: str,
+    mime_type: str | None,
+    crew: dict,
+    chat_id: str
+):
+    """
+    Saves the original voice recording, transcribes it, saves the transcript
+    as the user message, and generates the normal BridgeOS response.
+    """
+
+    verify_chat_access(
+        chat_id=chat_id,
+        crew_id=crew["id"],
+        yacht_id=crew["yacht_id"]
+    )
+
+    allowed_mime_types = {
+        "audio/webm",
+        "audio/wav",
+        "audio/x-wav",
+        "audio/mpeg",
+        "audio/mp3",
+        "audio/mp4",
+        "audio/m4a",
+        "audio/ogg",
+        "audio/aac",
+        "video/mp4"
+    }
+
+    clean_mime_type = (mime_type or "").lower().split(";")[0].strip()
+
+    if clean_mime_type and clean_mime_type not in allowed_mime_types:
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported voice-note format: {clean_mime_type}"
+        )
+
+    try:
+        file.seek(0)
+        audio_bytes = file.read()
+        file.seek(0)
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not read voice note: {str(e)}"
+        )
+
+    if not audio_bytes:
+        raise HTTPException(
+            status_code=400,
+            detail="Voice note is empty"
+        )
+
+    if len(audio_bytes) > 25 * 1024 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail="Voice note must be smaller than 25 MB"
+        )
+
+    voice_filename = safe_filename(
+        filename or f"voice-note-{uuid.uuid4()}.webm"
+    )
+
+    # This uses the existing asset pipeline:
+    # - Supabase Storage
+    # - assets table
+    # - transcription
+    # - asset_chunks
+    upload_result = upload_asset(
+        file=io.BytesIO(audio_bytes),
+        filename=voice_filename,
+        mime_type=mime_type or "audio/webm",
+        yacht_id=crew["yacht_id"],
+        uploaded_by=crew["id"],
+        chat_id=chat_id,
+        security_level=int(crew["security_level"]),
+        folder_name=None,
+        folder_security_level=None
+    )
+
+    asset = upload_result.get("asset") or {}
+
+    asset_id = asset.get("id")
+
+    if not asset_id:
+        raise HTTPException(
+            status_code=500,
+            detail="Voice note was uploaded but no asset ID was returned"
+        )
+
+    transcript = clean_text_for_postgres(
+        asset.get("extracted_text") or ""
+    )
+
+    # In case the returned upload row was the original pre-update row,
+    # retrieve the processed asset again.
+    if not transcript:
+        asset_res = supabase.table("assets") \
+            .select("id, extracted_text, file_name, mime_type, storage_path") \
+            .eq("id", asset_id) \
+            .eq("yacht_id", crew["yacht_id"]) \
+            .single() \
+            .execute()
+
+        processed_asset = asset_res.data or {}
+        transcript = clean_text_for_postgres(
+            processed_asset.get("extracted_text") or ""
+        )
+
+        if processed_asset:
+            asset = processed_asset
+
+    if not transcript:
+        raise HTTPException(
+            status_code=422,
+            detail="The voice note was saved, but no speech was detected"
+        )
+
+    # Reuse your existing chat function.
+    # This saves the transcript as the user message and saves the AI answer.
+    chat_result = chat(
+        query=transcript,
+        crew_id=crew["id"],
+        yacht_id=crew["yacht_id"],
+        security_level=crew["security_level"],
+        chat_id=chat_id,
+        uploaded_asset_id=asset_id
+    )
+
+    return {
+        **chat_result,
+        "transcript": transcript,
+        "voice_asset_id": asset_id,
+        "voice_asset": {
+            "id": asset_id,
+            "file_name": asset.get("file_name"),
+            "mime_type": asset.get("mime_type"),
+            "storage_path": asset.get("storage_path")
+        }
+
+    }
+    
+MONEY_PATTERN = re.compile(
+    r"""
+    (?<![\w\d])
+    (?P<currency_before>
+        US\$|CA\$|AU\$|
+        USD|EUR|GBP|AED|SAR|QAR|CAD|AUD|
+        \$|€|£
+    )?
+    \s*
+    (?P<amount>
+        \(?
+        (?:
+            \d{1,3}(?:,\d{3})+(?:\.\d{1,2})?
+            |
+            \d{1,3}(?:\.\d{3})+(?:,\d{1,2})?
+            |
+            \d+(?:\.\d{1,2})?
+            |
+            \d+(?:,\d{1,2})
+        )
+        \)?
+    )
+    \s*
+    (?P<currency_after>
+        USD|EUR|GBP|AED|SAR|QAR|CAD|AUD
+    )?
+    (?![\w\d])
+    """,
+    re.IGNORECASE | re.VERBOSE
+)
+
+
+INVOICE_TOTAL_LABELS = [
+    # Highest-confidence labels first.
+    ("grand_total", 100, [
+        "grand total",
+        "invoice total",
+        "final total",
+        "total invoice",
+        "amount paid",
+        "total paid",
+    ]),
+
+    ("amount_due", 90, [
+        "amount due",
+        "balance due",
+        "total due",
+        "net amount due",
+    ]),
+
+    ("total", 80, [
+        "total amount",
+        "total payable",
+        "total payment",
+        "total",
+    ]),
+]
+
+
+EXCLUDED_TOTAL_LABELS = [
+    "subtotal",
+    "sub total",
+    "tax total",
+    "vat total",
+    "sales tax",
+    "tax amount",
+    "vat amount",
+    "discount",
+    "shipping",
+    "delivery",
+    "deposit",
+    "balance brought forward",
+    "previous balance",
+]
+
+
+CURRENCY_MAP = {
+    "$": "USD",
+    "US$": "USD",
+    "USD": "USD",
+
+    "€": "EUR",
+    "EUR": "EUR",
+
+    "£": "GBP",
+    "GBP": "GBP",
+
+    "AED": "AED",
+    "SAR": "SAR",
+    "QAR": "QAR",
+    "CAD": "CAD",
+    "CA$": "CAD",
+    "AUD": "AUD",
+    "AU$": "AUD",
+}
+
+
+CURRENCY_SYMBOLS = {
+    "USD": "$",
+    "EUR": "€",
+    "GBP": "£",
+    "AED": "AED ",
+    "SAR": "SAR ",
+    "QAR": "QAR ",
+    "CAD": "CAD ",
+    "AUD": "AUD ",
+}
+
+
+def normalise_invoice_line(value: str) -> str:
+    text = str(value or "")
+    text = text.replace("\u00a0", " ")
+    text = text.replace("\t", " ")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def normalise_currency(value: str | None) -> str:
+    clean = str(value or "").strip().upper()
+
+    if not clean:
+        return ""
+
+    return CURRENCY_MAP.get(clean, clean)
+
+
+def parse_decimal_money(raw_amount: str) -> Decimal | None:
+    """
+    Parses one written monetary value without using floating-point arithmetic.
+
+    Supported examples:
+    - 1,234.56
+    - 1234.56
+    - 1 234.56
+    - 1234
+    - 1.234,56
+    - 1234,56
+    - (125.00)
+
+    Ambiguous values are rejected rather than guessed.
+    """
+
+    raw = str(raw_amount or "").strip()
+
+    if not raw:
+        return None
+
+    negative = raw.startswith("(") and raw.endswith(")")
+
+    raw = raw.strip("()")
+    raw = raw.replace("\u00a0", "")
+    raw = raw.replace(" ", "")
+
+    if not raw:
+        return None
+
+    # European format: 1.234,56
+    if "." in raw and "," in raw:
+        last_dot = raw.rfind(".")
+        last_comma = raw.rfind(",")
+
+        if last_comma > last_dot:
+            raw = raw.replace(".", "")
+            raw = raw.replace(",", ".")
+        else:
+            raw = raw.replace(",", "")
+
+    # One comma with one or two trailing digits: 1234,56
+    elif "," in raw and "." not in raw:
+        comma_parts = raw.split(",")
+
+        if len(comma_parts) == 2 and len(comma_parts[1]) in [1, 2]:
+            raw = comma_parts[0] + "." + comma_parts[1]
+
+        # Thousands groups: 1,234 or 1,234,567
+        elif all(
+            len(part) == 3
+            for part in comma_parts[1:]
+        ):
+            raw = "".join(comma_parts)
+
+        else:
+            # Ambiguous formatting: reject it.
+            return None
+
+    # Multiple dots may be European thousands separators: 1.234.567
+    elif raw.count(".") > 1:
+        dot_parts = raw.split(".")
+
+        if all(
+            len(part) == 3
+            for part in dot_parts[1:]
+        ):
+            raw = "".join(dot_parts)
+        else:
+            return None
+
+    try:
+        value = Decimal(raw)
+    except InvalidOperation:
+        return None
+
+    if negative:
+        value = -value
+
+    return value.quantize(
+        Decimal("0.01"),
+        rounding=ROUND_HALF_UP
+    )
+
+
+def extract_money_values_from_line(line: str) -> list[dict]:
+    """
+    Extracts complete monetary amounts from one line.
+
+    It rejects:
+    - dates
+    - percentages
+    - invoice/reference numbers
+    - isolated integers without currency unless they contain decimals or
+      thousands separators
+    """
+
+    clean_line = normalise_invoice_line(line)
+    values = []
+
+    if not clean_line:
+        return values
+
+    for match in MONEY_PATTERN.finditer(clean_line):
+        raw_amount = str(match.group("amount") or "").strip()
+
+        if not raw_amount:
+            continue
+
+        full_match = str(match.group(0) or "").strip()
+
+        currency_raw = (
+            match.group("currency_before")
+            or match.group("currency_after")
+            or ""
+        )
+
+        currency = normalise_currency(currency_raw)
+
+        start = match.start()
+        end = match.end()
+
+        before = clean_line[max(0, start - 2):start]
+        after = clean_line[end:end + 2]
+
+        # Reject percentages.
+        if "%" in after or "%" in before:
+            continue
+
+        # Reject date fragments such as 27/07/2026.
+        if "/" in before or "/" in after:
+            continue
+
+        # Reject time fragments such as 14:30.
+        if ":" in before or ":" in after:
+            continue
+
+        # Reject plain, currency-free integers because these are commonly:
+        # invoice numbers, quantities, dates, references or page numbers.
+        has_decimal_separator = "." in raw_amount or "," in raw_amount
+
+        if not currency and not has_decimal_separator:
+            continue
+
+        amount = parse_decimal_money(raw_amount)
+
+        if amount is None:
+            continue
+
+        # Monetary totals should not be negative for spend aggregation.
+        if amount < Decimal("0.00"):
+            continue
+
+        values.append({
+            "amount": amount,
+            "currency": currency,
+            "raw": full_match,
+            "start": start,
+            "end": end,
+        })
+
+    return values
+
+
+def determine_currency_from_document(text: str) -> str:
+    """
+    Determines the document currency conservatively.
+
+    Repeated appearances of the same currency are allowed.
+    Different currencies make the result ambiguous.
+    """
+
+    clean_text = str(text or "")
+
+    matches = re.findall(
+        r"US\$|CA\$|AU\$|\bUSD\b|\bEUR\b|\bGBP\b|\bAED\b|"
+        r"\bSAR\b|\bQAR\b|\bCAD\b|\bAUD\b|\$|€|£",
+        clean_text,
+        flags=re.IGNORECASE
+    )
+
+    currencies = {
+        normalise_currency(match)
+        for match in matches
+        if normalise_currency(match)
+    }
+
+    if len(currencies) == 1:
+        return next(iter(currencies))
+
+    return ""
+
+
+def line_has_excluded_total_label(line: str) -> bool:
+    lower = normalise_invoice_line(line).lower()
+
+    return any(
+        label in lower
+        for label in EXCLUDED_TOTAL_LABELS
+    )
+
+
+def find_total_label(line: str):
+    lower = normalise_invoice_line(line).lower()
+
+    if line_has_excluded_total_label(lower):
+        return None
+
+    for label_type, priority, phrases in INVOICE_TOTAL_LABELS:
+        for phrase in phrases:
+            if phrase in lower:
+                return {
+                    "type": label_type,
+                    "priority": priority,
+                    "phrase": phrase,
+                }
+
+    return None
+
+
+def get_row_document_name(row: dict) -> str:
+    return (
+        row.get("original_file_name")
+        or row.get("file_name")
+        or row.get("title")
+        or "Untitled invoice"
+    )
+
+
+def build_invoice_text_by_asset(
+    matched_rows: list[dict]
+) -> dict[str, dict]:
+    """
+    Combines financial text and searchable text by asset.
+
+    financial_text:
+    Used only to identify and calculate the final invoice total.
+
+    search_text:
+    Used to check whether the document contains the user's requested
+    subject, such as beef, fuel, vegetables, repairs, etc.
+    """
+
+    assets = {}
+
+    for row in matched_rows or []:
+        asset_id = row.get("asset_id")
+
+        if not asset_id:
+            continue
+
+        financial_content = str(
+            row.get("content")
+            or row.get("text")
+            or ""
+        ).strip()
+
+        search_content = str(
+            row.get("search_text")
+            or financial_content
+            or ""
+        ).strip()
+
+        if not financial_content:
+            continue
+
+        if asset_id not in assets:
+            assets[asset_id] = {
+                "asset_id": asset_id,
+                "file_name": get_row_document_name(row),
+                "rows": [],
+                "contents": [],
+                "search_contents": []
+            }
+
+        financial_key = normalise_for_source_check(
+            financial_content
+        )
+
+        existing_financial_keys = {
+            normalise_for_source_check(item)
+            for item in assets[asset_id]["contents"]
+        }
+
+        if (
+            financial_key
+            and financial_key not in existing_financial_keys
+        ):
+            assets[asset_id]["contents"].append(
+                financial_content
+            )
+
+        search_key = normalise_for_source_check(
+            search_content
+        )
+
+        existing_search_keys = {
+            normalise_for_source_check(item)
+            for item in assets[asset_id]["search_contents"]
+        }
+
+        if (
+            search_key
+            and search_key not in existing_search_keys
+        ):
+            assets[asset_id]["search_contents"].append(
+                search_content
+            )
+
+        assets[asset_id]["rows"].append(row)
+
+    return assets
+
+
+def extract_invoice_total_candidates(
+    document_text: str
+) -> list[dict]:
+    """
+    Finds labelled final invoice totals.
+
+    Only accepts:
+    - a monetary amount on the same line after the total label; or
+    - a monetary amount on the immediately following short line.
+
+    It rejects subtotal, tax, VAT, discount, delivery and other non-final totals.
+    """
+
+    raw_lines = str(document_text or "").splitlines()
+
+    lines = [
+        normalise_invoice_line(line)
+        for line in raw_lines
+    ]
+
+    lines = [
+        line
+        for line in lines
+        if line
+    ]
+
+    document_currency = determine_currency_from_document(
+        document_text
+    )
+
+    candidates = []
+
+    for index, line in enumerate(lines):
+        label = find_total_label(line)
+
+        if not label:
+            continue
+
+        lower_line = line.lower()
+        phrase_position = lower_line.find(label["phrase"])
+
+        if phrase_position < 0:
+            continue
+
+        phrase_end = phrase_position + len(label["phrase"])
+
+        # Only inspect text following the total label.
+        text_after_label = line[phrase_end:].strip(" :-–—")
+
+        selected_values = extract_money_values_from_line(
+            text_after_label
+        )
+
+        evidence = line
+
+        # Some invoices put the amount on the next line.
+        if not selected_values and index + 1 < len(lines):
+            next_line = lines[index + 1].strip()
+
+            if len(next_line) <= 60:
+                next_label = find_total_label(next_line)
+
+                if not next_label:
+                    selected_values = extract_money_values_from_line(
+                        next_line
+                    )
+
+                    if selected_values:
+                        evidence = f"{line} {next_line}"
+
+        clean_values = {}
+
+        for value in selected_values:
+            amount = value.get("amount")
+
+            if not isinstance(amount, Decimal):
+                continue
+
+            currency = (
+                value.get("currency")
+                or document_currency
+            )
+
+            # Do not guess the currency.
+            if not currency:
+                continue
+
+            key = (
+                currency,
+                amount
+            )
+
+            clean_values[key] = {
+                **value,
+                "currency": currency
+            }
+
+        # The labelled section must contain exactly one possible total.
+        if len(clean_values) != 1:
+            continue
+
+        selected = next(iter(clean_values.values()))
+
+        candidates.append({
+            "label_type": label["type"],
+            "label_phrase": label["phrase"],
+            "priority": label["priority"],
+            "amount": selected["amount"],
+            "currency": selected["currency"],
+            "evidence": evidence,
+            "line_index": index,
+        })
+
+    return candidates
+
+
+def choose_one_invoice_total(
+    candidates: list[dict]
+) -> tuple[dict | None, str | None]:
+    """
+    Selects one authoritative total for one invoice.
+
+    If equally authoritative candidates conflict, the invoice is rejected.
+    """
+
+    if not candidates:
+        return None, "No labelled invoice total was found."
+
+    highest_priority = max(
+        item["priority"]
+        for item in candidates
+    )
+
+    strongest = [
+        item
+        for item in candidates
+        if item["priority"] == highest_priority
+    ]
+
+    unique_totals = {}
+
+    for item in strongest:
+        key = (
+            item["currency"],
+            item["amount"]
+        )
+
+        unique_totals[key] = item
+
+    if len(unique_totals) > 1:
+        return None, (
+            "Conflicting invoice totals were found at the same confidence level."
+        )
+
+    return next(iter(unique_totals.values())), None
+
+
+def format_currency_amount(
+    amount: Decimal,
+    currency: str
+) -> str:
+    amount = amount.quantize(
+        Decimal("0.01"),
+        rounding=ROUND_HALF_UP
+    )
+
+    symbol = CURRENCY_SYMBOLS.get(currency)
+
+    if symbol:
+        return f"{symbol}{amount:,.2f}"
+
+    return f"{amount:,.2f} {currency}".strip()
+
+
+def extract_spending_subject(query: str) -> str:
+    """
+    Deterministically extracts the requested financial subject.
+
+    This does not hard-code products, suppliers or document names.
+    It removes only generic request/financial language.
+    """
+
+    clean_query = normalise_search_text(
+        str(query or "")
+    )
+
+    if not clean_query:
+        return ""
+
+    removable_words = {
+        "how",
+        "much",
+        "what",
+        "which",
+        "amount",
+        "amounts",
+        "money",
+        "did",
+        "do",
+        "does",
+        "have",
+        "has",
+        "was",
+        "were",
+        "we",
+        "w",       # Handles a mistyped "we", as in "did w spend"
+        "i",
+        "you",
+        "they",
+        "spend",
+        "spent",
+        "spending",
+        "pay",
+        "paid",
+        "payment",
+        "payments",
+        "charge",
+        "charged",
+        "charges",
+        "bill",
+        "billed",
+        "billing",
+        "purchase",
+        "purchased",
+        "purchases",
+        "cost",
+        "costs",
+        "costing",
+        "price",
+        "prices",
+        "total",
+        "totals",
+        "sum",
+        "combined",
+        "combine",
+        "calculate",
+        "calculation",
+        "overall",
+        "altogether",
+        "aggregate",
+        "aggregated",
+        "invoice",
+        "invoices",
+        "receipt",
+        "receipts",
+        "document",
+        "documents",
+        "file",
+        "files",
+        "on",
+        "for",
+        "of",
+        "the",
+        "a",
+        "an",
+        "in",
+        "from",
+        "across",
+        "all",
+    }
+
+    subject_words = [
+        word
+        for word in clean_query.split()
+        if word not in removable_words
+    ]
+
+    # Deduplicate while preserving multi-word subject order.
+    clean_subject_words = []
+    seen = set()
+
+    for word in subject_words:
+        if len(word) < 2:
+            continue
+
+        if word in seen:
+            continue
+
+        seen.add(word)
+        clean_subject_words.append(word)
+
+    subject = " ".join(
+        clean_subject_words
+    ).strip()
+
+    print(
+        "DETERMINISTIC SPENDING SUBJECT:",
+        {
+            "query": query,
+            "subject": subject
+        }
+    )
+
+    return subject
+
+def decimal_text_variants(
+    value: Decimal | None
+) -> set[str]:
+    if value is None:
+        return set()
+
+    decimal_value = Decimal(str(value))
+
+    variants = {
+        str(decimal_value),
+        format(decimal_value, "f"),
+        format(decimal_value.normalize(), "f"),
+    }
+
+    if decimal_value == decimal_value.to_integral_value():
+        integer_text = str(
+            decimal_value.quantize(Decimal("1"))
+        )
+
+        variants.add(integer_text)
+        variants.add(integer_text + ".0")
+        variants.add(integer_text + ".00")
+    else:
+        variants.add(f"{decimal_value:.2f}")
+
+    return {
+        normalise_search_text(item)
+        for item in variants
+        if str(item or "").strip()
+    }
+
+
+def document_contains_decimal(
+    document_text: str,
+    value: Decimal | None
+) -> bool:
+    if value is None:
+        return True
+
+    normalised_document = normalise_search_text(
+        document_text
+    )
+
+    return any(
+        variant in normalised_document
+        for variant in decimal_text_variants(value)
+    )
+
+
+def evidence_is_supported_exactly(
+    evidence: str,
+    document_text: str
+) -> bool:
+    """
+    Verifies that extracted evidence belongs to the document.
+
+    PDF and OCR extraction often changes spacing, separators and line breaks,
+    so requiring an almost exact sentence match rejects valid invoice rows.
+    """
+
+    normalised_evidence = normalise_search_text(
+        evidence
+    )
+
+    normalised_document = normalise_search_text(
+        document_text
+    )
+
+    if not normalised_evidence or not normalised_document:
+        return False
+
+    if normalised_evidence in normalised_document:
+        return True
+
+    evidence_words = [
+        word
+        for word in normalised_evidence.split()
+        if len(word) >= 2
+    ]
+
+    if not evidence_words:
+        return False
+
+    matched_words = [
+        word
+        for word in evidence_words
+        if word in normalised_document
+    ]
+
+    overlap = (
+        len(matched_words)
+        / len(evidence_words)
+    )
+
+    # OCR and extracted tables commonly lose columns, pipes and spacing.
+    return overlap >= 0.60
+
+def financial_extraction_cache_key(
+    asset_id: str,
+    subject: str,
+    document_text: str
+) -> str:
+    raw_value = "\n".join([
+        str(asset_id or ""),
+        normalise_search_text(subject),
+        document_text,
+    ])
+
+    return hashlib.sha256(
+        raw_value.encode("utf-8")
+    ).hexdigest()
+
+def extract_subject_line_items_with_llm(
+    query: str,
+    subject: str,
+    context: str,
+    asset_id: str | None = None
+) -> list[dict]:
+    """
+    Extracts every financial row in one document that semantically
+    matches the requested subject.
+
+    Important:
+    - Does not require the exact subject phrase to appear literally.
+    - Supports singular/plural wording, OCR differences, abbreviations,
+      longer descriptions and equivalent document wording.
+    - The LLM extracts values only.
+    - Python parses and calculates every amount.
+    - No product, supplier, filename, amount or question is hard-coded.
+    """
+
+    clean_subject = clean_text_for_postgres(
+        str(subject or "")
+    ).strip()
+
+    document_text = clean_text_for_postgres(
+        str(context or "")
+    ).strip()
+
+    if not clean_subject or not document_text:
+        return []
+
+    cache_key = financial_extraction_cache_key(
+        asset_id=str(asset_id or ""),
+        subject=clean_subject,
+        document_text=document_text
+    )
+
+    if cache_key in FINANCIAL_EXTRACTION_CACHE:
+        return [
+            dict(item)
+            for item in FINANCIAL_EXTRACTION_CACHE[cache_key]
+        ]
+
+    try:
+        raw = ask_llm(
+            query=query,
+            context=f"""
+You are extracting financial line items from exactly one document.
+
+Requested financial subject:
+{clean_subject}
+
+The requested subject may appear using:
+- singular or plural wording;
+- a longer product or service description;
+- an abbreviation;
+- OCR spelling or spacing differences;
+- a closely equivalent description used by the document.
+
+Return ONLY valid JSON:
+
+{{
+  "items": [
+    {{
+      "description": "complete matching row description copied from the document",
+      "unit_price": "unit price exactly as written, or empty string",
+      "quantity": "quantity exactly as written, or empty string",
+      "line_total": "line total exactly as written, or empty string",
+      "currency": "currency symbol or code, or empty string",
+      "evidence": "short exact fragment copied from the matching row"
+    }}
+  ]
+}}
+
+Rules:
+- Inspect the complete supplied document.
+- Extract EVERY financial row that refers to the requested subject.
+- Match by meaning, not only exact phrase equality.
+- Keep separate matching rows separate.
+- Preserve the complete row description.
+- Read table headings to determine quantity, unit price and line total.
+- Include a matching row when it contains either:
+  1. quantity and unit price; or
+  2. an explicit line total.
+- Do not use subtotal, VAT, tax, discount, delivery, invoice total,
+  amount due or grand total as a product/service line total.
+- Do not calculate anything.
+- Do not invent missing values.
+- Evidence must be copied from the supplied document.
+- Return {{"items": []}} only when the document genuinely has no
+  matching financial row.
+- Return JSON only.
+
+Document:
+{document_text}
+""".strip()
+        )
+
+    except Exception as error:
+        print(
+            "SINGLE DOCUMENT FINANCIAL EXTRACTION ERROR:",
+            {
+                "asset_id": asset_id,
+                "subject": clean_subject,
+                "error_type": type(error).__name__,
+                "error": str(error)
+            }
+        )
+
+        return []
+
+    print(
+        "FINANCIAL EXTRACTION RAW RESPONSE:",
+        {
+            "asset_id": asset_id,
+            "subject": clean_subject,
+            "response": str(raw or "")[:3000]
+        }
+    )
+
+    parsed = parse_llm_json_response(raw)
+
+    if not isinstance(parsed, dict):
+        print(
+            "FINANCIAL EXTRACTION INVALID JSON:",
+            {
+                "asset_id": asset_id,
+                "subject": clean_subject,
+                "response": str(raw or "")[:1000]
+            }
+        )
+
+        return []
+
+    raw_items = parsed.get("items") or []
+
+    if not isinstance(raw_items, list):
+        return []
+
+    normalised_document = normalise_search_text(
+        document_text
+    )
+
+    verified_items = []
+    seen_items = set()
+
+    for raw_item in raw_items:
+        if not isinstance(raw_item, dict):
+            continue
+
+        description = clean_text_for_postgres(
+            str(
+                raw_item.get("description")
+                or ""
+            )
+        ).strip()
+
+        evidence = clean_text_for_postgres(
+            str(
+                raw_item.get("evidence")
+                or ""
+            )
+        ).strip()
+
+        if not description:
+            continue
+
+        evidence_supported = False
+
+        if evidence:
+            evidence_supported = evidence_is_supported_exactly(
+                evidence=evidence,
+                document_text=document_text
+            )
+
+        description_supported = (
+            normalise_search_text(description)
+            in normalised_document
+        )
+
+        if not evidence_supported and not description_supported:
+            print(
+                "FINANCIAL ROW REJECTED: DOCUMENT EVIDENCE NOT FOUND",
+                {
+                    "asset_id": asset_id,
+                    "subject": clean_subject,
+                    "description": description,
+                    "evidence": evidence
+                }
+            )
+
+            continue
+
+        unit_price = parse_decimal_money(
+            str(
+                raw_item.get("unit_price")
+                or raw_item.get("price")
+                or raw_item.get("rate")
+                or ""
+            )
+        )
+
+        quantity = parse_general_decimal(
+            str(
+                raw_item.get("quantity")
+                or raw_item.get("qty")
+                or raw_item.get("units")
+                or ""
+            )
+        )
+
+        explicit_line_total = parse_decimal_money(
+            str(
+                raw_item.get("line_total")
+                or raw_item.get("explicit_line_total")
+                or raw_item.get("total")
+                or raw_item.get("amount")
+                or ""
+            )
+        )
+
+        if (
+            unit_price is not None
+            and unit_price < Decimal("0")
+        ):
+            unit_price = None
+
+        if (
+            quantity is not None
+            and quantity < Decimal("0")
+        ):
+            quantity = None
+
+        if (
+            explicit_line_total is not None
+            and explicit_line_total < Decimal("0")
+        ):
+            explicit_line_total = None
+
+        if (
+            unit_price is not None
+            and not document_contains_decimal(
+                document_text,
+                unit_price
+            )
+        ):
+            print(
+                "FINANCIAL VALUE REJECTED: UNIT PRICE NOT FOUND",
+                {
+                    "asset_id": asset_id,
+                    "description": description,
+                    "unit_price": str(unit_price)
+                }
+            )
+
+            unit_price = None
+
+        if (
+            quantity is not None
+            and not document_contains_decimal(
+                document_text,
+                quantity
+            )
+        ):
+            print(
+                "FINANCIAL VALUE REJECTED: QUANTITY NOT FOUND",
+                {
+                    "asset_id": asset_id,
+                    "description": description,
+                    "quantity": str(quantity)
+                }
+            )
+
+            quantity = None
+
+        if (
+            explicit_line_total is not None
+            and not document_contains_decimal(
+                document_text,
+                explicit_line_total
+            )
+        ):
+            print(
+                "FINANCIAL VALUE REJECTED: LINE TOTAL NOT FOUND",
+                {
+                    "asset_id": asset_id,
+                    "description": description,
+                    "line_total": str(explicit_line_total)
+                }
+            )
+
+            explicit_line_total = None
+
+        calculated_total = None
+
+        if (
+            unit_price is not None
+            and quantity is not None
+        ):
+            calculated_total = (
+                unit_price * quantity
+            ).quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP
+            )
+
+        if explicit_line_total is not None:
+            final_amount = (
+                explicit_line_total.quantize(
+                    Decimal("0.01"),
+                    rounding=ROUND_HALF_UP
+                )
+            )
+
+            amount_method = "explicit_line_total"
+
+        elif calculated_total is not None:
+            final_amount = calculated_total
+            amount_method = "quantity_times_unit_price"
+
+        else:
+            print(
+                "FINANCIAL ROW REJECTED: NO USABLE AMOUNT",
+                {
+                    "asset_id": asset_id,
+                    "subject": clean_subject,
+                    "description": description
+                }
+            )
+
+            continue
+
+        currency = normalise_currency(
+            raw_item.get("currency")
+        )
+
+        if not currency:
+            currency = determine_currency_from_document(
+                document_text
+            )
+
+        item_key = (
+            normalise_search_text(description),
+            unit_price,
+            quantity,
+            final_amount,
+            normalise_currency(currency),
+            normalise_search_text(evidence)
+        )
+
+        if item_key in seen_items:
+            continue
+
+        seen_items.add(item_key)
+
+        verified_items.append({
+            "description": description,
+            "unit_price": unit_price,
+            "quantity": quantity,
+            "explicit_line_total": explicit_line_total,
+            "amount": final_amount,
+            "currency": currency,
+            "evidence": evidence or description,
+            "asset_id": asset_id,
+            "amount_method": amount_method
+        })
+
+    print(
+        "VERIFIED FINANCIAL ITEMS:",
+        {
+            "asset_id": asset_id,
+            "subject": clean_subject,
+            "count": len(verified_items),
+            "items": [
+                {
+                    "description": item.get("description"),
+                    "unit_price": str(
+                        item.get("unit_price")
+                    ),
+                    "quantity": str(
+                        item.get("quantity")
+                    ),
+                    "line_total": str(
+                        item.get("explicit_line_total")
+                    ),
+                    "amount": str(
+                        item.get("amount")
+                    ),
+                    "currency": item.get("currency")
+                }
+                for item in verified_items
+            ]
+        }
+    )
+
+    # Cache only successful extraction results.
+    # Empty results are not cached because OCR/document processing
+    # may be corrected while the server is running.
+    if verified_items:
+        FINANCIAL_EXTRACTION_CACHE[cache_key] = [
+            dict(item)
+            for item in verified_items
+        ]
+
+    return verified_items
+
+def is_financial_total_query(query: str) -> bool:
+    """
+    Detects a request for monetary arithmetic.
+
+    This does not hard-code any item, supplier, invoice name,
+    category, project or exact user question.
+    """
+
+    clean = normalise_search_text(query)
+
+    if not clean:
+        return False
+
+    words = set(clean.split())
+
+    monetary_words = {
+        "spend",
+        "spent",
+        "spending",
+        "cost",
+        "costs",
+        "costing",
+        "price",
+        "prices",
+        "paid",
+        "pay",
+        "payment",
+        "payments",
+        "charged",
+        "charge",
+        "charges",
+        "billed",
+        "billing",
+        "amount",
+        "amounts",
+        "money",
+        "total",
+        "totals",
+        "invoice",
+        "invoices",
+        "purchase",
+        "purchased",
+        "purchases",
+        "owed",
+        "owing",
+        "due",
+    }
+
+    calculation_words = {
+        "how",
+        "much",
+        "total",
+        "totals",
+        "sum",
+        "add",
+        "combined",
+        "combine",
+        "calculate",
+        "calculation",
+        "altogether",
+        "overall",
+        "aggregate",
+    }
+
+    has_monetary_intent = bool(
+        words.intersection(monetary_words)
+    )
+
+    has_calculation_intent = bool(
+        words.intersection(calculation_words)
+    )
+
+    # Phrases such as "how much" are also financial calculation
+    # requests when accompanied by a monetary/spending term.
+    has_how_much = "how much" in clean
+
+    return (
+        has_monetary_intent
+        and (
+            has_calculation_intent
+            or has_how_much
+        )
+    )
+
+def parse_general_decimal(
+    raw_value: str
+) -> Decimal | None:
+    """
+    Parses a non-monetary decimal such as quantity, weight, hours,
+    count, volume, or measurement.
+    """
+
+    raw = str(raw_value or "").strip()
+
+    if not raw:
+        return None
+
+    raw = raw.replace("\u00a0", "")
+    raw = raw.replace(" ", "")
+
+    if "." in raw and "," in raw:
+        last_dot = raw.rfind(".")
+        last_comma = raw.rfind(",")
+
+        if last_comma > last_dot:
+            raw = raw.replace(".", "")
+            raw = raw.replace(",", ".")
+        else:
+            raw = raw.replace(",", "")
+
+    elif "," in raw:
+        parts = raw.split(",")
+
+        if len(parts) == 2 and len(parts[1]) <= 3:
+            raw = parts[0] + "." + parts[1]
+        elif all(len(part) == 3 for part in parts[1:]):
+            raw = "".join(parts)
+        else:
+            return None
+
+    elif raw.count(".") > 1:
+        parts = raw.split(".")
+
+        if all(len(part) == 3 for part in parts[1:]):
+            raw = "".join(parts)
+        else:
+            return None
+
+    try:
+        return Decimal(raw)
+    except InvalidOperation:
+        return None
+
+
+def resolve_subject_item_source(
+    item: dict,
+    subject: str,
+    matched_rows: list[dict]
+) -> tuple[int | None, dict | None]:
+    """
+    Maps one extracted line item back to its exact source.
+
+    Resolution order:
+    1. Validate the LLM-provided source number.
+    2. If invalid, compare evidence against every source.
+    3. Reject the item when no source can be verified.
+
+    This prevents one invoice's amount from being attached to another invoice.
+    """
+
+    subject_terms = [
+        term
+        for term in normalise_search_text(subject).split()
+        if len(term) >= 2
+    ]
+
+    description_text = normalise_search_text(
+        item.get("description") or ""
+    )
+
+    evidence_text = normalise_search_text(
+        item.get("evidence") or ""
+    )
+
+    evidence_words = [
+        word
+        for word in evidence_text.split()
+        if len(word) >= 2
+    ]
+
+    def source_text_for_row(row: dict) -> str:
+        return normalise_search_text(
+            str(
+                row.get("search_text")
+                or row.get("content")
+                or row.get("text")
+                or ""
+            )
+        )
+
+    def source_contains_subject(source_text: str) -> bool:
+        if not subject_terms:
+            return True
+
+        return all(
+            term in source_text
+            for term in subject_terms
+        )
+
+    def calculate_source_score(
+        source_text: str
+    ) -> int:
+        if not source_text:
+            return 0
+
+        if not source_contains_subject(source_text):
+            return 0
+
+        score = 30
+
+        if (
+            evidence_text
+            and evidence_text in source_text
+        ):
+            score += 200
+
+        if (
+            description_text
+            and description_text in source_text
+        ):
+            score += 80
+
+        if evidence_words:
+            matched_words = [
+                word
+                for word in evidence_words
+                if word in source_text
+            ]
+
+            overlap = (
+                len(matched_words)
+                / max(len(evidence_words), 1)
+            )
+
+            if overlap >= 0.90:
+                score += 140
+            elif overlap >= 0.75:
+                score += 100
+            elif overlap >= 0.60:
+                score += 60
+            elif overlap >= 0.40:
+                score += 25
+
+        unit_price = item.get("unit_price")
+        quantity = item.get("quantity")
+        amount = item.get("amount")
+
+        numeric_values = [
+            value
+            for value in [
+                unit_price,
+                quantity,
+                amount
+            ]
+            if value is not None
+        ]
+
+        for value in numeric_values:
+            value_text = normalise_search_text(
+                format_number_for_answer(value)
+            )
+
+            if value_text and value_text in source_text:
+                score += 15
+
+        return score
+
+    # ---------------------------------------------------------
+    # FIRST: TRUST THE RETURNED SOURCE NUMBER ONLY AFTER CHECKING
+    # ---------------------------------------------------------
+    try:
+        supplied_source_number = int(
+            item.get("source_number")
+        )
+    except Exception:
+        supplied_source_number = None
+
+    if (
+        supplied_source_number is not None
+        and 1 <= supplied_source_number <= len(matched_rows)
+    ):
+        supplied_row = matched_rows[
+            supplied_source_number - 1
+        ]
+
+        supplied_source_text = source_text_for_row(
+            supplied_row
+        )
+
+        supplied_score = calculate_source_score(
+            supplied_source_text
+        )
+
+        # The selected source must contain both the subject and
+        # useful row evidence.
+        if supplied_score >= 70:
+            return (
+                supplied_source_number,
+                supplied_row
+            )
+
+    # ---------------------------------------------------------
+    # FALLBACK: FIND THE STRONGEST UNIQUE SOURCE
+    # ---------------------------------------------------------
+    scored_sources = []
+
+    for source_number, row in enumerate(
+        matched_rows or [],
+        start=1
+    ):
+        source_text = source_text_for_row(row)
+
+        score = calculate_source_score(
+            source_text
+        )
+
+        if score >= 70:
+            scored_sources.append({
+                "source_number": source_number,
+                "row": row,
+                "score": score
+            })
+
+    if not scored_sources:
+        return None, None
+
+    scored_sources.sort(
+        key=lambda candidate: candidate["score"],
+        reverse=True
+    )
+
+    best = scored_sources[0]
+
+    # When two sources have exactly the same evidence, do not silently
+    # assign the row to the wrong invoice.
+    if len(scored_sources) > 1:
+        second_best = scored_sources[1]
+
+        if best["score"] == second_best["score"]:
+            print(
+                "SUBJECT SOURCE AMBIGUOUS:",
+                {
+                    "description": item.get("description"),
+                    "evidence": item.get("evidence"),
+                    "candidate_sources": [
+                        candidate["source_number"]
+                        for candidate in scored_sources
+                        if candidate["score"] == best["score"]
+                    ]
+                }
+            )
+
+            return None, None
+
+    return (
+        best["source_number"],
+        best["row"]
+    )
+
+def answer_financial_total_from_context(
+    query: str,
+    context: str,
+    matched_rows: list[dict]
+):
+    """
+    Routes financial questions between:
+
+    1. Dynamically requested entity calculations; and
+    2. Complete invoice/document totals.
+
+    Specific financial entities are determined only through
+    extract_spending_subjects(). No product, supplier, category,
+    question or subject is hard-coded here.
+    """
+
+    if not is_financial_total_query(
+        query
+    ):
+        return None
+
+    clean_context = clean_text_for_postgres(
+        str(context or "")
+    ).strip()
+
+    if (
+        not clean_context
+        or not matched_rows
+    ):
+        return {
+            "answer": FALLBACK_NO_DATA_ANSWER,
+            "sources": []
+        }
+
+    requested_subjects = (
+        extract_spending_subjects(
+            query
+        )
+    )
+
+    specific_subject_requested = bool(
+        requested_subjects
+    )
+
+    print(
+        "FINANCIAL ROUTING DEBUG:",
+        {
+            "query": query,
+            "requested_subjects": (
+                requested_subjects
+            ),
+            "route": (
+                "subject_spending"
+                if specific_subject_requested
+                else "whole_document_totals"
+            )
+        }
+    )
+
+    # =========================================================
+    # SPECIFIC ENTITY CALCULATION
+    # =========================================================
+
+    if specific_subject_requested:
+        return (
+            answer_subject_spending_from_context(
+                query=query,
+                context=clean_context,
+                matched_rows=matched_rows
+            )
+        )
+
+    # =========================================================
+    # COMPLETE INVOICE/DOCUMENT TOTALS
+    # =========================================================
+
+    invoice_assets = (
+        build_invoice_text_by_asset(
+            matched_rows
+        )
+    )
+
+    if not invoice_assets:
+        return {
+            "answer": FALLBACK_NO_DATA_ANSWER,
+            "sources": []
+        }
+
+    verified_totals = []
+
+    for (
+        asset_id,
+        asset_data
+    ) in invoice_assets.items():
+        file_name = (
+            asset_data.get(
+                "file_name"
+            )
+            or "Untitled invoice"
+        )
+
+        document_text = "\n\n".join(
+            asset_data.get(
+                "contents"
+            ) or []
+        ).strip()
+
+        if not document_text:
+            continue
+
+        candidates = (
+            extract_invoice_total_candidates(
+                document_text=document_text
+            )
+        )
+
+        (
+            selected_total,
+            rejection_reason
+        ) = choose_one_invoice_total(
+            candidates=candidates
+        )
+
+        if not selected_total:
+            print(
+                "INVOICE TOTAL REJECTED:",
+                {
+                    "asset_id": asset_id,
+                    "file_name": file_name,
+                    "reason": (
+                        rejection_reason
+                    )
+                }
+            )
+
+            continue
+
+        source_rows = (
+            asset_data.get("rows")
+            or []
+        )
+
+        if not source_rows:
+            continue
+
+        amount = selected_total.get(
+            "amount"
+        )
+
+        currency = normalise_currency(
+            selected_total.get(
+                "currency"
+            )
+        )
+
+        if not isinstance(
+            amount,
+            Decimal
+        ):
+            amount = parse_decimal_money(
+                str(amount or "")
+            )
+
+        if amount is None:
+            continue
+
+        if amount < Decimal("0"):
+            continue
+
+        amount = amount.quantize(
+            Decimal("0.01"),
+            rounding=ROUND_HALF_UP
+        )
+
+        verified_totals.append({
+            "asset_id": asset_id,
+            "file_name": file_name,
+            "amount": amount,
+            "currency": currency,
+            "evidence": (
+                selected_total.get(
+                    "evidence"
+                )
+                or ""
+            ),
+            "source_row": (
+                source_rows[0]
+            )
+        })
+
+    if not verified_totals:
+        return {
+            "answer": (
+                "I could not find a unique labelled final total "
+                "in the available financial documents."
+            ),
+            "sources": []
+        }
+
+    contributing_rows = []
+    seen_source_assets = set()
+
+    for item in verified_totals:
+        asset_id = item.get(
+            "asset_id"
+        )
+
+        source_row = item.get(
+            "source_row"
+        )
+
+        if not asset_id:
+            continue
+
+        if asset_id in seen_source_assets:
+            continue
+
+        if not isinstance(
+            source_row,
+            dict
+        ):
+            continue
+
+        seen_source_assets.add(
+            asset_id
+        )
+
+        contributing_rows.append(
+            source_row
+        )
+
+    sources = build_sources_from_asset_results(
+        contributing_rows
+    )
+
+    known_currencies = {
+        item["currency"]
+        for item in verified_totals
+        if item.get("currency")
+    }
+
+    unknown_currency_totals = [
+        item
+        for item in verified_totals
+        if not item.get("currency")
+    ]
+
+    # =========================================================
+    # DIFFERENT OR UNKNOWN CURRENCIES
+    # =========================================================
+
+    if (
+        len(known_currencies) > 1
+        or unknown_currency_totals
+    ):
+        answer_lines = [
+            (
+                "The verified document totals could not all be "
+                "combined into one overall amount because their "
+                "currencies are different or could not all be verified."
+            ),
+            ""
+        ]
+
+        for (
+            document_number,
+            item
+        ) in enumerate(
+            verified_totals,
+            start=1
+        ):
+            if item.get("currency"):
+                displayed_amount = (
+                    format_currency_amount(
+                        item["amount"],
+                        item["currency"]
+                    )
+                )
+
+            else:
+                displayed_amount = (
+                    format_number_for_answer(
+                        item["amount"]
+                    )
+                    + " (currency unverified)"
+                )
+
+            answer_lines.append(
+                f"Document {document_number}: "
+                f"{item['file_name']} — "
+                f"{displayed_amount}"
+            )
+
+        if known_currencies:
+            answer_lines.append("")
+
+            for currency in sorted(
+                known_currencies
+            ):
+                currency_items = [
+                    item
+                    for item
+                    in verified_totals
+                    if (
+                        item.get(
+                            "currency"
+                        )
+                        == currency
+                    )
+                ]
+
+                currency_total = sum(
+                    (
+                        item["amount"]
+                        for item
+                        in currency_items
+                    ),
+                    Decimal("0.00")
+                ).quantize(
+                    Decimal("0.01"),
+                    rounding=ROUND_HALF_UP
+                )
+
+                calculation = " + ".join(
+                    format_currency_amount(
+                        item["amount"],
+                        currency
+                    )
+                    for item
+                    in currency_items
+                )
+
+                answer_lines.append(
+                    f"{currency} combined total: "
+                    + format_currency_amount(
+                        currency_total,
+                        currency
+                    )
+                )
+
+                if len(
+                    currency_items
+                ) > 1:
+                    answer_lines.append(
+                        f"{currency} calculation: "
+                        + calculation
+                        + " = "
+                        + format_currency_amount(
+                            currency_total,
+                            currency
+                        )
+                    )
+
+        return {
+            "answer": "\n".join(
+                answer_lines
+            ).strip(),
+            "sources": sources
+        }
+
+    # =========================================================
+    # ONE VERIFIED CURRENCY
+    # =========================================================
+
+    currency = next(
+        iter(
+            known_currencies
+        )
+    )
+
+    combined_total = sum(
+        (
+            item["amount"]
+            for item
+            in verified_totals
+        ),
+        Decimal("0.00")
+    ).quantize(
+        Decimal("0.01"),
+        rounding=ROUND_HALF_UP
+    )
+
+    answer_lines = [
+        (
+            "The verified combined document total is "
+            + format_currency_amount(
+                combined_total,
+                currency
+            )
+            + "."
+        ),
+        ""
+    ]
+
+    calculation_parts = []
+
+    for (
+        document_number,
+        item
+    ) in enumerate(
+        verified_totals,
+        start=1
+    ):
+        displayed_amount = (
+            format_currency_amount(
+                item["amount"],
+                currency
+            )
+        )
+
+        answer_lines.append(
+            f"Document {document_number}: "
+            f"{item['file_name']} — "
+            f"{displayed_amount}"
+        )
+
+        calculation_parts.append(
+            displayed_amount
+        )
+
+    if len(
+        verified_totals
+    ) > 1:
+        answer_lines.extend([
+            "",
+            (
+                "Combined calculation: "
+                + " + ".join(
+                    calculation_parts
+                )
+                + " = "
+                + format_currency_amount(
+                    combined_total,
+                    currency
+                )
+            )
+        ])
+
+    return {
+        "answer": "\n".join(
+            answer_lines
+        ).strip(),
+        "sources": sources
+    }
+    
+
+def extract_spending_subjects(query: str) -> list[str]:
+    """
+    Dynamically extracts the actual entities whose financial values
+    the user wants calculated.
+
+    This function does not contain:
+    - fixed product names;
+    - fixed supplier names;
+    - fixed expense categories;
+    - regex question formats;
+    - hard-coded user questions;
+    - lists of expected financial subjects.
+
+    The LLM determines the requested entity or entities from the
+    meaning of the complete user request.
+    """
+
+    clean_query = clean_text_for_postgres(
+        str(query or "")
+    ).strip()
+
+    if not clean_query:
+        return []
+
+    try:
+        extraction_response = ask_llm(
+            query=clean_query,
+            context="""
+You are a structured intent parser for financial document questions.
+
+Determine whether the user is requesting:
+
+1. Monetary values for one or more specific entities; or
+2. Final totals for complete invoices/documents without requesting
+   a specific entity.
+
+A requested entity is the actual thing whose financial value the
+user wants to know.
+
+It may be any product, service, supplier, person, project,
+department, vessel component, expense category, location, activity,
+purpose, asset, or other user-defined concept.
+
+Return ONLY valid JSON in this exact structure:
+
+{
+  "request_type": "entity_values",
+  "subjects": [
+    {
+      "value": "the complete requested entity exactly as understood",
+      "evidence": "the exact part of the user request identifying this entity"
+    }
+  ]
+}
+
+Or, when the user requests complete document totals without naming
+a particular entity:
+
+{
+  "request_type": "whole_document_totals",
+  "subjects": []
+}
+
+Rules:
+- Understand the full meaning of the request.
+- Return only actual entities whose monetary value was requested.
+- Do not return verbs expressing payment, cost, spending or calculation.
+- Do not return prepositions, articles, pronouns, auxiliary verbs,
+  question words or grammatical connectors.
+- Do not return words whose only purpose is requesting a calculation.
+- Preserve one meaningful multi-word entity as one subject.
+- Keep genuinely separate entities as separate subjects.
+- Do not split one entity into individual words.
+- Do not broaden or invent an entity.
+- Do not answer the financial question.
+- Do not calculate anything.
+- Return JSON only.
+""".strip()
+        )
+
+        parsed = parse_llm_json_response(
+            extraction_response
+        )
+
+        if not isinstance(parsed, dict):
+            print(
+                "FINANCIAL SUBJECT PARSER INVALID JSON:",
+                {
+                    "query": clean_query,
+                    "response": str(
+                        extraction_response or ""
+                    )[:1000]
+                }
+            )
+            return []
+
+        request_type = str(
+            parsed.get("request_type") or ""
+        ).strip().lower()
+
+        if request_type == "whole_document_totals":
+            return []
+
+        raw_subjects = parsed.get("subjects") or []
+
+        if not isinstance(raw_subjects, list):
+            return []
+
+        candidates = []
+        seen_candidates = set()
+
+        for raw_subject in raw_subjects:
+            if isinstance(raw_subject, dict):
+                value = raw_subject.get("value")
+
+                if value is None:
+                    value = raw_subject.get(
+                        "subject"
+                    )
+
+                if value is None:
+                    value = raw_subject.get(
+                        "normalised_value"
+                    )
+
+            elif isinstance(raw_subject, str):
+                value = raw_subject
+
+            else:
+                continue
+
+            subject = clean_text_for_postgres(
+                str(value or "")
+            ).strip(
+                " \t\r\n.,;:!?\"'()[]{}"
+            )
+
+            subject_key = normalise_search_text(
+                subject
+            )
+
+            if not subject or not subject_key:
+                continue
+
+            if subject_key in seen_candidates:
+                continue
+
+            seen_candidates.add(
+                subject_key
+            )
+
+            candidates.append(subject)
+
+        if not candidates:
+            return []
+
+        # A second independent semantic pass prevents request/action words
+        # from accidentally becoming subjects. This remains fully dynamic:
+        # there is no fixed list of product names or question patterns.
+        validation_response = ask_llm(
+            query=clean_query,
+            context=f"""
+You are validating entities extracted from a financial request.
+
+Original user request:
+{clean_query}
+
+Extracted candidates:
+{json.dumps(candidates, ensure_ascii=False)}
+
+Return ONLY valid JSON in this exact structure:
+
+{{
+  "subjects": [
+    "validated requested entity"
+  ]
+}}
+
+Rules:
+- Keep only actual entities whose financial value the user requested.
+- Remove anything that only expresses asking, paying, spending,
+  costing, calculating, summing, combining or searching.
+- Remove grammatical fragments and connector words.
+- Preserve meaningful multi-word entity names.
+- Keep separate requested entities separate.
+- Do not invent, broaden or rewrite an entity into a different concept.
+- Do not calculate anything.
+- Do not answer the user.
+- Return JSON only.
+""".strip()
+        )
+
+        validated_data = parse_llm_json_response(
+            validation_response
+        )
+
+        if not isinstance(validated_data, dict):
+            print(
+                "FINANCIAL SUBJECT VALIDATION INVALID JSON:",
+                {
+                    "query": clean_query,
+                    "candidates": candidates,
+                    "response": str(
+                        validation_response or ""
+                    )[:1000]
+                }
+            )
+
+            return candidates
+
+        validated_values = (
+            validated_data.get("subjects")
+            or []
+        )
+
+        if not isinstance(
+            validated_values,
+            list
+        ):
+            return candidates
+
+        subjects = []
+        seen_subjects = set()
+
+        for value in validated_values:
+            if isinstance(value, dict):
+                value = (
+                    value.get("value")
+                    or value.get("subject")
+                    or ""
+                )
+
+            if not isinstance(value, str):
+                continue
+
+            subject = clean_text_for_postgres(
+                value
+            ).strip(
+                " \t\r\n.,;:!?\"'()[]{}"
+            )
+
+            subject_key = normalise_search_text(
+                subject
+            )
+
+            if not subject or not subject_key:
+                continue
+
+            if subject_key in seen_subjects:
+                continue
+
+            seen_subjects.add(
+                subject_key
+            )
+
+            subjects.append(subject)
+
+        print(
+            "VALIDATED FINANCIAL SUBJECTS:",
+            {
+                "query": clean_query,
+                "initial_candidates": candidates,
+                "validated_subjects": subjects
+            }
+        )
+
+        return subjects
+
+    except Exception as error:
+        print(
+            "FINANCIAL SUBJECT EXTRACTION ERROR:",
+            type(error).__name__,
+            str(error)
+        )
+
+        return []
+
+def answer_subject_spending_from_context(
+    query: str,
+    context: str,
+    matched_rows: list[dict]
+):
+    """
+    Calculates one or more requested financial subjects across every
+    supplied financial document.
+
+    Behaviour:
+    - Every supplied financial document is checked independently.
+    - No exact subject-text pre-filter is used.
+    - Every verified matching row is retained.
+    - Identical rows in separate invoices remain separate.
+    - Duplicate OCR/text copies inside one invoice are removed.
+    - Each invoice and its matching rows are displayed.
+    - Each invoice receives a subtotal.
+    - Same verified currencies are combined.
+    - When every matching amount has no detectable currency, the
+      numerical amounts are combined and clearly marked as
+      currency-unverified.
+    - Mixed known and unknown currencies remain separate.
+    """
+
+    clean_query = clean_text_for_postgres(
+        str(query or "")
+    ).strip()
+
+    if not clean_query:
+        return None
+
+    if not matched_rows:
+        return {
+            "answer": FALLBACK_NO_DATA_ANSWER,
+            "sources": []
+        }
+
+    subjects = extract_spending_subjects(
+        clean_query
+    )
+
+    if not subjects:
+        return {
+            "answer": (
+                "I could not identify the financial subject "
+                "requested in the question."
+            ),
+            "sources": []
+        }
+
+    unique_subjects = []
+    seen_subject_keys = set()
+
+    for subject in subjects:
+        clean_subject = clean_text_for_postgres(
+            str(subject or "")
+        ).strip()
+
+        subject_key = normalise_search_text(
+            clean_subject
+        )
+
+        if not clean_subject or not subject_key:
+            continue
+
+        if subject_key in seen_subject_keys:
+            continue
+
+        seen_subject_keys.add(subject_key)
+        unique_subjects.append(clean_subject)
+
+    subjects = unique_subjects
+
+    if not subjects:
+        return {
+            "answer": (
+                "I could not identify the financial subject "
+                "requested in the question."
+            ),
+            "sources": []
+        }
+
+    print(
+        "FINANCIAL SUBJECTS TO CALCULATE:",
+        {
+            "query": clean_query,
+            "subjects": subjects
+        }
+    )
+
+    # =========================================================
+    # GROUP EVERY ROW BY ITS DOCUMENT
+    # =========================================================
+
+    documents_by_asset = {}
+
+    for row in matched_rows or []:
+        if not isinstance(row, dict):
+            continue
+
+        asset_id = str(
+            row.get("asset_id") or ""
+        ).strip()
+
+        if not asset_id:
+            continue
+
+        row_text = clean_text_for_postgres(
+            str(
+                row.get("search_text")
+                or row.get("content")
+                or row.get("text")
+                or ""
+            )
+        ).strip()
+
+        if not row_text:
+            continue
+
+        file_name = clean_text_for_postgres(
+            str(
+                row.get("original_file_name")
+                or row.get("file_name")
+                or row.get("title")
+                or "Untitled document"
+            )
+        ).strip()
+
+        if asset_id not in documents_by_asset:
+            documents_by_asset[asset_id] = {
+                "asset_id": asset_id,
+                "file_name": file_name,
+                "source_row": row,
+                "text_parts": [],
+                "seen_text_parts": set()
+            }
+
+        normalised_part = normalise_for_source_check(
+            row_text
+        )
+
+        if not normalised_part:
+            continue
+
+        if (
+            normalised_part
+            in documents_by_asset[
+                asset_id
+            ]["seen_text_parts"]
+        ):
+            continue
+
+        documents_by_asset[
+            asset_id
+        ]["seen_text_parts"].add(
+            normalised_part
+        )
+
+        documents_by_asset[
+            asset_id
+        ]["text_parts"].append(
+            row_text
+        )
+
+    if not documents_by_asset:
+        return {
+            "answer": FALLBACK_NO_DATA_ANSWER,
+            "sources": []
+        }
+
+    subject_results = {
+        subject: []
+        for subject in subjects
+    }
+
+    # =========================================================
+    # CHECK EVERY SUBJECT AGAINST EVERY FINANCIAL DOCUMENT
+    # =========================================================
+
+    for subject in subjects:
+        for asset_id, document in documents_by_asset.items():
+            file_name = document["file_name"]
+
+            document_text = "\n\n".join(
+                document.get("text_parts") or []
+            ).strip()
+
+            if not document_text:
+                continue
+
+            source_row = {
+                **document["source_row"],
+                "asset_id": asset_id,
+                "file_name": (
+                    document["source_row"].get("file_name")
+                    or file_name
+                ),
+                "original_file_name": file_name,
+                "content": document_text,
+                "search_text": document_text,
+                "content_type": "financial_document"
+            }
+
+            try:
+                extracted_items = (
+                    extract_subject_line_items_with_llm(
+                        query=clean_query,
+                        subject=subject,
+                        context=document_text,
+                        asset_id=asset_id
+                    )
+                    or []
+                )
+
+            except Exception as error:
+                print(
+                    "FINANCIAL DOCUMENT EXTRACTION ERROR:",
+                    {
+                        "asset_id": asset_id,
+                        "file_name": file_name,
+                        "subject": subject,
+                        "error_type": type(error).__name__,
+                        "error": str(error)
+                    }
+                )
+
+                extracted_items = []
+
+            document_currency = (
+                determine_currency_from_document(
+                    document_text
+                )
+            )
+
+            for item in extracted_items:
+                if not isinstance(item, dict):
+                    continue
+
+                description = clean_text_for_postgres(
+                    str(
+                        item.get("description")
+                        or ""
+                    )
+                ).strip()
+
+                evidence = clean_text_for_postgres(
+                    str(
+                        item.get("evidence")
+                        or ""
+                    )
+                ).strip()
+
+                if not description:
+                    continue
+
+                evidence_supported = (
+                    evidence_is_supported_exactly(
+                        evidence=evidence,
+                        document_text=document_text
+                    )
+                    if evidence
+                    else False
+                )
+
+                description_supported = (
+                    normalise_search_text(
+                        description
+                    )
+                    in normalise_search_text(
+                        document_text
+                    )
+                )
+
+                if (
+                    not evidence_supported
+                    and not description_supported
+                ):
+                    continue
+
+                unit_price = item.get("unit_price")
+                quantity = item.get("quantity")
+
+                explicit_line_total = item.get(
+                    "explicit_line_total"
+                )
+
+                if explicit_line_total is None:
+                    explicit_line_total = item.get(
+                        "line_total"
+                    )
+
+                if explicit_line_total is None:
+                    explicit_line_total = item.get(
+                        "amount"
+                    )
+
+                if (
+                    unit_price is not None
+                    and not isinstance(
+                        unit_price,
+                        Decimal
+                    )
+                ):
+                    unit_price = parse_decimal_money(
+                        str(unit_price)
+                    )
+
+                if (
+                    quantity is not None
+                    and not isinstance(
+                        quantity,
+                        Decimal
+                    )
+                ):
+                    quantity = parse_general_decimal(
+                        str(quantity)
+                    )
+
+                if (
+                    explicit_line_total is not None
+                    and not isinstance(
+                        explicit_line_total,
+                        Decimal
+                    )
+                ):
+                    explicit_line_total = parse_decimal_money(
+                        str(explicit_line_total)
+                    )
+
+                calculated_total = None
+
+                if (
+                    isinstance(unit_price, Decimal)
+                    and isinstance(quantity, Decimal)
+                ):
+                    calculated_total = (
+                        unit_price * quantity
+                    ).quantize(
+                        Decimal("0.01"),
+                        rounding=ROUND_HALF_UP
+                    )
+
+                if isinstance(
+                    explicit_line_total,
+                    Decimal
+                ):
+                    final_amount = (
+                        explicit_line_total.quantize(
+                            Decimal("0.01"),
+                            rounding=ROUND_HALF_UP
+                        )
+                    )
+
+                    amount_method = "explicit_line_total"
+
+                elif calculated_total is not None:
+                    final_amount = calculated_total
+                    amount_method = (
+                        "quantity_times_unit_price"
+                    )
+
+                else:
+                    continue
+
+                if final_amount < Decimal("0"):
+                    continue
+
+                currency = normalise_currency(
+                    item.get("currency")
+                )
+
+                if not currency:
+                    currency = document_currency or ""
+
+                subject_results[subject].append({
+                    "subject": subject,
+                    "asset_id": asset_id,
+                    "file_name": file_name,
+                    "source_row": source_row,
+                    "description": description,
+                    "evidence": evidence,
+                    "unit_price": unit_price,
+                    "quantity": quantity,
+                    "explicit_line_total": (
+                        explicit_line_total
+                    ),
+                    "calculated_total": calculated_total,
+                    "amount": final_amount,
+                    "currency": currency,
+                    "amount_method": amount_method
+                })
+
+    # =========================================================
+    # REMOVE DUPLICATES ONLY INSIDE THE SAME DOCUMENT
+    # =========================================================
+
+    for subject in subjects:
+        unique_items = []
+        seen_item_keys = set()
+
+        for item in subject_results.get(
+            subject,
+            []
+        ):
+            duplicate_key = (
+                str(item.get("asset_id") or ""),
+                normalise_search_text(
+                    item.get("description") or ""
+                ),
+                item.get("unit_price"),
+                item.get("quantity"),
+                item.get("amount"),
+                normalise_currency(
+                    item.get("currency")
+                )
+            )
+
+            if duplicate_key in seen_item_keys:
+                continue
+
+            seen_item_keys.add(duplicate_key)
+            unique_items.append(item)
+
+        subject_results[subject] = unique_items
+
+    found_subjects = [
+        subject
+        for subject in subjects
+        if subject_results.get(subject)
+    ]
+
+    missing_subjects = [
+        subject
+        for subject in subjects
+        if not subject_results.get(subject)
+    ]
+
+    if not found_subjects:
+        return {
+            "answer": (
+                "I found no verifiable matching financial rows for "
+                + ", ".join(subjects)
+                + "."
+            ),
+            "sources": []
+        }
+
+    answer_lines = []
+    subject_totals = []
+
+    def display_amount(
+        amount: Decimal,
+        currency: str
+    ) -> str:
+        if currency:
+            return format_currency_amount(
+                amount,
+                currency
+            )
+
+        return format_number_for_answer(
+            amount
+        )
+
+    def format_one_subject(
+        subject: str,
+        items: list[dict]
+    ):
+        lines = []
+        documents = {}
+
+        for item in items:
+            document_key = (
+                str(item.get("asset_id") or "")
+                or str(item.get("file_name") or "")
+            )
+
+            if document_key not in documents:
+                documents[document_key] = {
+                    "asset_id": item.get("asset_id"),
+                    "file_name": (
+                        item.get("file_name")
+                        or "Untitled document"
+                    ),
+                    "items": []
+                }
+
+            documents[document_key]["items"].append(
+                item
+            )
+
+        total_rows = sum(
+            len(document["items"])
+            for document in documents.values()
+        )
+
+        lines.append(
+            f"{subject}: found {total_rows} verified "
+            f"{'matching row' if total_rows == 1 else 'matching rows'} "
+            f"across {len(documents)} "
+            f"{'document' if len(documents) == 1 else 'documents'}."
+        )
+
+        document_subtotals = []
+
+        for document_number, document in enumerate(
+            documents.values(),
+            start=1
+        ):
+            document_items = document["items"]
+
+            lines.extend([
+                "",
+                (
+                    f"Document {document_number}: "
+                    f"{document['file_name']}"
+                )
+            ])
+
+            for row_number, item in enumerate(
+                document_items,
+                start=1
+            ):
+                amount = item["amount"]
+                currency = normalise_currency(
+                    item.get("currency")
+                )
+
+                unit_price = item.get("unit_price")
+                quantity = item.get("quantity")
+
+                displayed_amount = display_amount(
+                    amount,
+                    currency
+                )
+
+                if (
+                    item.get("amount_method")
+                    == "quantity_times_unit_price"
+                    and unit_price is not None
+                    and quantity is not None
+                ):
+                    calculation = (
+                        f"{display_amount(unit_price, currency)}"
+                        f" × "
+                        f"{format_number_for_answer(quantity)}"
+                        f" = "
+                        f"{displayed_amount}"
+                    )
+
+                elif (
+                    item.get("amount_method")
+                    == "explicit_line_total"
+                ):
+                    if (
+                        unit_price is not None
+                        and quantity is not None
+                    ):
+                        calculation = (
+                            f"written line total "
+                            f"{displayed_amount} "
+                            f"(quantity "
+                            f"{format_number_for_answer(quantity)}, "
+                            f"unit price "
+                            f"{display_amount(unit_price, currency)})"
+                        )
+
+                    else:
+                        calculation = (
+                            f"written line total "
+                            f"{displayed_amount}"
+                        )
+
+                else:
+                    calculation = displayed_amount
+
+                lines.append(
+                    f"- Row {row_number} — "
+                    f"{item['description']}: "
+                    f"{calculation}"
+                )
+
+            currencies_in_document = {
+                normalise_currency(
+                    item.get("currency")
+                )
+                for item in document_items
+                if normalise_currency(
+                    item.get("currency")
+                )
+            }
+
+            unknown_currency_items = [
+                item
+                for item in document_items
+                if not normalise_currency(
+                    item.get("currency")
+                )
+            ]
+
+            # One known currency and no unknown rows.
+            if (
+                len(currencies_in_document) == 1
+                and not unknown_currency_items
+            ):
+                document_currency = next(
+                    iter(currencies_in_document)
+                )
+
+                document_total = sum(
+                    (
+                        item["amount"]
+                        for item in document_items
+                    ),
+                    Decimal("0.00")
+                ).quantize(
+                    Decimal("0.01"),
+                    rounding=ROUND_HALF_UP
+                )
+
+                lines.append(
+                    "Document subtotal: "
+                    + format_currency_amount(
+                        document_total,
+                        document_currency
+                    )
+                )
+
+                document_subtotals.append({
+                    "amount": document_total,
+                    "currency": document_currency,
+                    "currency_verified": True,
+                    "file_name": document["file_name"]
+                })
+
+            # Every matching row has unknown currency.
+            elif (
+                not currencies_in_document
+                and unknown_currency_items
+            ):
+                document_total = sum(
+                    (
+                        item["amount"]
+                        for item in unknown_currency_items
+                    ),
+                    Decimal("0.00")
+                ).quantize(
+                    Decimal("0.01"),
+                    rounding=ROUND_HALF_UP
+                )
+
+                lines.append(
+                    "Document subtotal "
+                    "(currency not stated or not detected): "
+                    + format_number_for_answer(
+                        document_total
+                    )
+                )
+
+                if len(unknown_currency_items) > 1:
+                    lines.append(
+                        "Document calculation: "
+                        + " + ".join(
+                            format_number_for_answer(
+                                item["amount"]
+                            )
+                            for item in unknown_currency_items
+                        )
+                        + " = "
+                        + format_number_for_answer(
+                            document_total
+                        )
+                    )
+
+                document_subtotals.append({
+                    "amount": document_total,
+                    "currency": "",
+                    "currency_verified": False,
+                    "file_name": document["file_name"]
+                })
+
+            else:
+                lines.append(
+                    "This document contains mixed or partially "
+                    "unverified currencies, so it was not reduced "
+                    "to one document subtotal."
+                )
+
+                for currency in sorted(
+                    currencies_in_document
+                ):
+                    currency_total = sum(
+                        (
+                            item["amount"]
+                            for item in document_items
+                            if normalise_currency(
+                                item.get("currency")
+                            ) == currency
+                        ),
+                        Decimal("0.00")
+                    ).quantize(
+                        Decimal("0.01"),
+                        rounding=ROUND_HALF_UP
+                    )
+
+                    lines.append(
+                        f"- {currency} subtotal: "
+                        + format_currency_amount(
+                            currency_total,
+                            currency
+                        )
+                    )
+
+                if unknown_currency_items:
+                    unknown_total = sum(
+                        (
+                            item["amount"]
+                            for item
+                            in unknown_currency_items
+                        ),
+                        Decimal("0.00")
+                    ).quantize(
+                        Decimal("0.01"),
+                        rounding=ROUND_HALF_UP
+                    )
+
+                    lines.append(
+                        "- Currency-unverified subtotal: "
+                        + format_number_for_answer(
+                            unknown_total
+                        )
+                    )
+
+        verified_document_currencies = {
+            subtotal["currency"]
+            for subtotal in document_subtotals
+            if subtotal["currency_verified"]
+        }
+
+        unverified_document_subtotals = [
+            subtotal
+            for subtotal in document_subtotals
+            if not subtotal["currency_verified"]
+        ]
+
+        verified_document_subtotals = [
+            subtotal
+            for subtotal in document_subtotals
+            if subtotal["currency_verified"]
+        ]
+
+        # All documents use one verified currency.
+        if (
+            document_subtotals
+            and not unverified_document_subtotals
+            and len(verified_document_currencies) == 1
+        ):
+            combined_currency = next(
+                iter(verified_document_currencies)
+            )
+
+            combined_total = sum(
+                (
+                    subtotal["amount"]
+                    for subtotal in document_subtotals
+                ),
+                Decimal("0.00")
+            ).quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP
+            )
+
+            lines.extend([
+                "",
+                (
+                    f"Combined total for {subject}: "
+                    + format_currency_amount(
+                        combined_total,
+                        combined_currency
+                    )
+                )
+            ])
+
+            if len(document_subtotals) > 1:
+                lines.append(
+                    "Combined document calculation: "
+                    + " + ".join(
+                        format_currency_amount(
+                            subtotal["amount"],
+                            combined_currency
+                        )
+                        for subtotal in document_subtotals
+                    )
+                    + " = "
+                    + format_currency_amount(
+                        combined_total,
+                        combined_currency
+                    )
+                )
+
+            return (
+                lines,
+                combined_total,
+                combined_currency,
+                True
+            )
+
+        # Every document has an unknown currency.
+        if (
+            document_subtotals
+            and not verified_document_subtotals
+            and unverified_document_subtotals
+        ):
+            combined_total = sum(
+                (
+                    subtotal["amount"]
+                    for subtotal
+                    in unverified_document_subtotals
+                ),
+                Decimal("0.00")
+            ).quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP
+            )
+
+            lines.extend([
+                "",
+                (
+                    f"Combined amount for {subject} "
+                    f"(currency not stated or not detected): "
+                    + format_number_for_answer(
+                        combined_total
+                    )
+                )
+            ])
+
+            if len(
+                unverified_document_subtotals
+            ) > 1:
+                lines.append(
+                    "Combined document calculation: "
+                    + " + ".join(
+                        format_number_for_answer(
+                            subtotal["amount"]
+                        )
+                        for subtotal
+                        in unverified_document_subtotals
+                    )
+                    + " = "
+                    + format_number_for_answer(
+                        combined_total
+                    )
+                )
+
+            return (
+                lines,
+                combined_total,
+                "",
+                False
+            )
+
+        # Mixed currencies or known and unknown currencies.
+        lines.extend([
+            "",
+            (
+                "The matching document subtotals could not all "
+                "be combined into one currency total."
+            )
+        ])
+
+        for currency in sorted(
+            verified_document_currencies
+        ):
+            currency_subtotals = [
+                subtotal
+                for subtotal in verified_document_subtotals
+                if subtotal["currency"] == currency
+            ]
+
+            currency_total = sum(
+                (
+                    subtotal["amount"]
+                    for subtotal in currency_subtotals
+                ),
+                Decimal("0.00")
+            ).quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP
+            )
+
+            lines.append(
+                f"{currency} combined total: "
+                + format_currency_amount(
+                    currency_total,
+                    currency
+                )
+            )
+
+            if len(currency_subtotals) > 1:
+                lines.append(
+                    f"{currency} calculation: "
+                    + " + ".join(
+                        format_currency_amount(
+                            subtotal["amount"],
+                            currency
+                        )
+                        for subtotal in currency_subtotals
+                    )
+                    + " = "
+                    + format_currency_amount(
+                        currency_total,
+                        currency
+                    )
+                )
+
+        if unverified_document_subtotals:
+            unverified_total = sum(
+                (
+                    subtotal["amount"]
+                    for subtotal
+                    in unverified_document_subtotals
+                ),
+                Decimal("0.00")
+            ).quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP
+            )
+
+            lines.append(
+                "Currency-unverified combined amount: "
+                + format_number_for_answer(
+                    unverified_total
+                )
+            )
+
+        return lines, None, None, False
+
+    for subject_index, subject in enumerate(
+        found_subjects
+    ):
+        (
+            subject_lines,
+            subject_total,
+            subject_currency,
+            currency_verified
+        ) = format_one_subject(
+            subject=subject,
+            items=subject_results[subject]
+        )
+
+        if subject_index > 0:
+            answer_lines.append("")
+
+        answer_lines.extend(subject_lines)
+
+        if subject_total is not None:
+            subject_totals.append({
+                "subject": subject,
+                "amount": subject_total,
+                "currency": subject_currency,
+                "currency_verified": currency_verified
+            })
+
+    # Combine separate requested subjects only when compatible.
+    if len(found_subjects) > 1:
+        all_verified = (
+            len(subject_totals) == len(found_subjects)
+            and all(
+                item["currency_verified"]
+                for item in subject_totals
+            )
+        )
+
+        verified_currencies = {
+            item["currency"]
+            for item in subject_totals
+            if item["currency_verified"]
+        }
+
+        if all_verified and len(verified_currencies) == 1:
+            currency = next(
+                iter(verified_currencies)
+            )
+
+            combined_subject_total = sum(
+                (
+                    item["amount"]
+                    for item in subject_totals
+                ),
+                Decimal("0.00")
+            ).quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP
+            )
+
+            answer_lines.extend([
+                "",
+                (
+                    "Combined total for "
+                    + ", ".join(found_subjects)
+                    + ": "
+                    + format_currency_amount(
+                        combined_subject_total,
+                        currency
+                    )
+                ),
+                (
+                    "Combined subject calculation: "
+                    + " + ".join(
+                        format_currency_amount(
+                            item["amount"],
+                            currency
+                        )
+                        for item in subject_totals
+                    )
+                    + " = "
+                    + format_currency_amount(
+                        combined_subject_total,
+                        currency
+                    )
+                )
+            ])
+
+    if missing_subjects:
+        answer_lines.extend([
+            "",
+            (
+                "No verifiable matching financial row "
+                "was found for: "
+                + ", ".join(missing_subjects)
+                + "."
+            )
+        ])
+
+    contributing_rows = []
+    seen_contributing_assets = set()
+
+    for subject in found_subjects:
+        for item in subject_results.get(
+            subject,
+            []
+        ):
+            asset_id = str(
+                item.get("asset_id") or ""
+            ).strip()
+
+            source_row = item.get("source_row")
+
+            if not asset_id:
+                continue
+
+            if asset_id in seen_contributing_assets:
+                continue
+
+            if not isinstance(source_row, dict):
+                continue
+
+            seen_contributing_assets.add(asset_id)
+            contributing_rows.append(source_row)
+
+    sources = build_sources_from_asset_results(
+        contributing_rows
+    )
+
+    print(
+        "FINAL VERIFIED MULTI-DOCUMENT FINANCIAL RESULTS:",
+        {
+            subject: [
+                {
+                    "asset_id": item.get("asset_id"),
+                    "file_name": item.get("file_name"),
+                    "description": item.get("description"),
+                    "amount": str(item.get("amount")),
+                    "currency": item.get("currency")
+                }
+                for item in subject_results.get(
+                    subject,
+                    []
+                )
+            ]
+            for subject in subjects
+        }
+    )
+
+    return {
+        "answer": "\n".join(
+            answer_lines
+        ).strip(),
+        "sources": sources
+    }
+
 def chat(
     query: str,
     crew_id: str,
@@ -3615,18 +13597,37 @@ def chat(
     uploaded_asset_id: str | None = None
 ):
     """
-    Secure document-grounded chat.
+    Secure BridgeOS document chat.
 
-    Behavior:
-    - Searches accessible uploaded yacht assets.
-    - Supports multi-part questions.
-    - Uses semantic retrieval plus generic keyword/file-name fallback.
-    - Uses current chat memory for recently uploaded chat files.
-    - Answers ONLY from uploaded document context.
-    - If no supported answer exists, returns FALLBACK_NO_DATA_ANSWER.
-    - Sources are returned and saved with the assistant message.
-    - No hallucinations.
+    Financial behaviour:
+    - Searches every accessible processed financial document.
+    - Does not exclude a financial document merely because the requested
+      subject is written differently, pluralised, abbreviated or affected
+      by OCR.
+    - Sends every qualifying financial document to the semantic line-item
+      extractor.
+    - Keeps each contributing invoice separate.
+    - Combines matching values when their currencies are compatible.
+    - Never exposes unrelated documents as final sources.
+    - Does not hard-code products, suppliers, filenames, questions or amounts.
     """
+
+    clean_query = clean_text_for_postgres(
+        str(query or "")
+    ).strip()
+
+    try:
+        security_level = int(security_level)
+    except Exception:
+        security_level = 4
+
+    if not clean_query:
+        return {
+            "answer": "Please enter a question.",
+            "sources": [],
+            "uploaded_asset_id": uploaded_asset_id,
+            "mode": "document_qa"
+        }
 
     chat_row = verify_chat_access(
         chat_id=chat_id,
@@ -3634,369 +13635,1838 @@ def chat(
         yacht_id=yacht_id
     )
 
-    supabase.table("messages").insert({
-        "chat_id": chat_id,
-        "yacht_id": yacht_id,
-        "crew_id": crew_id,
-        "role": "user",
-        "content": query,
-        "sources": []
-    }).execute()
+    # =========================================================
+    # LOCAL RESPONSE HELPERS
+    # =========================================================
 
-    if chat_row.get("title") == "New Chat":
-        supabase.table("chats").update({
-            "title": query[:60],
-            "updated_at": "now()"
-        }).eq("id", chat_id).eq("crew_id", crew_id).eq("yacht_id", yacht_id).execute()
+    def unique_source_cards(
+        raw_sources: list[dict] | None
+    ) -> list[dict]:
+        output = []
+        seen_asset_ids = set()
 
-    answer = ""
-    sources = []
-    matched_rows = []
-    context = ""
-    retrieval_query_input = query
+        for source in raw_sources or []:
+            if not isinstance(source, dict):
+                continue
 
-    # Generic chat memory:
-    # If frontend does not send uploaded_asset_id, recover the latest file
-    # attached to this exact chat_id.
-    resolved_uploaded_asset_id = uploaded_asset_id or get_latest_chat_asset_id(
-        chat_id=chat_id,
-        crew_id=crew_id,
-        yacht_id=yacht_id,
-        security_level=security_level
-    )
+            asset_id = source.get("asset_id")
 
-    try:
-        if resolved_uploaded_asset_id:
-            print(
-                "LOCAL CHAT DEBUG: using chat-memory asset:",
-                resolved_uploaded_asset_id
+            if not asset_id:
+                continue
+
+            if asset_id in seen_asset_ids:
+                continue
+
+            seen_asset_ids.add(asset_id)
+
+            file_name = (
+                source.get("title")
+                or source.get("original_file_name")
+                or source.get("file_name")
+                or "Untitled document"
             )
 
-            matched_rows = get_uploaded_chat_asset_rows(
-                uploaded_asset_id=resolved_uploaded_asset_id,
-                crew_id=crew_id,
-                yacht_id=yacht_id,
-                security_level=security_level,
-                chat_id=chat_id
-            )
+            output.append({
+                "asset_id": asset_id,
+                "title": file_name,
+                "file_name": file_name
+            })
 
-            if matched_rows:
-                context = build_context_from_asset_results(matched_rows)
+        return output
 
-        else:
-            accessible_asset_ids = get_accessible_asset_ids(
-                crew_id=crew_id,
-                yacht_id=yacht_id,
-                security_level=security_level
-            )
+    def save_assistant_response(
+        final_answer: str,
+        final_sources: list[dict]
+    ):
+        safe_answer = clean_text_for_postgres(
+            str(final_answer or "")
+        ).strip()
 
-            if accessible_asset_ids:
-                assets_res = supabase.table("assets") \
-                    .select("id") \
-                    .eq("yacht_id", yacht_id) \
-                    .in_("id", accessible_asset_ids) \
-                    .eq("processing_status", "processed") \
-                    .execute()
+        safe_sources = (
+            final_sources
+            if isinstance(final_sources, list)
+            else []
+        )
 
-                allowed_asset_ids = [
-                    asset["id"]
-                    for asset in (assets_res.data or [])
-                    if asset.get("id")
-                ]
-
-                print("LOCAL CHAT DEBUG: allowed_asset_ids:", allowed_asset_ids)
-
-                if allowed_asset_ids:
-                    retrieval_query_input = build_memory_aware_retrieval_input(
-                        query=query,
-                        chat_id=chat_id
-                    )
-
-                    print("LOCAL CHAT DEBUG: retrieval_query_input:", retrieval_query_input)
-
-                    retrieval_queries = build_retrieval_queries(retrieval_query_input)
-                    matched_rows_by_key = {}
-
-                    for retrieval_query in retrieval_queries:
-                        filters = extract_query_filters(retrieval_query)
-                        year_filter = filters.get("year")
-
-                        keyword_rows = keyword_search_asset_chunks(
-                            query=retrieval_query,
-                            yacht_id=yacht_id,
-                            allowed_asset_ids=allowed_asset_ids,
-                            year_filter=year_filter,
-                            limit=10
-                        )
-
-                        for row in keyword_rows:
-                            key = (
-                                row.get("asset_id"),
-                                row.get("chunk_index"),
-                                row.get("content_type")
-                            )
-
-                            if key not in matched_rows_by_key:
-                                matched_rows_by_key[key] = row
-
-                        try:
-                            semantic_results = supabase.rpc("match_asset_chunks_secure", {
-                                "query_embedding": embed(retrieval_query),
-                                "match_count": 6,
-                                "allowed_asset_ids": allowed_asset_ids,
-                                "yacht_filter": yacht_id,
-                                "year_filter": year_filter
-                            }).execute()
-
-                            for row in semantic_results.data or []:
-                                key = (
-                                    row.get("asset_id"),
-                                    row.get("chunk_index"),
-                                    row.get("content_type")
-                                )
-
-                                if key not in matched_rows_by_key:
-                                    matched_rows_by_key[key] = row
-
-                        except Exception as e:
-                            print("SEMANTIC SEARCH ERROR:", type(e).__name__, str(e))
-
-                    matched_rows = list(matched_rows_by_key.values())[:30]
-
-                    print("LOCAL CHAT DEBUG: matched chunks:", len(matched_rows))
-
-                    if matched_rows:
-                        context = build_context_from_asset_results(matched_rows)
-
-    except Exception as e:
-        print("LOCAL CHAT DOCUMENT SEARCH ERROR:", type(e).__name__, str(e))
-        matched_rows = []
-        context = ""
-
-        if resolved_uploaded_asset_id:
-            uploaded_result = answer_from_uploaded_chat_asset(
-                query=query,
-                context=context,
-                matched_rows=matched_rows
-            )
-
-            answer = uploaded_result["answer"]
-            sources = uploaded_result["sources"]
-
+        try:
             supabase.table("messages").insert({
                 "chat_id": chat_id,
                 "yacht_id": yacht_id,
                 "crew_id": crew_id,
                 "role": "assistant",
-                "content": answer,
-                "sources": sources
+                "content": safe_answer,
+                "sources": safe_sources
             }).execute()
 
-            supabase.table("chats").update({
-                "updated_at": "now()"
-            }).eq("id", chat_id).eq("crew_id", crew_id).eq("yacht_id", yacht_id).execute()
+        except Exception as error:
+            print(
+                "ASSISTANT MESSAGE SAVE ERROR:",
+                type(error).__name__,
+                str(error)
+            )
 
+        try:
+            (
+                supabase.table("chats")
+                .update({
+                    "updated_at": "now()"
+                })
+                .eq("id", chat_id)
+                .eq("crew_id", crew_id)
+                .eq("yacht_id", yacht_id)
+                .execute()
+            )
+
+        except Exception as error:
+            print(
+                "CHAT UPDATED_AT ERROR:",
+                type(error).__name__,
+                str(error)
+            )
+
+    def finish(
+        final_answer: str,
+        final_sources: list[dict] | None,
+        mode: str,
+        final_uploaded_asset_id=None
+    ):
+        safe_answer = clean_text_for_postgres(
+            str(final_answer or "")
+        ).strip()
+
+        if not safe_answer:
+            safe_answer = FALLBACK_NO_DATA_ANSWER
+
+        safe_sources = unique_source_cards(
+            final_sources or []
+        )
+
+        if safe_answer == FALLBACK_NO_DATA_ANSWER:
+            safe_sources = []
+
+        save_assistant_response(
+            final_answer=safe_answer,
+            final_sources=safe_sources
+        )
+
+        return {
+            "answer": safe_answer,
+            "sources": safe_sources,
+            "uploaded_asset_id": final_uploaded_asset_id,
+            "mode": mode
+        }
+
+    # =========================================================
+    # FINANCIAL RETRIEVAL HELPERS
+    # =========================================================
+
+    def subject_terms(
+        subject: str
+    ) -> list[str]:
+        """
+        Produces broad retrieval terms from the dynamically extracted subject.
+
+        These terms are used for diagnostics and tags only. They are not used
+        as the final gate that decides whether a financial document reaches
+        the semantic financial extractor.
+        """
+
+        ignored_terms = {
+            "the",
+            "a",
+            "an",
+            "some",
+            "any",
+            "all",
+            "total",
+            "totals",
+            "amount",
+            "amounts",
+            "money",
+            "cost",
+            "costs",
+            "price",
+            "prices",
+            "spend",
+            "spent",
+            "spending",
+            "pay",
+            "paid",
+            "payment",
+            "payments",
+            "charge",
+            "charged",
+            "charges",
+            "purchase",
+            "purchased",
+            "purchases",
+            "invoice",
+            "invoices",
+            "receipt",
+            "receipts",
+            "document",
+            "documents",
+            "file",
+            "files",
+            "calculate",
+            "calculation",
+            "combined",
+            "combine",
+            "overall",
+            "altogether",
+            "on",
+            "for",
+            "from",
+            "of",
+            "and",
+            "or",
+            "plus",
+            "with",
+            "we",
+            "did",
+            "how",
+            "much",
+            "was",
+            "were",
+            "is",
+            "are"
+        }
+
+        terms = []
+
+        for term in normalise_search_text(
+            subject
+        ).split():
+            if len(term) < 2:
+                continue
+
+            if term in ignored_terms:
+                continue
+
+            if term not in terms:
+                terms.append(term)
+
+        return terms
+
+    def financial_document_score(
+        file_name: str,
+        document_text: str
+    ) -> int:
+        """
+        Scores whether a document looks like financial source material.
+
+        The score does not depend on a particular product, supplier,
+        requested question or amount.
+        """
+
+        normalised_file_name = normalise_search_text(
+            file_name
+        )
+
+        normalised_document = normalise_search_text(
+            document_text
+        )
+
+        score = 0
+
+        file_markers = [
+            "invoice",
+            "receipt",
+            "statement",
+            "bill",
+            "quotation",
+            "quote",
+            "purchase order",
+            "expense",
+            "payment"
+        ]
+
+        document_markers = [
+            "invoice number",
+            "invoice no",
+            "invoice date",
+            "unit price",
+            "quantity",
+            "qty",
+            "line total",
+            "subtotal",
+            "grand total",
+            "amount due",
+            "balance due",
+            "tax",
+            "vat",
+            "supplier",
+            "vendor"
+        ]
+
+        if any(
+            normalise_search_text(marker)
+            in normalised_file_name
+            for marker in file_markers
+        ):
+            score += 4
+
+        for marker in document_markers:
+            if (
+                normalise_search_text(marker)
+                in normalised_document
+            ):
+                score += 1
+
+        has_price = any(
+            normalise_search_text(marker)
+            in normalised_document
+            for marker in [
+                "price",
+                "unit price",
+                "rate"
+            ]
+        )
+
+        has_quantity = any(
+            normalise_search_text(marker)
+            in normalised_document
+            for marker in [
+                "quantity",
+                "qty"
+            ]
+        )
+
+        has_total = (
+            "total"
+            in normalised_document
+        )
+
+        if has_price and has_quantity:
+            score += 3
+
+        if has_price and has_total:
+            score += 2
+
+        digit_count = sum(
+            character.isdigit()
+            for character in document_text
+        )
+
+        if digit_count >= 8:
+            score += 1
+
+        if digit_count >= 20:
+            score += 1
+
+        return score
+
+    def build_financial_document_text(
+        asset: dict
+    ) -> str:
+        """
+        Builds the complete readable financial text for one asset.
+
+        Normal extracted text and OCR are included when they are not duplicates.
+        """
+
+        file_name = (
+            asset.get("original_file_name")
+            or asset.get("file_name")
+            or "Untitled document"
+        )
+
+        extracted_text = clean_text_for_postgres(
+            asset.get("extracted_text")
+            or ""
+        ).strip()
+
+        ocr_text = clean_text_for_postgres(
+            asset.get("ocr_text")
+            or ""
+        ).strip()
+
+        summary = clean_text_for_postgres(
+            asset.get("summary")
+            or ""
+        ).strip()
+
+        parts = [
+            f"File name: {file_name}"
+        ]
+
+        if extracted_text:
+            parts.append(
+                "Document text:\n"
+                + extracted_text
+            )
+
+        if ocr_text:
+            normalised_extracted = normalise_search_text(
+                extracted_text
+            )
+
+            normalised_ocr = normalise_search_text(
+                ocr_text
+            )
+
+            ocr_is_duplicate = bool(
+                normalised_extracted
+                and normalised_ocr
+                and (
+                    normalised_ocr
+                    in normalised_extracted
+                    or normalised_extracted
+                    in normalised_ocr
+                )
+            )
+
+            if not ocr_is_duplicate:
+                parts.append(
+                    "OCR text:\n"
+                    + ocr_text
+                )
+
+        if (
+            not extracted_text
+            and not ocr_text
+            and summary
+        ):
+            parts.append(
+                "Document summary:\n"
+                + summary
+            )
+
+        return "\n\n".join(
+            part
+            for part in parts
+            if str(part or "").strip()
+        ).strip()
+
+    def run_financial_answer(
+        financial_context: str,
+        financial_rows: list[dict]
+    ) -> dict:
+        if not financial_rows:
             return {
-                "answer": answer,
-                "sources": sources,
-                "uploaded_asset_id": resolved_uploaded_asset_id,
-                "mode": "uploaded_chat_asset"
+                "answer": (
+                    "No readable financial documents reached "
+                    "the calculation step."
+                ),
+                "sources": []
             }
 
-    if resolved_uploaded_asset_id:
-        uploaded_result = answer_from_uploaded_chat_asset(
-            query=query,
-            context=context,
-            matched_rows=matched_rows
+        if not str(
+            financial_context or ""
+        ).strip():
+            return {
+                "answer": (
+                    "Financial documents were found, but their text "
+                    "could not be assembled for calculation."
+                ),
+                "sources": []
+            }
+
+        print(
+            "RUNNING FINANCIAL ANSWER:",
+            {
+                "query": clean_query,
+                "document_count": len(
+                    financial_rows
+                ),
+                "documents": [
+                    (
+                        row.get("original_file_name")
+                        or row.get("file_name")
+                        or "Untitled document"
+                    )
+                    for row in financial_rows
+                ],
+                "context_characters": len(
+                    financial_context
+                )
+            }
         )
 
-        answer = uploaded_result["answer"]
-        sources = uploaded_result["sources"]
+        try:
+            result = answer_financial_total_from_context(
+                query=clean_query,
+                context=financial_context,
+                matched_rows=financial_rows
+            )
 
-    elif context:
-        raw_answer = ask_llm(
-            query=query,
-            context=f"""
-You are BridgeOS, a secure yacht documentation assistant.
+        except Exception as error:
+            print(
+                "FINANCIAL ANSWER ERROR:",
+                type(error).__name__,
+                str(error)
+            )
 
-Always respond in British English.
-Use British English for wording, spelling, grammar, and tone.
-Do not rewrite file names, document titles, API names, table names, field names, or quoted source text.
+            return {
+                "answer": (
+                    "Financial calculation failed inside the backend: "
+                    f"{type(error).__name__}: {str(error)}"
+                ),
+                "sources": []
+            }
 
-You must answer using ONLY the uploaded document context below.
+        if not isinstance(result, dict):
+            return {
+                "answer": (
+                    "The financial calculation returned "
+                    "an invalid response."
+                ),
+                "sources": []
+            }
 
-If uploaded_asset_id was provided or resolved from this chat's uploaded file memory, the uploaded document context is the file/photo/document the user uploaded in this chat. In that case, answer directly from that uploaded file context, including image visual description and OCR text when available.
-
-The uploaded context is divided into numbered blocks like SOURCE 1, SOURCE 2, SOURCE 3.
-Each source block includes a file name and content.
-
-Return ONLY valid JSON in this exact shape:
-
-{{
-  "answer": "final user-facing answer here",
-  "document_used": true,
-  "used_source_numbers": [1],
-  "used_source_titles": ["exact file name used for the answer"]
-}}
-
-or:
-
-{{
-  "answer": "Sorry, I don't have this data yet. Please ask your admin to upload it.",
-  "document_used": false,
-  "used_source_numbers": [],
-  "used_source_titles": []
-}}
-
-Special rule for chatbot-uploaded files:
-- If uploaded_asset_id was provided or resolved from this chat's uploaded file memory, the user is asking about the file/photo/document uploaded in this chat.
-- In that case, answer from the uploaded file context.
-- For photos, use the Image visual description and OCR text.
-- Do not require the user to name a yacht document or procedure when uploaded_asset_id was provided or resolved.
-
-Strict rules:
-- Do not hallucinate.
-- Do not add general maritime knowledge.
-- Do not add advice that is not explicitly supported by the uploaded document context.
-- Do not invent steps, warnings, locations, equipment, names, dates, or procedures.
-- If the document context contains the answer, answer only from that context.
-- If the user asks "what should I do in case of..." and the answer is in the SOP/context, extract the relevant procedure from the context and present it clearly.
-- If the user asks whether a document/procedure/report says something about a specific topic, object, operation, action, person, place, or requirement, only answer if that exact requested thing is explicitly present in the uploaded document context.
-- If the exact requested thing is not explicitly present in the uploaded document context, the answer must be exactly: "Sorry, I don't have this data yet. Please ask your admin to upload it."
-- Do not answer by using a broader related section. Do not infer that a missing topic is covered by another topic.
-- If none of the requested information is explicitly found in the uploaded document context, or if the user asks about a specific topic that is not explicitly named or clearly described in the context, the answer must be exactly: "Sorry, I don't have this data yet. Please ask your admin to upload it."
-- When using that fallback answer, set "document_used": false, "used_source_numbers": [], and "used_source_titles": [].
-- Set "document_used": true only when the final answer is directly supported by the uploaded document context.
-- If the user asks multiple things in one message, answer each requested part separately.
-- Use every uploaded source block that directly supports any part of the final answer.
-- Include in "used_source_numbers" ONLY the SOURCE numbers whose content directly supports the final answer.
-- Include in "used_source_titles" ONLY the exact file names whose content directly supports the final answer.
-- If the final answer uses one document, include only that one document.
-- If the final answer combines information from two or more documents, include all and only those documents.
-- If one requested part is found and another requested part is not found, answer the found part and clearly say only that the missing part is not available in the uploaded documents.
-- Do not turn a partially supported multi-part question into the full fallback answer unless none of the requested parts are supported.
-- Do not include retrieved files that were not used in the final answer.
-- Do not include a source just because it was retrieved. Include it only if its content appears in or directly supports the answer.
-- If the user identifies a specific document, form, report, procedure, code, reference, or title using words from the query, prefer source blocks whose file name or content matches those words, unless another source is explicitly needed.
-- Do not include document references inside the answer. The frontend will show sources separately.
-- Return JSON only. Do not wrap it in markdown.
-- Use the memory-aware retrieval query only to understand follow-up context. The factual answer must still come only from the uploaded document context.
-- Never say "the document does not provide additional details" for a topic that is not explicitly in the document. Use the fallback answer instead.
-
-Memory-aware retrieval query:
-{retrieval_query_input}
-
-Original user question:
-{query}
-
-Uploaded document context:
-{context}
-""".strip()
-        )
-
-        parsed = parse_llm_json_response(raw_answer)
-
-        document_used = False
-        used_source_numbers = []
-        used_source_titles = []
-
-        if parsed and isinstance(parsed, dict):
-            answer = str(parsed.get("answer") or "").strip()
-            document_used = bool(parsed.get("document_used"))
-
-            raw_used_numbers = parsed.get("used_source_numbers") or []
-            raw_used_titles = parsed.get("used_source_titles") or []
-
-            if isinstance(raw_used_numbers, list):
-                for number in raw_used_numbers:
-                    try:
-                        number = int(number)
-                        if number > 0:
-                            used_source_numbers.append(number)
-                    except Exception:
-                        pass
-
-            if isinstance(raw_used_titles, list):
-                used_source_titles = [
-                    str(title).strip()
-                    for title in raw_used_titles
-                    if str(title).strip()
-                ]
-
-        else:
-            print("LOCAL CHAT JSON ROUTING PARSE FAILED:", str(raw_answer)[:500])
-            answer = FALLBACK_NO_DATA_ANSWER
-            document_used = False
-            used_source_numbers = []
-            used_source_titles = []
+        answer = str(
+            result.get("answer")
+            or ""
+        ).strip()
 
         if not answer:
-            answer = FALLBACK_NO_DATA_ANSWER
-            document_used = False
-            used_source_numbers = []
-            used_source_titles = []
+            return {
+                "answer": (
+                    "The financial calculation completed "
+                    "but returned an empty answer."
+                ),
+                "sources": []
+            }
 
-        if answer.strip() == FALLBACK_NO_DATA_ANSWER:
-            document_used = False
-            used_source_numbers = []
-            used_source_titles = []
+        return {
+            "answer": answer,
+            "sources": (
+                result.get("sources")
+                or []
+            )
+        }
 
-        if document_used and answer.strip() != FALLBACK_NO_DATA_ANSWER:
-            source_rows = []
+    # =========================================================
+    # SAVE USER MESSAGE
+    # =========================================================
 
-            if used_source_numbers:
-                for source_number in used_source_numbers:
-                    index = source_number - 1
-
-                    if 0 <= index < len(matched_rows):
-                        source_rows.append(matched_rows[index])
-
-            if not source_rows and used_source_titles:
-                normalized_used_titles = {
-                    title.lower().strip()
-                    for title in used_source_titles
-                }
-
-                for row in matched_rows:
-                    row_file_name = str(row.get("file_name") or "").lower().strip()
-                    row_original_name = str(row.get("original_file_name") or "").lower().strip()
-
-                    if (
-                        row_file_name in normalized_used_titles
-                        or row_original_name in normalized_used_titles
-                    ):
-                        source_rows.append(row)
-
-            if not source_rows:
-                sources = []
-            else:
-                sources = build_sources_from_asset_results(source_rows)
-
-        else:
-            sources = []
-
-    else:
-        answer = FALLBACK_NO_DATA_ANSWER
-        sources = []
-
-    supabase.table("messages").insert({
+    user_payload = {
         "chat_id": chat_id,
         "yacht_id": yacht_id,
         "crew_id": crew_id,
-        "role": "assistant",
-        "content": answer,
-        "sources": sources
-    }).execute()
-
-    supabase.table("chats").update({
-        "updated_at": "now()"
-    }).eq("id", chat_id).eq("crew_id", crew_id).eq("yacht_id", yacht_id).execute()
-
-    return {
-        "answer": answer,
-        "sources": sources,
-        "uploaded_asset_id": resolved_uploaded_asset_id
+        "role": "user",
+        "content": clean_query,
+        "sources": []
     }
+
+    if uploaded_asset_id:
+        user_payload[
+            "uploaded_asset_id"
+        ] = uploaded_asset_id
+
+    try:
+        (
+            supabase.table("messages")
+            .insert(user_payload)
+            .execute()
+        )
+
+    except Exception as error:
+        print(
+            "USER MESSAGE SAVE ERROR:",
+            type(error).__name__,
+            str(error)
+        )
+
+        try:
+            user_payload.pop(
+                "uploaded_asset_id",
+                None
+            )
+
+            (
+                supabase.table("messages")
+                .insert(user_payload)
+                .execute()
+            )
+
+        except Exception as second_error:
+            print(
+                "USER MESSAGE FALLBACK SAVE ERROR:",
+                type(second_error).__name__,
+                str(second_error)
+            )
+
+    if chat_row.get("title") == "New Chat":
+        try:
+            (
+                supabase.table("chats")
+                .update({
+                    "title": (
+                        clean_query[:60]
+                        or "New Chat"
+                    ),
+                    "updated_at": "now()"
+                })
+                .eq("id", chat_id)
+                .eq("crew_id", crew_id)
+                .eq("yacht_id", yacht_id)
+                .execute()
+            )
+
+        except Exception as error:
+            print(
+                "CHAT TITLE UPDATE ERROR:",
+                type(error).__name__,
+                str(error)
+            )
+
+    # =========================================================
+    # CLASSIFY QUERY
+    # =========================================================
+
+    try:
+        query_scope = classify_bridgeos_query_scope(
+            clean_query
+        )
+
+    except Exception as error:
+        print(
+            "QUERY SCOPE ERROR:",
+            type(error).__name__,
+            str(error)
+        )
+
+        query_scope = "factual"
+
+    try:
+        financial_query = is_financial_total_query(
+            clean_query
+        )
+
+    except Exception as error:
+        print(
+            "FINANCIAL CLASSIFICATION ERROR:",
+            type(error).__name__,
+            str(error)
+        )
+
+        financial_query = False
+
+    if financial_query:
+        answer_depth = "comprehensive"
+
+    else:
+        try:
+            answer_depth = classify_answer_depth(
+                clean_query
+            )
+
+        except Exception:
+            answer_depth = "focused"
+
+    # =========================================================
+    # EXTRACT DYNAMIC FINANCIAL SUBJECTS
+    # =========================================================
+
+    requested_financial_subjects = []
+
+    if financial_query:
+        try:
+            requested_financial_subjects = (
+                extract_spending_subjects(
+                    clean_query
+                )
+                or []
+            )
+
+        except Exception as error:
+            print(
+                "FINANCIAL SUBJECT EXTRACTION ERROR:",
+                type(error).__name__,
+                str(error)
+            )
+
+            requested_financial_subjects = []
+
+    deduplicated_subjects = []
+    seen_subject_keys = set()
+
+    for subject in requested_financial_subjects:
+        subject = str(
+            subject or ""
+        ).strip()
+
+        subject_key = normalise_search_text(
+            subject
+        )
+
+        if not subject_key:
+            continue
+
+        if subject_key in seen_subject_keys:
+            continue
+
+        seen_subject_keys.add(
+            subject_key
+        )
+
+        deduplicated_subjects.append(
+            subject
+        )
+
+    requested_financial_subjects = (
+        deduplicated_subjects
+    )
+
+    requested_subject_groups = []
+
+    for subject in requested_financial_subjects:
+        terms = subject_terms(
+            subject
+        )
+
+        requested_subject_groups.append({
+            "subject": subject,
+            "terms": terms
+        })
+
+    print(
+        "CHAT CLASSIFICATION:",
+        {
+            "query": clean_query,
+            "scope": query_scope,
+            "financial_query": financial_query,
+            "financial_subjects": (
+                requested_financial_subjects
+            ),
+            "financial_subject_groups": (
+                requested_subject_groups
+            ),
+            "answer_depth": answer_depth,
+            "uploaded_asset_id": uploaded_asset_id
+        }
+    )
+
+    # =========================================================
+    # CONVERSATIONAL REQUEST
+    # =========================================================
+
+    if (
+        query_scope == "conversational"
+        and not uploaded_asset_id
+    ):
+        try:
+            answer = ask_llm(
+                query=clean_query,
+                context="""
+You are BridgeOS, a private document assistant.
+
+Respond naturally to greetings and application-help questions.
+
+Rules:
+- Be brief and useful.
+- Do not invent document information.
+- Do not answer factual document questions without evidence.
+- Use British English.
+- Return plain text only.
+""".strip()
+            )
+
+            answer = str(
+                answer or ""
+            ).strip()
+
+        except Exception as error:
+            print(
+                "CONVERSATIONAL ANSWER ERROR:",
+                type(error).__name__,
+                str(error)
+            )
+
+            answer = "Hello. How can I help?"
+
+        return finish(
+            final_answer=answer,
+            final_sources=[],
+            mode="conversational",
+            final_uploaded_asset_id=None
+        )
+
+    # =========================================================
+    # EXPLICITLY UPLOADED CHAT ASSET
+    # =========================================================
+
+    if uploaded_asset_id:
+        try:
+            matched_rows = (
+                get_uploaded_chat_asset_rows(
+                    uploaded_asset_id=uploaded_asset_id,
+                    crew_id=crew_id,
+                    yacht_id=yacht_id,
+                    security_level=security_level,
+                    chat_id=chat_id
+                )
+                or []
+            )
+
+            matched_rows = deduplicate_context_rows(
+                matched_rows
+            )
+
+            context = (
+                build_context_from_asset_results(
+                    matched_rows
+                )
+                if matched_rows
+                else ""
+            )
+
+        except Exception as error:
+            print(
+                "UPLOADED ASSET RETRIEVAL ERROR:",
+                type(error).__name__,
+                str(error)
+            )
+
+            matched_rows = []
+            context = ""
+
+        if not context:
+            return finish(
+                final_answer=(
+                    "I received the uploaded file, but I could not "
+                    "read enough content to answer reliably."
+                ),
+                final_sources=[],
+                mode="uploaded_chat_asset",
+                final_uploaded_asset_id=uploaded_asset_id
+            )
+
+        if financial_query:
+            grouped_uploaded_rows = {}
+
+            for row in matched_rows:
+                asset_id = row.get("asset_id")
+
+                if not asset_id:
+                    continue
+
+                if asset_id not in grouped_uploaded_rows:
+                    grouped_uploaded_rows[
+                        asset_id
+                    ] = {
+                        "base_row": row,
+                        "parts": [],
+                        "seen_parts": set()
+                    }
+
+                row_text = str(
+                    row.get("search_text")
+                    or row.get("content")
+                    or ""
+                ).strip()
+
+                normalised_part = normalise_for_source_check(
+                    row_text
+                )
+
+                if (
+                    row_text
+                    and normalised_part
+                    and normalised_part
+                    not in grouped_uploaded_rows[
+                        asset_id
+                    ]["seen_parts"]
+                ):
+                    grouped_uploaded_rows[
+                        asset_id
+                    ]["seen_parts"].add(
+                        normalised_part
+                    )
+
+                    grouped_uploaded_rows[
+                        asset_id
+                    ]["parts"].append(
+                        row_text
+                    )
+
+            financial_rows = []
+
+            for asset_id, grouped in (
+                grouped_uploaded_rows.items()
+            ):
+                base_row = grouped["base_row"]
+
+                document_text = "\n\n".join(
+                    grouped["parts"]
+                ).strip()
+
+                if not document_text:
+                    continue
+
+                financial_rows.append({
+                    **base_row,
+                    "asset_id": asset_id,
+                    "content": document_text,
+                    "search_text": document_text,
+                    "content_type": "financial_document",
+                    "chunk_index": 0
+                })
+
+            financial_context = (
+                build_context_from_asset_results(
+                    financial_rows
+                )
+                if financial_rows
+                else ""
+            )
+
+            financial_result = run_financial_answer(
+                financial_context=financial_context,
+                financial_rows=financial_rows
+            )
+
+            return finish(
+                final_answer=financial_result.get(
+                    "answer"
+                ),
+                final_sources=financial_result.get(
+                    "sources"
+                ),
+                mode="uploaded_chat_asset",
+                final_uploaded_asset_id=uploaded_asset_id
+            )
+
+        try:
+            numeric_result = (
+                answer_numeric_comparison_from_context(
+                    query=clean_query,
+                    context=context,
+                    matched_rows=matched_rows
+                )
+            )
+
+        except Exception as error:
+            print(
+                "UPLOADED NUMERIC ANSWER ERROR:",
+                type(error).__name__,
+                str(error)
+            )
+
+            numeric_result = None
+
+        if isinstance(numeric_result, dict):
+            return finish(
+                final_answer=numeric_result.get(
+                    "answer"
+                ),
+                final_sources=numeric_result.get(
+                    "sources"
+                ),
+                mode="uploaded_chat_asset",
+                final_uploaded_asset_id=uploaded_asset_id
+            )
+
+        try:
+            uploaded_result = (
+                answer_from_uploaded_chat_asset(
+                    query=clean_query,
+                    context=context,
+                    matched_rows=matched_rows
+                )
+            )
+
+        except Exception as error:
+            print(
+                "UPLOADED FILE ANSWER ERROR:",
+                type(error).__name__,
+                str(error)
+            )
+
+            uploaded_result = None
+
+        if not isinstance(uploaded_result, dict):
+            uploaded_result = {
+                "answer": FALLBACK_NO_DATA_ANSWER,
+                "sources": []
+            }
+
+        return finish(
+            final_answer=uploaded_result.get(
+                "answer"
+            ),
+            final_sources=uploaded_result.get(
+                "sources"
+            ),
+            mode="uploaded_chat_asset",
+            final_uploaded_asset_id=uploaded_asset_id
+        )
+
+    # =========================================================
+    # ACCESSIBLE PROCESSED ASSETS
+    # =========================================================
+
+    try:
+        accessible_asset_ids = (
+            get_accessible_asset_ids(
+                crew_id=crew_id,
+                yacht_id=yacht_id,
+                security_level=security_level
+            )
+            or []
+        )
+
+    except Exception as error:
+        print(
+            "ACCESSIBLE ASSET LOOKUP ERROR:",
+            type(error).__name__,
+            str(error)
+        )
+
+        accessible_asset_ids = []
+
+    if not accessible_asset_ids:
+        return finish(
+            final_answer=FALLBACK_NO_DATA_ANSWER,
+            final_sources=[],
+            mode="document_qa"
+        )
+
+    try:
+        processed_assets_result = (
+            supabase.table("assets")
+            .select("id")
+            .eq("yacht_id", yacht_id)
+            .in_("id", accessible_asset_ids)
+            .eq("processing_status", "processed")
+            .execute()
+        )
+
+        allowed_asset_ids = [
+            row.get("id")
+            for row in (
+                processed_assets_result.data
+                or []
+            )
+            if row.get("id")
+        ]
+
+    except Exception as error:
+        print(
+            "PROCESSED ASSET LOOKUP ERROR:",
+            type(error).__name__,
+            str(error)
+        )
+
+        allowed_asset_ids = []
+
+    if not allowed_asset_ids:
+        return finish(
+            final_answer=FALLBACK_NO_DATA_ANSWER,
+            final_sources=[],
+            mode="document_qa"
+        )
+
+    # =========================================================
+    # FINANCIAL RETRIEVAL
+    # =========================================================
+
+    if financial_query:
+        try:
+            assets_result = (
+                supabase.table("assets")
+                .select("""
+                    id,
+                    yacht_id,
+                    chat_id,
+                    security_level,
+                    file_name,
+                    original_file_name,
+                    file_type,
+                    mime_type,
+                    extracted_text,
+                    ocr_text,
+                    summary,
+                    processing_status,
+                    processing_error,
+                    created_at
+                """)
+                .eq("yacht_id", yacht_id)
+                .in_("id", allowed_asset_ids)
+                .eq("processing_status", "processed")
+                .order("created_at", desc=False)
+                .execute()
+            )
+
+        except Exception as error:
+            print(
+                "FINANCIAL ASSET LOAD ERROR:",
+                type(error).__name__,
+                str(error)
+            )
+
+            assets_result = None
+
+        all_loaded_assets = (
+            assets_result.data
+            if assets_result
+            else []
+        ) or []
+
+        financial_rows = []
+        seen_financial_assets = set()
+
+        for asset in all_loaded_assets:
+            asset_id = asset.get("id")
+
+            if not asset_id:
+                continue
+
+            if asset_id in seen_financial_assets:
+                continue
+
+            file_name = (
+                asset.get("original_file_name")
+                or asset.get("file_name")
+                or "Untitled document"
+            )
+
+            document_text = build_financial_document_text(
+                asset
+            )
+
+            if not document_text:
+                print(
+                    "FINANCIAL ASSET SKIPPED: EMPTY CONTENT",
+                    {
+                        "asset_id": asset_id,
+                        "file_name": file_name
+                    }
+                )
+
+                continue
+
+            normalised_document = normalise_search_text(
+                document_text
+            )
+
+            matched_subjects = []
+
+            for group in requested_subject_groups:
+                terms = group.get("terms") or []
+
+                if not terms:
+                    continue
+
+                matched_term_count = sum(
+                    1
+                    for term in terms
+                    if term in normalised_document
+                )
+
+                if matched_term_count > 0:
+                    matched_subjects.append(
+                        group.get("subject")
+                        or ""
+                    )
+
+            document_score = financial_document_score(
+                file_name=file_name,
+                document_text=document_text
+            )
+
+            # Every document that looks financial reaches the semantic
+            # line-item extractor.
+            #
+            # Do not require an exact requested-subject match here.
+            # A valid invoice may use:
+            # - plural or singular wording;
+            # - a longer description;
+            # - an abbreviation;
+            # - OCR-damaged spacing or spelling;
+            # - equivalent terminology.
+            #
+            # The semantic extractor later decides whether the document
+            # genuinely contains matching rows.
+            include_document = (
+                document_score >= 2
+            )
+
+            print(
+                "FINANCIAL ASSET FILTER:",
+                {
+                    "asset_id": asset_id,
+                    "file_name": file_name,
+                    "score": document_score,
+                    "matched_subjects": matched_subjects,
+                    "included": include_document,
+                    "document_characters": len(
+                        document_text
+                    )
+                }
+            )
+
+            if not include_document:
+                continue
+
+            seen_financial_assets.add(
+                asset_id
+            )
+
+            financial_rows.append({
+                "asset_id": asset_id,
+                "yacht_id": asset.get("yacht_id"),
+                "chat_id": asset.get("chat_id"),
+                "security_level": asset.get(
+                    "security_level"
+                ),
+                "content": document_text,
+                "search_text": document_text,
+                "content_type": "financial_document",
+                "chunk_index": 0,
+                "detected_date": None,
+                "detected_year": None,
+                "tags": [
+                    "financial",
+                    *[
+                        normalise_search_text(
+                            subject
+                        )
+                        for subject in matched_subjects
+                        if subject
+                    ]
+                ],
+                "file_name": asset.get("file_name"),
+                "original_file_name": asset.get(
+                    "original_file_name"
+                ),
+                "file_type": asset.get("file_type"),
+                "mime_type": asset.get("mime_type")
+            })
+
+        financial_context = (
+            build_context_from_asset_results(
+                financial_rows
+            )
+            if financial_rows
+            else ""
+        )
+
+        print(
+            "FINANCIAL RETRIEVAL RESULT:",
+            {
+                "accessible_processed_assets": len(
+                    all_loaded_assets
+                ),
+                "matching_financial_documents": len(
+                    financial_rows
+                ),
+                "documents": [
+                    (
+                        row.get("original_file_name")
+                        or row.get("file_name")
+                    )
+                    for row in financial_rows
+                ],
+                "context_length": len(
+                    financial_context
+                )
+            }
+        )
+
+        if not financial_rows:
+            return finish(
+                final_answer=(
+                    "I could not find a processed financial "
+                    "document suitable for calculation."
+                ),
+                final_sources=[],
+                mode="document_qa"
+            )
+
+        financial_result = run_financial_answer(
+            financial_context=financial_context,
+            financial_rows=financial_rows
+        )
+
+        return finish(
+            final_answer=financial_result.get(
+                "answer"
+            ),
+            final_sources=financial_result.get(
+                "sources"
+            ),
+            mode="document_qa"
+        )
+
+    # =========================================================
+    # NORMAL DOCUMENT RETRIEVAL
+    # =========================================================
+
+    try:
+        followup_query = is_contextual_followup_query(
+            query=clean_query,
+            chat_id=chat_id
+        )
+
+    except Exception as error:
+        print(
+            "FOLLOW-UP CLASSIFICATION ERROR:",
+            type(error).__name__,
+            str(error)
+        )
+
+        followup_query = False
+
+    retrieval_query_input = clean_query
+
+    if followup_query:
+        try:
+            retrieval_query_input = (
+                build_memory_aware_retrieval_input(
+                    query=clean_query,
+                    chat_id=chat_id
+                )
+                or clean_query
+            )
+
+        except Exception as error:
+            print(
+                "FOLLOW-UP REWRITE ERROR:",
+                type(error).__name__,
+                str(error)
+            )
+
+    try:
+        retrieval_queries = (
+            build_retrieval_queries(
+                retrieval_query_input
+            )
+            or [
+                retrieval_query_input
+            ]
+        )
+
+    except Exception:
+        retrieval_queries = [
+            retrieval_query_input
+        ]
+
+    matched_rows_by_key = {}
+
+    try:
+        file_listing_query = is_file_listing_query(
+            clean_query
+        )
+
+    except Exception:
+        file_listing_query = False
+
+    if file_listing_query:
+        try:
+            listing_rows = (
+                get_asset_metadata_rows_for_listing(
+                    query=clean_query,
+                    yacht_id=yacht_id,
+                    allowed_asset_ids=allowed_asset_ids,
+                    limit=50
+                )
+                or []
+            )
+
+            for row in listing_rows:
+                key = (
+                    row.get("asset_id"),
+                    row.get("chunk_index"),
+                    row.get("content_type")
+                )
+
+                matched_rows_by_key[key] = row
+
+        except Exception as error:
+            print(
+                "FILE LISTING RETRIEVAL ERROR:",
+                type(error).__name__,
+                str(error)
+            )
+
+    for retrieval_query in retrieval_queries:
+        retrieval_query = str(
+            retrieval_query or ""
+        ).strip()
+
+        if not retrieval_query:
+            continue
+
+        try:
+            filters = (
+                extract_query_filters(
+                    retrieval_query
+                )
+                or {}
+            )
+
+        except Exception:
+            filters = {}
+
+        year_filter = filters.get("year")
+
+        try:
+            keyword_rows = (
+                keyword_search_asset_chunks(
+                    query=retrieval_query,
+                    yacht_id=yacht_id,
+                    allowed_asset_ids=allowed_asset_ids,
+                    year_filter=year_filter,
+                    limit=40
+                )
+                or []
+            )
+
+            for row in keyword_rows:
+                key = (
+                    row.get("asset_id"),
+                    row.get("chunk_index"),
+                    row.get("content_type")
+                )
+
+                if key not in matched_rows_by_key:
+                    matched_rows_by_key[key] = row
+
+        except Exception as error:
+            print(
+                "KEYWORD SEARCH ERROR:",
+                type(error).__name__,
+                str(error)
+            )
+
+        try:
+            query_embedding = embed(
+                retrieval_query
+            )
+
+            embedding_is_usable = bool(
+                isinstance(query_embedding, list)
+                and query_embedding
+                and any(
+                    float(value or 0) != 0
+                    for value in query_embedding
+                )
+            )
+
+            if embedding_is_usable:
+                semantic_result = (
+                    supabase.rpc(
+                        "match_asset_chunks_secure",
+                        {
+                            "query_embedding": query_embedding,
+                            "match_count": 40,
+                            "allowed_asset_ids": allowed_asset_ids,
+                            "yacht_filter": yacht_id,
+                            "year_filter": year_filter
+                        }
+                    )
+                    .execute()
+                )
+
+                for row in (
+                    semantic_result.data
+                    or []
+                ):
+                    key = (
+                        row.get("asset_id"),
+                        row.get("chunk_index"),
+                        row.get("content_type")
+                    )
+
+                    if key not in matched_rows_by_key:
+                        matched_rows_by_key[key] = row
+
+        except Exception as error:
+            print(
+                "SEMANTIC SEARCH ERROR:",
+                type(error).__name__,
+                str(error)
+            )
+
+    matched_rows = list(
+        matched_rows_by_key.values()
+    )[:100]
+
+    if (
+        matched_rows
+        and not file_listing_query
+    ):
+        try:
+            matched_rows = (
+                expand_retrieved_rows_to_full_relevant_documents(
+                    query=retrieval_query_input,
+                    matched_rows=matched_rows,
+                    yacht_id=yacht_id,
+                    security_level=security_level,
+                    answer_depth=answer_depth
+                )
+                or matched_rows
+            )
+
+        except Exception as error:
+            print(
+                "FULL DOCUMENT EXPANSION ERROR:",
+                type(error).__name__,
+                str(error)
+            )
+
+        try:
+            matched_rows = deduplicate_context_rows(
+                matched_rows
+            )
+
+        except Exception as error:
+            print(
+                "CONTEXT DEDUPLICATION ERROR:",
+                type(error).__name__,
+                str(error)
+            )
+
+    context = (
+        build_context_from_asset_results(
+            matched_rows
+        )
+        if matched_rows
+        else ""
+    )
+
+    if not context:
+        return finish(
+            final_answer=FALLBACK_NO_DATA_ANSWER,
+            final_sources=[],
+            mode="document_qa"
+        )
+
+    if file_listing_query:
+        try:
+            listing_result = answer_file_listing_directly(
+                query=clean_query,
+                rows=matched_rows
+            )
+
+        except Exception as error:
+            print(
+                "FILE LISTING ANSWER ERROR:",
+                type(error).__name__,
+                str(error)
+            )
+
+            listing_result = None
+
+        if isinstance(listing_result, dict):
+            return finish(
+                final_answer=listing_result.get(
+                    "answer"
+                ),
+                final_sources=listing_result.get(
+                    "sources"
+                ),
+                mode="document_qa"
+            )
+
+    try:
+        numeric_result = (
+            answer_numeric_comparison_from_context(
+                query=clean_query,
+                context=context,
+                matched_rows=matched_rows
+            )
+        )
+
+    except Exception as error:
+        print(
+            "NUMERIC ANSWER ERROR:",
+            type(error).__name__,
+            str(error)
+        )
+
+        numeric_result = None
+
+    if isinstance(numeric_result, dict):
+        return finish(
+            final_answer=numeric_result.get(
+                "answer"
+            ),
+            final_sources=numeric_result.get(
+                "sources"
+            ),
+            mode="document_qa"
+        )
+
+        # =========================================================
+    # NORMAL GROUNDED DOCUMENT ANSWER
+    # =========================================================
+
+    clean_context = clean_text_for_postgres(
+        str(context or "")
+    ).strip()
+
+    if not clean_context:
+        return finish(
+            final_answer=FALLBACK_NO_DATA_ANSWER,
+            final_sources=[],
+            mode="document_qa"
+        )
+
+    # Use the retrieved document rows as the only factual context.
+    # The model is asked for structured JSON first, but a plain-text
+    # fallback is allowed because some RunPod models do not reliably
+    # follow JSON-only instructions.
+    answer = ""
+    verified_rows = []
+
+    try:
+        raw_answer = ask_llm(
+            query=clean_query,
+            context=f"""
+You are BridgeOS, a private document assistant.
+
+Answer the user's question using ONLY the supplied document context.
+
+Return valid JSON when possible:
+
+{{
+  "answer": "direct answer supported by the documents",
+  "used_sources": [
+    {{
+      "source_number": 1,
+      "evidence_quote": "short exact supporting text from that source"
+    }}
+  ]
+}}
+
+Rules:
+- Use only the document context below.
+- Do not use outside knowledge.
+- Do not invent names, dates, numbers, events, requirements or conclusions.
+- Answer the exact user question.
+- If the answer is not present, return:
+  {{
+    "answer": "{FALLBACK_NO_DATA_ANSWER}",
+    "used_sources": []
+  }}
+- Source numbers correspond to the numbered sources below.
+- Keep evidence quotes short and copied from the source.
+- Use British English.
+
+User question:
+{clean_query}
+
+Document context:
+{clean_context}
+""".strip()
+        )
+
+        raw_answer = clean_text_for_postgres(
+            str(raw_answer or "")
+        ).strip()
+
+        parsed_answer = parse_llm_json_response(
+            raw_answer
+        )
+
+        if isinstance(parsed_answer, dict):
+            candidate_answer = clean_text_for_postgres(
+                str(
+                    parsed_answer.get("answer")
+                    or parsed_answer.get("response")
+                    or parsed_answer.get("message")
+                    or ""
+                )
+            ).strip()
+
+            used_sources = (
+                parsed_answer.get("used_sources")
+                or parsed_answer.get("sources")
+                or []
+            )
+
+            if (
+                candidate_answer
+                and candidate_answer != FALLBACK_NO_DATA_ANSWER
+            ):
+                answer = candidate_answer
+
+            if isinstance(used_sources, list):
+                for used_source in used_sources:
+                    if not isinstance(used_source, dict):
+                        continue
+
+                    try:
+                        source_number = int(
+                            used_source.get("source_number")
+                        )
+                    except Exception:
+                        continue
+
+                    source_index = source_number - 1
+
+                    if (
+                        source_index < 0
+                        or source_index >= len(matched_rows)
+                    ):
+                        continue
+
+                    selected_row = matched_rows[
+                        source_index
+                    ]
+
+                    evidence_quote = clean_text_for_postgres(
+                        str(
+                            used_source.get("evidence_quote")
+                            or used_source.get("quote")
+                            or ""
+                        )
+                    ).strip()
+
+                    # Accept an exact/normalised quote match.
+                    if (
+                        evidence_quote
+                        and source_quote_exists_in_row(
+                            selected_row,
+                            evidence_quote
+                        )
+                    ):
+                        verified_rows.append(
+                            selected_row
+                        )
+
+        else:
+            # Some RunPod models return a correct plain-text answer
+            # despite being instructed to return JSON.
+            if (
+                raw_answer
+                and raw_answer != FALLBACK_NO_DATA_ANSWER
+                and not raw_answer.lower().startswith(
+                    "runpod "
+                )
+            ):
+                answer = raw_answer
+
+    except Exception as error:
+        print(
+            "STRUCTURED DOCUMENT ANSWER ERROR:",
+            type(error).__name__,
+            str(error)
+        )
+
+    # =========================================================
+    # PLAIN-TEXT FALLBACK
+    # =========================================================
+
+    if not answer:
+        try:
+            fallback_answer = ask_llm(
+                query=clean_query,
+                context=f"""
+You are BridgeOS, a private document assistant.
+
+Answer the user's question directly using ONLY the document context below.
+
+Rules:
+- Do not use outside knowledge.
+- Do not invent information.
+- Do not mention that you are an AI.
+- Do not describe the retrieval process.
+- Do not return JSON.
+- Use British English.
+- If the documents do not contain the answer, return exactly:
+{FALLBACK_NO_DATA_ANSWER}
+
+User question:
+{clean_query}
+
+Document context:
+{clean_context}
+""".strip()
+            )
+
+            fallback_answer = clean_text_for_postgres(
+                str(fallback_answer or "")
+            ).strip()
+
+            if (
+                fallback_answer
+                and fallback_answer
+                != FALLBACK_NO_DATA_ANSWER
+                and not fallback_answer.lower().startswith(
+                    "runpod "
+                )
+            ):
+                answer = fallback_answer
+
+        except Exception as error:
+            print(
+                "PLAIN DOCUMENT ANSWER ERROR:",
+                type(error).__name__,
+                str(error)
+            )
+
+    if (
+        not answer
+        or answer == FALLBACK_NO_DATA_ANSWER
+    ):
+        return finish(
+            final_answer=FALLBACK_NO_DATA_ANSWER,
+            final_sources=[],
+            mode="document_qa"
+        )
+
+    # =========================================================
+    # SOURCE FALLBACK
+    # =========================================================
+
+    # When valid evidence quotes were returned, use only those rows.
+    # Otherwise use the strongest retrieved document rows rather than
+    # throwing away a valid answer merely because the model did not
+    # produce perfect source JSON.
+    if not verified_rows:
+        verified_rows = []
+
+        seen_verified_assets = set()
+
+        for row in matched_rows:
+            if not isinstance(row, dict):
+                continue
+
+            asset_id = row.get("asset_id")
+
+            if not asset_id:
+                continue
+
+            if asset_id in seen_verified_assets:
+                continue
+
+            row_text = clean_text_for_postgres(
+                str(
+                    row.get("content")
+                    or row.get("search_text")
+                    or row.get("text")
+                    or ""
+                )
+            ).strip()
+
+            if not row_text:
+                continue
+
+            seen_verified_assets.add(
+                asset_id
+            )
+
+            verified_rows.append(
+                row
+            )
+
+            # Keep the displayed sources focused.
+            if len(verified_rows) >= 3:
+                break
+
+    verified_sources = build_sources_from_asset_results(
+        verified_rows
+    )
+
+    return finish(
+        final_answer=answer,
+        final_sources=verified_sources,
+        mode="document_qa"
+    )
 # ------------------------
 # TEMP DEMO LOGIN FOR TESTING ONLY
 # Remove before production.
@@ -4152,7 +15622,6 @@ def ensure_demo_account():
 
     return crew_insert.data[0]
 
-
 def test_login_response():
     crew = ensure_demo_account()
 
@@ -4166,4 +15635,299 @@ def test_login_response():
         },
         "crew": crew
     }
- 
+
+def _clean_reset_email(email: str) -> str:
+    return (email or "").strip().lower()
+
+
+def _make_reset_code() -> str:
+    return str(random.randint(100000, 999999))
+
+
+def _hash_reset_code(email: str, code: str) -> str:
+    raw = f"{_clean_reset_email(email)}:{code}:{SUPABASE_JWT_SECRET}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _send_password_reset_code_email(email: str, code: str):
+    """
+    Sends password reset code using Brevo Transactional Email API.
+    """
+
+    if not BREVO_API_KEY or not BREVO_FROM_EMAIL:
+        raise HTTPException(
+            status_code=500,
+            detail="Password reset email is not configured. Missing Brevo settings."
+        )
+
+    subject = "Your BridgeOS password reset code"
+
+    text_content = f"""
+Hello,
+
+Your BridgeOS password reset code is:
+
+{code}
+
+This code expires in 15 minutes.
+
+If you did not request this password reset, you can ignore this email.
+
+BridgeOS
+""".strip()
+
+    html_content = f"""
+<!doctype html>
+<html>
+  <body style="font-family: Arial, sans-serif; color: #111827; line-height: 1.5;">
+    <p>Hello,</p>
+
+    <p>Your BridgeOS password reset code is:</p>
+
+    <p style="font-size: 28px; font-weight: bold; letter-spacing: 4px;">
+      {code}
+    </p>
+
+    <p>This code expires in 15 minutes.</p>
+
+    <p>If you did not request this password reset, you can ignore this email.</p>
+
+    <p>If you don’t see this email in your inbox, please check your spam or junk folder.</p>
+
+
+    <p>BridgeOS</p>
+  </body>
+</html>
+""".strip()
+
+    payload = {
+        "sender": {
+            "name": BREVO_FROM_NAME,
+            "email": BREVO_FROM_EMAIL
+        },
+        "to": [
+            {
+                "email": email
+            }
+        ],
+        "subject": subject,
+        "htmlContent": html_content,
+        "textContent": text_content,
+        "tags": ["password-reset"]
+    }
+
+    try:
+        response = requests.post(
+            BREVO_API_URL,
+            json=payload,
+            headers={
+                "accept": "application/json",
+                "content-type": "application/json",
+                "api-key": BREVO_API_KEY
+            },
+            timeout=20
+        )
+
+        print("BREVO PASSWORD RESET DEBUG: status:", response.status_code)
+        print("BREVO PASSWORD RESET DEBUG: response:", response.text[:500])
+
+        if response.status_code >= 400:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Brevo failed to send password reset email: "
+                    f"{response.status_code}: {response.text[:500]}"
+                )
+            )
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        print("BREVO PASSWORD RESET ERROR:", type(e).__name__, str(e))
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Could not send password reset email through Brevo: "
+                f"{type(e).__name__}: {str(e)}"
+            )
+        )
+def forgot_password(email: str):
+    """
+    Sends a 6-digit password reset verification code by email.
+
+    Security behaviour:
+    - Always returns a generic message.
+    - Does not reveal whether the email exists.
+    - Stores only a hash of the code.
+    - Code expires after 15 minutes.
+    """
+
+    clean_email = _clean_reset_email(email)
+
+    if not clean_email:
+        raise HTTPException(status_code=400, detail="Email is required")
+
+    crew_res = supabase.table("crew") \
+        .select("id, email") \
+        .ilike("email", clean_email) \
+        .limit(1) \
+        .execute()
+
+    generic_response = {
+        "message": "If this email exists, a verification code has been sent."
+    }
+
+    if not crew_res.data:
+        return generic_response
+
+    code = _make_reset_code()
+    code_hash = _hash_reset_code(clean_email, code)
+    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat()
+
+    try:
+        auth_admin.table("password_reset_codes").insert({
+            "email": clean_email,
+            "code_hash": code_hash,
+            "code_preview": code,
+            "expires_at": expires_at,
+            "sent_at": datetime.now(timezone.utc).isoformat(),
+            "sent_provider": "brevo"
+        }).execute()
+
+        auth_admin.table("password_reset_codes").insert({
+            "email": clean_email,
+            "code_hash": code_hash,
+            "expires_at": expires_at
+        }).execute()
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not create password reset code: {str(e)}"
+        )
+
+    print("PASSWORD RESET DEBUG: sending email to", clean_email)
+
+    _send_password_reset_code_email(clean_email, code)
+
+    print("PASSWORD RESET DEBUG: email sent successfully")
+
+    return generic_response
+
+
+def confirm_forgot_password(email: str, code: str, new_password: str):
+    """
+    Verifies the emailed code and updates the user's Supabase Auth password.
+    """
+
+    clean_email = _clean_reset_email(email)
+    clean_code = (code or "").strip()
+
+    if not clean_email:
+        raise HTTPException(status_code=400, detail="Email is required")
+
+    if not clean_code:
+        raise HTTPException(status_code=400, detail="Verification code is required")
+
+    if not new_password or len(new_password) < 8:
+        raise HTTPException(
+            status_code=400,
+            detail="Password must be at least 8 characters"
+        )
+
+    code_hash = _hash_reset_code(clean_email, clean_code)
+    now = datetime.now(timezone.utc)
+
+    try:
+        code_res = auth_admin.table("password_reset_codes") \
+            .select("*") \
+            .ilike("email", clean_email) \
+            .eq("code_hash", code_hash) \
+            .is_("used_at", "null") \
+            .order("created_at", desc=True) \
+            .limit(1) \
+            .execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not verify reset code: {str(e)}"
+        )
+
+    if not code_res.data:
+        raise HTTPException(status_code=400, detail="Invalid or expired verification code")
+
+    reset_row = code_res.data[0]
+
+    attempts = int(reset_row.get("attempts") or 0)
+
+    if attempts >= 5:
+        raise HTTPException(
+            status_code=400,
+            detail="Too many attempts. Please request a new code."
+        )
+
+    expires_at_raw = reset_row.get("expires_at")
+
+    try:
+        expires_at = datetime.fromisoformat(str(expires_at_raw).replace("Z", "+00:00"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid or expired verification code")
+
+    if expires_at < now:
+        raise HTTPException(status_code=400, detail="Invalid or expired verification code")
+
+    crew_res = supabase.table("crew") \
+        .select("id, email, yacht_id") \
+        .ilike("email", clean_email) \
+        .limit(1) \
+        .execute()
+
+    if not crew_res.data:
+        raise HTTPException(status_code=400, detail="Invalid or expired verification code")
+
+    crew = crew_res.data[0]
+    crew_id = crew["id"]
+
+    try:
+        auth_admin.auth.admin.update_user_by_id(
+            crew_id,
+            {
+                "password": new_password
+            }
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not reset password in Supabase Auth: {str(e)}"
+        )
+
+    try:
+        auth_admin.table("password_reset_codes") \
+            .update({
+                "used_at": now.isoformat(),
+                "attempts": attempts + 1
+            }) \
+            .eq("id", reset_row["id"]) \
+            .execute()
+
+        supabase.table("crew") \
+            .update({
+                "password_updated_at": now.isoformat(),
+                "password_updated_by": crew_id,
+                "password_reset_by_role": "forgot_password",
+                "must_change_password": False
+            }) \
+            .eq("id", crew_id) \
+            .execute()
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Password was reset, but database sync failed: {str(e)}"
+        )
+
+    return {
+        "message": "Password reset successfully. Please log in with your new password."
+    }

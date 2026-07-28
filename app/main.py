@@ -1,12 +1,16 @@
-from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException, Depends
+from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException, Depends, Header
+from fastapi.responses import StreamingResponse, PlainTextResponse
+import io
+from urllib.parse import quote
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
-from app.config import FRONTEND_ORIGINS
+from app.config import FRONTEND_ORIGINS, BUCKET_NAME
 
 from app.auth import get_user
 from app import services
+from app.services import get_asset_for_download
 
 app = FastAPI(title="Yacht Secure Chatbot API")
 
@@ -22,6 +26,7 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
 )
 security = HTTPBearer()
 # ------------------------
@@ -37,11 +42,27 @@ class SignupAdminRequest(BaseModel):
 class AuthorizeAssetRequest(BaseModel):
     crew_id: str
 
+class LoginClientGeo(BaseModel):
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    country: Optional[str] = None
+    region: Optional[str] = None
+    city: Optional[str] = None
+
+
+class LoginClientGeo(BaseModel):
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    accuracy: Optional[float] = None
+    country: Optional[str] = None
+    region: Optional[str] = None
+    city: Optional[str] = None
+
 
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
-
+    client_geo: Optional[LoginClientGeo] = None
 
 class CreateYachtRequest(BaseModel):
     name: str
@@ -78,9 +99,24 @@ class ChatRequest(BaseModel):
     chat_id: Optional[str] = None
     query: Optional[str] = None
     message: Optional[str] = None
+    uploaded_asset_id: Optional[str] = None
 
 class CreateChatRequest(BaseModel):
     title: Optional[str] = "New Chat"
+
+class UpdateChatRequest(BaseModel):
+    title: str
+
+class RenameAssetRequest(BaseModel):
+    name: str
+
+class RenameFolderRequest(BaseModel):
+    name: str
+
+
+class UpdateAssetPermissionsRequest(BaseModel):
+    security_level: int
+    crew_ids: list[str] = []
 
 class AuthorizeDocumentRequest(BaseModel):
     crew_id: str
@@ -107,19 +143,93 @@ class UpdateCrewUserRequest(BaseModel):
 class ResetCrewPasswordRequest(BaseModel):
     password: str
 
+class ResetMyPasswordRequest(BaseModel):
+    password: str
+
 class SeedAssetRequest(BaseModel):
     file_name: str
     content: str
     security_level: int = 1
 
+class MoveAssetRequest(BaseModel):
+    folder_name: Optional[str] = None
+
+class CreateAssetFolderRequest(BaseModel):
+    name: str
+    security_level: int = 1
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+class ConfirmForgotPasswordRequest(BaseModel):
+    email: EmailStr
+    code: str
+    password: str
+
+class CreateApiConnectionRequest(BaseModel):
+    name: str
+    base_url: str
+    auth_type: str = "none"
+    api_key: Optional[str] = None
+    extra_headers: dict = {}
+    security_level: int = 1
+
+class SyncApiConnectionRequest(BaseModel):
+    endpoint_path: Optional[str] = None
+    method: str = "GET"
+    payload: Optional[dict] = None
+    file_name: Optional[str] = None
+    security_level: Optional[int] = None
+
+class DirectApiIngestRequest(BaseModel):
+    source_name: str
+    content: object
+    file_name: Optional[str] = None
+    security_level: int = 1
+
+class ReembedRequest(BaseModel):
+    batch_size: int = 100
+
+
+@app.post("/admin/reembed-asset-chunks")
+async def reembed_asset_chunks_api(
+    body: ReembedRequest,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(
+        user["sub"]
+    )
+
+    if not admin_crew:
+        raise HTTPException(
+            status_code=403,
+            detail="No access"
+        )
+
+    if int(
+        admin_crew["security_level"]
+    ) != 1:
+        raise HTTPException(
+            status_code=403,
+            detail="Only Tier 1 admins can re-embed documents"
+        )
+
+    return services.reembed_all_asset_chunks(
+        admin_crew=admin_crew,
+        batch_size=body.batch_size
+    )
+
 @app.post("/auth/dev-login")
-async def dev_login(body: DevLoginRequest):
+async def dev_login(body: DevLoginRequest, request: Request):
     return services.dev_login(
         email=body.email,
         full_name=body.full_name or "Test Admin",
-        yacht_name=body.yacht_name or "Test Yacht"
+        yacht_name=body.yacht_name or "Test Yacht",
+        request=request
     )
-
 
 @app.get("/health")
 async def health():
@@ -164,18 +274,50 @@ async def dev_create_admin(body: DevCreateAdminRequest):
 # ------------------------
 # AUTH: LOGIN
 # ------------------------
-
 @app.post("/auth/login")
-async def login(body: LoginRequest):
+async def login(body: LoginRequest, request: Request):
     return services.login(
         email=body.email,
-        password=body.password
+        password=body.password,
+        request=request,
+        client_geo=body.client_geo.model_dump() if body.client_geo else None
     )
-
 
 # ------------------------
 # CURRENT USER
 # ------------------------
+
+from app.config import (
+    OPENAI_API_KEY,
+    OPENAI_CHAT_MODEL,
+    OPENAI_VISION_MODEL,
+    OPENAI_EMBEDDING_MODEL,
+    OPENAI_EMBEDDING_DIMENSIONS,
+    OPENAI_TRANSCRIPTION_MODEL
+)
+
+
+@app.get("/debug-ai-config")
+async def debug_ai_config():
+    """
+    Backend-only debugging route.
+
+    This does not return the API key itself.
+    Protect or remove this route in production.
+    """
+
+    return {
+        "provider": "openai",
+        "openai_key_present": bool(
+            OPENAI_API_KEY
+        ),
+        "chat_model": OPENAI_CHAT_MODEL,
+        "vision_model": OPENAI_VISION_MODEL,
+        "embedding_model": OPENAI_EMBEDDING_MODEL,
+        "embedding_dimensions": OPENAI_EMBEDDING_DIMENSIONS,
+        "transcription_model": OPENAI_TRANSCRIPTION_MODEL
+    }
+
 
 @app.get("/me")
 async def me(
@@ -190,6 +332,24 @@ async def me(
         raise HTTPException(status_code=403, detail="No crew profile found")
 
     return crew
+    
+@app.post("/me/reset-password")
+async def reset_my_password_api(
+    body: ResetMyPasswordRequest,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    crew = services.get_crew(user["sub"])
+
+    if not crew:
+        raise HTTPException(status_code=403, detail="No crew profile found")
+
+    return services.reset_my_password(
+        crew=crew,
+        new_password=body.password
+    )
 
 
 # ------------------------
@@ -257,12 +417,13 @@ async def list_crew(request: Request):
     return services.list_crew_for_yacht(admin_crew)
 
 @app.post("/auth/repair-admin-login")
-async def repair_admin_login(body: RepairAdminLoginRequest):
+async def repair_admin_login(body: RepairAdminLoginRequest, request: Request):
     return services.repair_admin_login(
         email=body.email,
         password=body.password,
         full_name=body.full_name,
-        yacht_name=body.yacht_name
+        yacht_name=body.yacht_name,
+        request=request
     )
 
 @app.patch("/crew/{crew_id}")
@@ -380,6 +541,17 @@ async def list_documents_admin(
 
     return services.list_documents_for_admin(admin_crew)
 
+@app.post("/auth/forgot-password")
+async def forgot_password(body: ForgotPasswordRequest):
+    return services.forgot_password(email=body.email)
+
+@app.post("/auth/forgot-password/confirm")
+async def confirm_forgot_password(body: ConfirmForgotPasswordRequest):
+    return services.confirm_forgot_password(
+        email=body.email,
+        code=body.code,
+        new_password=body.password
+    )
 
 # ------------------------
 # LIST MY ACCESSIBLE DOCUMENTS
@@ -398,6 +570,126 @@ async def list_my_documents(
         raise HTTPException(status_code=403, detail="No access")
 
     return services.list_my_documents(crew)
+
+@app.post("/pending-documents")
+async def upload_pending_document_api(
+    request: Request,
+    file: UploadFile = File(...),
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    crew = services.get_crew(user["sub"])
+
+    if not crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    if int(crew["security_level"]) != 1:
+        raise HTTPException(
+            status_code=403,
+            detail="Only Tier 1 admins can upload pending documents"
+        )
+
+    return services.upload_pending_document(
+        file=file.file,
+        filename=file.filename,
+        mime_type=file.content_type,
+        yacht_id=crew["yacht_id"],
+        uploaded_by=crew["id"]
+    )
+
+
+@app.get("/pending-documents/admin")
+async def list_pending_documents_api(
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.list_pending_documents(admin_crew)
+
+
+@app.get("/pending-documents/{pending_document_id}/signed-url")
+async def pending_document_signed_url_api(
+    pending_document_id: str,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.create_pending_document_signed_url(
+        pending_document_id=pending_document_id,
+        admin_crew=admin_crew
+    )
+
+@app.get("/pending-documents/{pending_document_id}/preview")
+async def pending_document_preview_api(
+    pending_document_id: str,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.create_pending_document_preview(
+        pending_document_id=pending_document_id,
+        admin_crew=admin_crew
+    )
+
+@app.get("/pending-documents/{pending_document_id}/download")
+async def download_pending_document_api(
+    pending_document_id: str,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    pending_doc = services.get_pending_document_for_download(
+        pending_document_id=pending_document_id,
+        admin_crew=admin_crew
+    )
+
+    try:
+        file_bytes = services.storage_admin.storage.from_(services.BUCKET_NAME).download(
+            pending_doc["storage_path"]
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not download pending document from storage: {str(e)}"
+        )
+
+    filename = pending_doc.get("original_file_name") or pending_doc.get("file_name") or "pending-document"
+    mime_type = pending_doc.get("mime_type") or "application/octet-stream"
+
+    safe_download_name = quote(filename)
+
+    return StreamingResponse(
+        io.BytesIO(file_bytes),
+        media_type=mime_type,
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{safe_download_name}"
+        }
+    )
 
 
 # ------------------------
@@ -470,6 +762,7 @@ async def upload_asset_api(
     file: UploadFile = File(...),
     chat_id: Optional[str] = Form(None),
     security_level: int = Form(1),
+    folder_name: Optional[str] = Form(None),
     token: HTTPAuthorizationCredentials = Depends(security)
 ):
     user = get_user(request)
@@ -479,13 +772,35 @@ async def upload_asset_api(
     if not crew:
         raise HTTPException(status_code=403, detail="No access")
 
-    if int(crew["security_level"]) != 1:
-        raise HTTPException(
-            status_code=403,
-            detail="Only security level 1 can upload assets"
+    is_chat_upload = bool(chat_id)
+
+    if is_chat_upload:
+        services.verify_chat_access(
+            chat_id=chat_id,
+            crew_id=crew["id"],
+            yacht_id=crew["yacht_id"]
         )
+    else:
+        if int(crew["security_level"]) != 1:
+            raise HTTPException(
+                status_code=403,
+                detail="Only security level 1 can upload yacht documentation"
+            )
 
     try:
+        if is_chat_upload:
+            final_security_level = int(crew["security_level"])
+            final_folder_name = None
+        else:
+            final_security_level = int(security_level)
+            final_folder_name = folder_name
+
+        if final_security_level not in [1, 2, 3, 4]:
+            raise HTTPException(
+                status_code=400,
+                detail="security_level must be 1, 2, 3, or 4"
+            )
+
         return services.upload_asset(
             file=file.file,
             filename=file.filename,
@@ -493,19 +808,27 @@ async def upload_asset_api(
             yacht_id=crew["yacht_id"],
             uploaded_by=crew["id"],
             chat_id=chat_id,
-            security_level=security_level
+            security_level=final_security_level,
+            folder_name=final_folder_name,
+            folder_security_level=None
         )
+
+    except HTTPException:
+        raise
+
     except Exception as e:
         raise HTTPException(
             status_code=500,
             detail=f"Asset upload failed: {type(e).__name__}: {str(e)}"
         )
+        
 @app.post("/assets/batch")
 async def upload_assets_batch_api(
     request: Request,
     files: list[UploadFile] = File(...),
     chat_id: Optional[str] = Form(None),
     security_level: int = Form(1),
+    folder_name: Optional[str] = Form(None),
     token: HTTPAuthorizationCredentials = Depends(security)
 ):
     user = get_user(request)
@@ -515,10 +838,32 @@ async def upload_assets_batch_api(
     if not crew:
         raise HTTPException(status_code=403, detail="No access")
 
-    if crew["security_level"] != 1:
+    is_chat_upload = bool(chat_id)
+
+    if is_chat_upload:
+        services.verify_chat_access(
+            chat_id=chat_id,
+            crew_id=crew["id"],
+            yacht_id=crew["yacht_id"]
+        )
+    else:
+        if int(crew["security_level"]) != 1:
+            raise HTTPException(
+                status_code=403,
+                detail="Only security level 1 can upload yacht documentation"
+            )
+
+    if is_chat_upload:
+        final_security_level = int(crew["security_level"])
+        final_folder_name = None
+    else:
+        final_security_level = int(security_level)
+        final_folder_name = folder_name
+
+    if final_security_level not in [1, 2, 3, 4]:
         raise HTTPException(
-            status_code=403,
-            detail="Only security level 1 can upload assets"
+            status_code=400,
+            detail="security_level must be 1, 2, 3, or 4"
         )
 
     results = []
@@ -531,16 +876,19 @@ async def upload_assets_batch_api(
             yacht_id=crew["yacht_id"],
             uploaded_by=crew["id"],
             chat_id=chat_id,
-            security_level=security_level
+            security_level=final_security_level,
+            folder_name=final_folder_name,
+            folder_security_level=None
         )
         results.append(result)
 
     return {
         "message": "Batch upload completed",
         "count": len(results),
+        "folder_name": folder_name,
+        "security_level": final_security_level,
         "results": results
     }
-
 
 @app.get("/assets/admin")
 async def list_assets_admin(
@@ -569,6 +917,7 @@ async def list_my_assets(
         raise HTTPException(status_code=403, detail="No access")
 
     return services.list_my_assets(crew)
+
 
 @app.get("/assets/{asset_id}/status")
 async def asset_status(
@@ -605,6 +954,220 @@ async def get_asset_signed_url_api(
         asset_id=asset_id,
         crew=crew
     )
+
+@app.get("/assets/{asset_id}/preview")
+async def get_asset_preview_api(
+    asset_id: str,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    crew = services.get_crew(user["sub"])
+
+    if not crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.create_asset_preview(
+        asset_id=asset_id,
+        crew=crew
+    )
+
+@app.get("/assets/{asset_id}/download")
+async def download_asset(
+    asset_id: str,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    crew = services.get_crew(user["sub"])
+
+    if not crew:
+        raise HTTPException(status_code=404, detail="Crew profile not found")
+
+    asset = services.get_asset_for_download(
+        asset_id=asset_id,
+        crew=crew
+    )
+
+    storage_path = asset.get("storage_path")
+
+    if not storage_path:
+        raise HTTPException(
+            status_code=404,
+            detail="This asset has no stored file to download"
+        )
+
+    try:
+        file_bytes = services.storage_admin.storage.from_(services.BUCKET_NAME).download(
+            storage_path
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not download file from storage: {str(e)}"
+        )
+
+    if not file_bytes:
+        raise HTTPException(
+            status_code=404,
+            detail="File not found in storage"
+        )
+
+    filename = (
+        asset.get("original_file_name")
+        or asset.get("file_name")
+        or "download"
+    )
+
+    filename = str(filename).replace("\r", "").replace("\n", "").strip()
+
+    mime_type = asset.get("mime_type") or "application/octet-stream"
+
+    ascii_filename = filename.replace('"', "").replace("\\", "")
+
+    return StreamingResponse(
+        io.BytesIO(file_bytes),
+        media_type=mime_type,
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{ascii_filename}"; '
+                f"filename*=UTF-8''{quote(filename)}"
+            )
+        }
+    )
+
+@app.patch("/assets/{asset_id}/rename")
+async def rename_asset_api(
+    asset_id: str,
+    body: RenameAssetRequest,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.rename_asset(
+        asset_id=asset_id,
+        new_name=body.name,
+        admin_crew=admin_crew
+    )
+
+@app.delete("/assets/{asset_id}")
+async def delete_asset_api(
+    asset_id: str,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.delete_asset(
+        asset_id=asset_id,
+        admin_crew=admin_crew
+    )
+
+@app.patch("/assets/{asset_id}/move")
+async def move_asset_api(
+    asset_id: str,
+    body: MoveAssetRequest,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.move_asset_to_folder(
+        asset_id=asset_id,
+        folder_name=body.folder_name,
+        admin_crew=admin_crew
+    )
+
+@app.post("/assets/folders")
+async def create_asset_folder_api(
+    body: CreateAssetFolderRequest,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.create_asset_folder(
+        folder_name=body.name,
+        security_level=body.security_level,
+        admin_crew=admin_crew
+    )
+
+
+@app.get("/assets/folders/my")
+async def list_my_asset_folders_api(
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    crew = services.get_crew(user["sub"])
+
+    if not crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.list_my_asset_folders(crew)
+
+@app.patch("/assets/folders/{folder_name}/rename")
+async def rename_folder_assets_api(
+    folder_name: str,
+    body: RenameFolderRequest,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.rename_asset_folder(
+        old_folder_name=folder_name,
+        new_folder_name=body.name,
+        admin_crew=admin_crew
+    )
+
+@app.delete("/assets/folders/{folder_name}")
+async def delete_folder_assets_api(
+    folder_name: str,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.delete_folder_assets(
+        folder_name=folder_name,
+        admin_crew=admin_crew
+    )
+
 
 @app.post("/assets/{asset_id}/authorize")
 async def authorize_asset(
@@ -659,6 +1222,153 @@ async def seed_asset_api(
         uploaded_by=crew["id"],
         security_level=body.security_level
     )
+
+@app.get("/assets/{asset_id}/permissions")
+async def get_asset_permissions_api(
+    asset_id: str,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.get_asset_permissions(
+        asset_id=asset_id,
+        admin_crew=admin_crew
+    )
+
+
+@app.put("/assets/{asset_id}/permissions")
+async def update_asset_permissions_api(
+    asset_id: str,
+    body: UpdateAssetPermissionsRequest,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.update_asset_permissions(
+        asset_id=asset_id,
+        security_level=body.security_level,
+        crew_ids=body.crew_ids,
+        admin_crew=admin_crew
+    )
+
+# ------------------------
+# API CONNECTIONS
+# ------------------------
+@app.post("/api-connections")
+async def create_api_connection_api(
+    body: CreateApiConnectionRequest,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.create_api_connection(
+        admin_crew=admin_crew,
+        name=body.name,
+        base_url=body.base_url,
+        auth_type=body.auth_type,
+        api_key=body.api_key,
+        extra_headers=body.extra_headers,
+        security_level=body.security_level
+    )
+
+@app.get("/api-connections")
+async def list_api_connections_api(
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.list_api_connections(admin_crew)
+
+
+@app.delete("/api-connections/{connection_id}")
+async def delete_api_connection_api(
+    connection_id: str,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.delete_api_connection(
+        connection_id=connection_id,
+        admin_crew=admin_crew
+    )
+
+
+@app.post("/api-connections/{connection_id}/sync")
+async def sync_api_connection_api(
+    connection_id: str,
+    body: SyncApiConnectionRequest,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.sync_api_connection(
+        connection_id=connection_id,
+        admin_crew=admin_crew,
+        endpoint_path=body.endpoint_path,
+        method=body.method,
+        payload=body.payload,
+        file_name=body.file_name,
+        security_level=body.security_level
+    )
+
+
+@app.post("/api-ingest")
+async def direct_api_ingest_api(
+    body: DirectApiIngestRequest,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    admin_crew = services.get_crew(user["sub"])
+
+    if not admin_crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.ingest_api_data_directly(
+        admin_crew=admin_crew,
+        source_name=body.source_name,
+        content=body.content,
+        file_name=body.file_name,
+        security_level=body.security_level
+    )
+    
 # ------------------------
 # CHAT
 # ------------------------
@@ -699,6 +1409,47 @@ async def list_my_chats_api(
         yacht_id=crew["yacht_id"]
     )
 
+@app.patch("/chats/{chat_id}")
+async def update_chat_api(
+    chat_id: str,
+    body: UpdateChatRequest,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    crew = services.get_crew(user["sub"])
+
+    if not crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.update_chat_title(
+        chat_id=chat_id,
+        crew_id=crew["id"],
+        yacht_id=crew["yacht_id"],
+        title=body.title
+    )
+
+
+@app.delete("/chats/{chat_id}")
+async def delete_chat_api(
+    chat_id: str,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    user = get_user(request)
+
+    crew = services.get_crew(user["sub"])
+
+    if not crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    return services.delete_chat(
+        chat_id=chat_id,
+        crew_id=crew["id"],
+        yacht_id=crew["yacht_id"]
+    )
+
 
 @app.get("/chats/{chat_id}/messages")
 async def get_chat_messages_api(
@@ -718,11 +1469,98 @@ async def get_chat_messages_api(
         crew_id=crew["id"],
         yacht_id=crew["yacht_id"]
     )
-    
-@app.post("/chat")
-async def chat_api(
-    body: ChatRequest,
+
+@app.get("/webhooks/whatsapp")
+async def verify_whatsapp_webhook(request: Request):
+    mode = request.query_params.get("hub.mode")
+    token = request.query_params.get("hub.verify_token")
+    challenge = request.query_params.get("hub.challenge")
+
+    if mode == "subscribe" and services.verify_whatsapp_webhook_token(token):
+        return PlainTextResponse(challenge or "")
+
+    raise HTTPException(status_code=403, detail="WhatsApp webhook verification failed")
+
+
+@app.post("/webhooks/whatsapp")
+async def receive_whatsapp_webhook(request: Request):
+    payload = await request.json()
+
+    try:
+        return services.handle_whatsapp_webhook_payload(payload)
+
+    except Exception as e:
+        print("WHATSAPP WEBHOOK ERROR:", type(e).__name__, str(e))
+
+        return {
+            "received": True,
+            "saved": 0,
+            "error": type(e).__name__
+        }
+
+@app.post("/whatsapp/connect")
+async def connect_whatsapp_api(
     request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    auth_user = get_user(request)
+    crew = services.get_crew(auth_user["sub"])
+
+    if not crew:
+        raise HTTPException(status_code=403, detail="No access")
+
+    body = await request.json()
+
+    code = body.get("code")
+    waba_id = body.get("waba_id")
+    phone_number_id = body.get("phone_number_id")
+    display_phone_number = body.get("display_phone_number")
+    client_name = body.get("client_name")
+
+    if not phone_number_id:
+        raise HTTPException(status_code=400, detail="phone_number_id is required")
+
+    crew_id = crew["id"]
+    yacht_id = crew.get("yacht_id")
+
+    if not yacht_id:
+        raise HTTPException(status_code=400, detail="No yacht_id found for user")
+
+    access_token = body.get("access_token")
+
+    if code and not access_token:
+        token_result = services.exchange_whatsapp_code_for_token(code)
+        access_token = token_result.get("access_token")
+
+    if not access_token:
+        raise HTTPException(status_code=400, detail="Meta access token or code is required")
+
+    connection = services.save_client_whatsapp_connection(
+        yacht_id=yacht_id,
+        crew_id=crew_id,
+        client_name=client_name,
+        waba_id=waba_id,
+        phone_number_id=phone_number_id,
+        display_phone_number=display_phone_number,
+        access_token=access_token
+    )
+
+    return {
+        "ok": True,
+        "connection": {
+            "id": connection["id"],
+            "phone_number_id": connection["phone_number_id"],
+            "display_phone_number": connection.get("display_phone_number"),
+            "client_name": connection.get("client_name"),
+            "is_active": connection.get("is_active")
+        }
+    }
+
+@app.post("/voice-notes")
+async def voice_note_api(
+    request: Request,
+    file: UploadFile = File(...),
+    chat_id: str = Form(...),
     token: HTTPAuthorizationCredentials = Depends(security)
 ):
     user = get_user(request)
@@ -730,6 +1568,54 @@ async def chat_api(
     crew = services.get_crew(user["sub"])
 
     if not crew:
+        raise HTTPException(
+            status_code=403,
+            detail="No access"
+        )
+
+    if not chat_id:
+        raise HTTPException(
+            status_code=422,
+            detail="Missing chat_id"
+        )
+
+    services.verify_chat_access(
+        chat_id=chat_id,
+        crew_id=crew["id"],
+        yacht_id=crew["yacht_id"]
+    )
+
+    filename = file.filename or "voice-note.webm"
+    mime_type = file.content_type or "audio/webm"
+
+    return services.create_voice_note_and_answer(
+        file=file.file,
+        filename=filename,
+        mime_type=mime_type,
+        crew=crew,
+        chat_id=chat_id
+    )
+
+@app.post("/chat")
+async def chat_api(
+    body: ChatRequest,
+    request: Request,
+    token: HTTPAuthorizationCredentials = Depends(security)
+):
+    print("CHAT DEBUG: /chat endpoint hit")
+    print("CHAT DEBUG: authorization header present:", bool(request.headers.get("Authorization")))
+
+    try:
+        user = get_user(request)
+        print("CHAT DEBUG: user verified:", user.get("sub"))
+    except Exception as e:
+        print("CHAT DEBUG: get_user failed:", type(e).__name__, str(e))
+        raise
+
+    crew = services.get_crew(user["sub"])
+
+    if not crew:
+        print("CHAT DEBUG: no crew profile found for:", user["sub"])
         raise HTTPException(status_code=403, detail="No access")
 
     query = body.query or body.message
@@ -740,10 +1626,18 @@ async def chat_api(
     if not body.chat_id:
         raise HTTPException(status_code=422, detail="Missing chat_id")
 
+    print("CHAT DEBUG: using local Supabase asset search")
+    print("CHAT DEBUG: chat_id:", body.chat_id)
+    print("CHAT DEBUG: crew_id:", crew["id"])
+    print("CHAT DEBUG: yacht_id:", crew["yacht_id"])
+    print("CHAT DEBUG: security_level:", crew["security_level"])
+    print("CHAT DEBUG: query:", query)
+
     return services.chat(
         query=query,
         crew_id=crew["id"],
         yacht_id=crew["yacht_id"],
         security_level=crew["security_level"],
-        chat_id=body.chat_id
+        chat_id=body.chat_id,
+        uploaded_asset_id=body.uploaded_asset_id
     )
