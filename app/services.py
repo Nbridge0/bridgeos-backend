@@ -2,34 +2,46 @@ from fastapi import HTTPException
 
 from app.database import supabase
 from app.embeddings import embed
-from app.config import BUCKET_NAME
+from app.config import (
+    BUCKET_NAME,
+    SUPABASE_JWT_SECRET,
+    SUPABASE_URL,
+    SUPABASE_SERVICE_KEY,
+)
 from app.llm import ask_llm, FALLBACK_NO_DATA_ANSWER
-from app.file_utils import detect_file_type, calculate_file_hash, safe_filename
+from app.file_utils import (
+    detect_file_type,
+    calculate_file_hash,
+    safe_filename,
+)
 from app.metadata_utils import (
     extract_date_from_filename,
     extract_year_from_text,
     detect_event,
     generate_basic_tags,
-    extract_query_filters
+    extract_query_filters,
 )
 from app.extractors import (
-    chunk_text,
-    extract_text_by_file_type
+    extract_text_by_file_type,
 )
 from app.image_ai import (
     describe_image,
-    extract_ocr_from_image
+    extract_ocr_from_image,
 )
-
 
 import time
 import uuid
 import jwt as pyjwt
 
-from app.config import SUPABASE_JWT_SECRET, SUPABASE_URL, SUPABASE_SERVICE_KEY
 from supabase import create_client
 
-auth_admin = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+
+auth_admin = create_client(
+    SUPABASE_URL,
+    SUPABASE_SERVICE_KEY,
+)
+
+
 # ------------------------
 # YACHT
 # ------------------------
@@ -37,30 +49,34 @@ auth_admin = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 def create_yacht(user_id: str, name: str):
     return supabase.table("yachts").insert({
         "name": name,
-        "owner_id": user_id
+        "owner_id": user_id,
     }).execute()
 
 
 # ------------------------
 # AUTH / ACCOUNTS
 # ------------------------
-def signup_admin(email: str, password: str, full_name: str, yacht_name: str):
+
+def signup_admin(
+    email: str,
+    password: str,
+    full_name: str,
+    yacht_name: str,
+):
     """
-    Creates the MAIN admin account using normal Supabase signup:
+    Creates the MAIN admin account using Supabase Admin Auth:
     1. Supabase Auth user
     2. Yacht row
     3. Crew profile with security_level = 1
-
-    This avoids supabase.auth.admin.create_user(), which can fail with:
-    'User not allowed'
     """
 
     try:
         auth_res = auth_admin.auth.admin.create_user({
             "email": email,
             "password": password,
-            "email_confirm": True
+            "email_confirm": True,
         })
+
     except Exception as e:
         error_text = str(e)
 
@@ -71,27 +87,35 @@ def signup_admin(email: str, password: str, full_name: str, yacht_name: str):
         ):
             raise HTTPException(
                 status_code=409,
-                detail="This email already exists. Try logging in or use another email."
+                detail=(
+                    "This email already exists. "
+                    "Try logging in or use another email."
+                ),
             )
 
         raise HTTPException(
             status_code=400,
-            detail=f"Could not create Supabase Auth user: {error_text}"
+            detail=(
+                "Could not create Supabase Auth user: "
+                f"{error_text}"
+            ),
         )
 
     if not auth_res.user:
         raise HTTPException(
             status_code=400,
-            detail="Supabase did not return a user."
+            detail="Supabase did not return a user.",
         )
 
     user_id = auth_res.user.id
 
     try:
-        existing_crew = supabase.table("crew") \
-            .select("*") \
-            .eq("id", user_id) \
+        existing_crew = (
+            supabase.table("crew")
+            .select("*")
+            .eq("id", user_id)
             .execute()
+        )
 
         if existing_crew.data:
             return {
@@ -99,26 +123,31 @@ def signup_admin(email: str, password: str, full_name: str, yacht_name: str):
                 "account_type": "main_admin",
                 "email": email,
                 "user_id": user_id,
-                "crew": existing_crew.data[0]
+                "crew": existing_crew.data[0],
             }
+
     except Exception:
         pass
 
     try:
         yacht_res = supabase.table("yachts").insert({
             "name": yacht_name,
-            "owner_id": user_id
+            "owner_id": user_id,
         }).execute()
+
     except Exception as e:
         raise HTTPException(
             status_code=400,
-            detail=f"Could not create yacht row: {str(e)}"
+            detail=f"Could not create yacht row: {str(e)}",
         )
 
     if not yacht_res.data:
         raise HTTPException(
             status_code=400,
-            detail="Could not create yacht row. Supabase returned no data."
+            detail=(
+                "Could not create yacht row. "
+                "Supabase returned no data."
+            ),
         )
 
     yacht = yacht_res.data[0]
@@ -130,18 +159,25 @@ def signup_admin(email: str, password: str, full_name: str, yacht_name: str):
             "full_name": full_name,
             "yacht_id": yacht["id"],
             "security_level": 1,
-            "created_by": user_id
+            "created_by": user_id,
         }).execute()
+
     except Exception as e:
         raise HTTPException(
             status_code=400,
-            detail=f"Could not create admin crew profile: {str(e)}"
+            detail=(
+                "Could not create admin crew profile: "
+                f"{str(e)}"
+            ),
         )
 
     if not crew_res.data:
         raise HTTPException(
             status_code=400,
-            detail="Could not create admin crew profile. Supabase returned no data."
+            detail=(
+                "Could not create admin crew profile. "
+                "Supabase returned no data."
+            ),
         )
 
     return {
@@ -150,10 +186,16 @@ def signup_admin(email: str, password: str, full_name: str, yacht_name: str):
         "email": email,
         "user_id": user_id,
         "yacht": yacht,
-        "crew": crew_res.data[0]
+        "crew": crew_res.data[0],
     }
-    
-def dev_create_admin(email: str, password: str, full_name: str, yacht_name: str):
+
+
+def dev_create_admin(
+    email: str,
+    password: str,
+    full_name: str,
+    yacht_name: str,
+):
     """
     DEV ONLY.
 
@@ -164,40 +206,54 @@ def dev_create_admin(email: str, password: str, full_name: str, yacht_name: str)
     """
 
     try:
-        auth_res = supabase.auth.admin.create_user({
+        auth_res = auth_admin.auth.admin.create_user({
             "email": email,
             "password": password,
-            "email_confirm": True
+            "email_confirm": True,
         })
+
     except Exception as e:
         error_text = str(e)
 
-        if "already been registered" in error_text or "already exists" in error_text:
+        if (
+            "already been registered" in error_text
+            or "already exists" in error_text
+        ):
             raise HTTPException(
                 status_code=409,
                 detail=(
                     "This email already exists in Supabase Auth. "
-                    "Use a new email or delete this user from Supabase Auth first."
-                )
+                    "Use a new email or delete this user from "
+                    "Supabase Auth first."
+                ),
             )
 
         raise HTTPException(
             status_code=500,
-            detail=f"Could not create Supabase Auth user: {error_text}"
+            detail=(
+                "Could not create Supabase Auth user: "
+                f"{error_text}"
+            ),
         )
 
     if not auth_res.user:
-        raise HTTPException(status_code=500, detail="Supabase did not return a user")
+        raise HTTPException(
+            status_code=500,
+            detail="Supabase did not return a user",
+        )
 
     user_id = auth_res.user.id
 
     yacht_res = supabase.table("yachts").insert({
         "name": yacht_name,
-        "owner_id": user_id
+        "owner_id": user_id,
     }).execute()
 
     if not yacht_res.data:
-        raise HTTPException(status_code=500, detail="Could not create yacht row")
+        raise HTTPException(
+            status_code=500,
+            detail="Could not create yacht row",
+        )
 
     yacht = yacht_res.data[0]
 
@@ -207,11 +263,14 @@ def dev_create_admin(email: str, password: str, full_name: str, yacht_name: str)
         "full_name": full_name,
         "yacht_id": yacht["id"],
         "security_level": 1,
-        "created_by": user_id
+        "created_by": user_id,
     }).execute()
 
     if not crew_res.data:
-        raise HTTPException(status_code=500, detail="Could not create crew row")
+        raise HTTPException(
+            status_code=500,
+            detail="Could not create crew row",
+        )
 
     return {
         "message": "Dev admin created successfully",
@@ -219,7 +278,7 @@ def dev_create_admin(email: str, password: str, full_name: str, yacht_name: str)
         "password": password,
         "user_id": user_id,
         "yacht": yacht,
-        "crew": crew_res.data[0]
+        "crew": crew_res.data[0],
     }
 
 
@@ -231,22 +290,32 @@ def login(email: str, password: str):
     try:
         auth_res = supabase.auth.sign_in_with_password({
             "email": email,
-            "password": password
+            "password": password,
         })
+
     except Exception as e:
         raise HTTPException(
             status_code=401,
-            detail=f"Supabase login failed: {str(e)}"
+            detail=f"Supabase login failed: {str(e)}",
         )
 
     if not auth_res:
-        raise HTTPException(status_code=401, detail="No login response from Supabase")
+        raise HTTPException(
+            status_code=401,
+            detail="No login response from Supabase",
+        )
 
     if not getattr(auth_res, "session", None):
-        raise HTTPException(status_code=401, detail="No session returned from Supabase")
+        raise HTTPException(
+            status_code=401,
+            detail="No session returned from Supabase",
+        )
 
     if not auth_res.session.access_token:
-        raise HTTPException(status_code=401, detail="No access token returned from Supabase")
+        raise HTTPException(
+            status_code=401,
+            detail="No access token returned from Supabase",
+        )
 
     return {
         "access_token": auth_res.session.access_token,
@@ -254,16 +323,25 @@ def login(email: str, password: str):
         "token_type": "bearer",
         "user": {
             "id": auth_res.user.id if auth_res.user else None,
-            "email": auth_res.user.email if auth_res.user else email
-        }
+            "email": (
+                auth_res.user.email
+                if auth_res.user
+                else email
+            ),
+        },
     }
 
-def dev_login(email: str, full_name: str = "Test Admin", yacht_name: str = "Test Yacht"):
+
+def dev_login(
+    email: str,
+    full_name: str = "Test Admin",
+    yacht_name: str = "Test Yacht",
+):
     """
     DEV LOGIN ONLY.
 
     This bypasses Supabase Auth.
-    It creates/repairs:
+    It creates or repairs:
     - yacht
     - crew profile
     - JWT token your own auth.py can read
@@ -271,32 +349,46 @@ def dev_login(email: str, full_name: str = "Test Admin", yacht_name: str = "Test
     Remove this before production.
     """
 
-    user_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, email.lower().strip()))
+    user_id = str(
+        uuid.uuid5(
+            uuid.NAMESPACE_DNS,
+            email.lower().strip(),
+        )
+    )
 
-    crew_res = supabase.table("crew") \
-        .select("*") \
-        .eq("id", user_id) \
+    crew_res = (
+        supabase.table("crew")
+        .select("*")
+        .eq("id", user_id)
         .execute()
+    )
 
     if crew_res.data:
         crew = crew_res.data[0]
+
     else:
-        yacht_res = supabase.table("yachts") \
-            .select("*") \
-            .eq("name", yacht_name) \
-            .limit(1) \
+        yacht_res = (
+            supabase.table("yachts")
+            .select("*")
+            .eq("name", yacht_name)
+            .limit(1)
             .execute()
+        )
 
         if yacht_res.data:
             yacht = yacht_res.data[0]
+
         else:
             yacht_insert = supabase.table("yachts").insert({
                 "name": yacht_name,
-                "owner_id": user_id
+                "owner_id": user_id,
             }).execute()
 
             if not yacht_insert.data:
-                raise HTTPException(status_code=500, detail="Could not create yacht")
+                raise HTTPException(
+                    status_code=500,
+                    detail="Could not create yacht",
+                )
 
             yacht = yacht_insert.data[0]
 
@@ -306,11 +398,14 @@ def dev_login(email: str, full_name: str = "Test Admin", yacht_name: str = "Test
             "full_name": full_name,
             "yacht_id": yacht["id"],
             "security_level": 1,
-            "created_by": user_id
+            "created_by": user_id,
         }).execute()
 
         if not crew_insert.data:
-            raise HTTPException(status_code=500, detail="Could not create crew profile")
+            raise HTTPException(
+                status_code=500,
+                detail="Could not create crew profile",
+            )
 
         crew = crew_insert.data[0]
 
@@ -323,10 +418,10 @@ def dev_login(email: str, full_name: str = "Test Admin", yacht_name: str = "Test
             "aud": "authenticated",
             "role": "authenticated",
             "iat": now,
-            "exp": now + 60 * 60 * 24 * 30
+            "exp": now + 60 * 60 * 24 * 30,
         },
         SUPABASE_JWT_SECRET,
-        algorithm="HS256"
+        algorithm="HS256",
     )
 
     return {
@@ -335,29 +430,35 @@ def dev_login(email: str, full_name: str = "Test Admin", yacht_name: str = "Test
         "token_type": "bearer",
         "user": {
             "id": user_id,
-            "email": email
+            "email": email,
         },
-        "crew": crew
+        "crew": crew,
     }
+
 
 # ------------------------
 # CREW
 # ------------------------
+
 def get_crew(user_id: str):
-    crew_res = supabase.table("crew") \
-        .select("*") \
-        .eq("id", user_id) \
+    crew_res = (
+        supabase.table("crew")
+        .select("*")
+        .eq("id", user_id)
         .execute()
+    )
 
     if not crew_res.data:
         return None
 
     crew = crew_res.data[0]
 
-    yacht_res = supabase.table("yachts") \
-        .select("name") \
-        .eq("id", crew["yacht_id"]) \
+    yacht_res = (
+        supabase.table("yachts")
+        .select("name")
+        .eq("id", crew["yacht_id"])
         .execute()
+    )
 
     crew["yacht_name"] = None
 
@@ -366,63 +467,83 @@ def get_crew(user_id: str):
 
     return crew
 
-def create_chat(crew_id: str, yacht_id: str, title: str = "New Chat"):
+
+def create_chat(
+    crew_id: str,
+    yacht_id: str,
+    title: str = "New Chat",
+):
     """
     Creates a private chat owned by this exact crew member.
-    Even if two users have the same yacht_id, they get separate chats.
     """
 
     res = supabase.table("chats").insert({
         "crew_id": crew_id,
         "yacht_id": yacht_id,
-        "title": title or "New Chat"
+        "title": title or "New Chat",
     }).execute()
 
     if not res.data:
-        raise HTTPException(status_code=500, detail="Could not create chat")
+        raise HTTPException(
+            status_code=500,
+            detail="Could not create chat",
+        )
 
-    chat = res.data[0]
+    chat_row = res.data[0]
 
     return {
-        "chat_id": chat["id"],
-        "chat": chat
+        "chat_id": chat_row["id"],
+        "chat": chat_row,
     }
 
 
 def list_my_chats(crew_id: str, yacht_id: str):
     """
     Lists only chats owned by this logged-in crew member.
-    Same yacht users cannot see each other's chats.
     """
 
-    return supabase.table("chats") \
-        .select("*") \
-        .eq("crew_id", crew_id) \
-        .eq("yacht_id", yacht_id) \
-        .order("updated_at", desc=True) \
+    return (
+        supabase.table("chats")
+        .select("*")
+        .eq("crew_id", crew_id)
+        .eq("yacht_id", yacht_id)
+        .order("updated_at", desc=True)
         .execute()
+    )
 
 
-def verify_chat_access(chat_id: str, crew_id: str, yacht_id: str):
+def verify_chat_access(
+    chat_id: str,
+    crew_id: str,
+    yacht_id: str,
+):
     """
     Blocks access unless the chat belongs to this exact crew member.
-    This is the main privacy check.
     """
 
-    res = supabase.table("chats") \
-        .select("*") \
-        .eq("id", chat_id) \
-        .eq("crew_id", crew_id) \
-        .eq("yacht_id", yacht_id) \
+    res = (
+        supabase.table("chats")
+        .select("*")
+        .eq("id", chat_id)
+        .eq("crew_id", crew_id)
+        .eq("yacht_id", yacht_id)
         .execute()
+    )
 
     if not res.data:
-        raise HTTPException(status_code=403, detail="Chat not found or not yours")
+        raise HTTPException(
+            status_code=403,
+            detail="Chat not found or not yours",
+        )
 
     return res.data[0]
 
 
-def get_chat_messages(chat_id: str, crew_id: str, yacht_id: str):
+def get_chat_messages(
+    chat_id: str,
+    crew_id: str,
+    yacht_id: str,
+):
     """
     Loads saved messages only if this chat belongs to this crew member.
     """
@@ -430,88 +551,105 @@ def get_chat_messages(chat_id: str, crew_id: str, yacht_id: str):
     verify_chat_access(
         chat_id=chat_id,
         crew_id=crew_id,
-        yacht_id=yacht_id
+        yacht_id=yacht_id,
     )
 
-    return supabase.table("messages") \
-        .select("*") \
-        .eq("chat_id", chat_id) \
-        .eq("crew_id", crew_id) \
-        .eq("yacht_id", yacht_id) \
-        .order("created_at") \
+    return (
+        supabase.table("messages")
+        .select("*")
+        .eq("chat_id", chat_id)
+        .eq("crew_id", crew_id)
+        .eq("yacht_id", yacht_id)
+        .order("created_at")
         .execute()
+    )
 
-def repair_admin_login(email: str, password: str, full_name: str, yacht_name: str):
+
+def repair_admin_login(
+    email: str,
+    password: str,
+    full_name: str,
+    yacht_name: str,
+):
     """
     TEMP SETUP / REPAIR LOGIN.
 
     Use when Supabase Auth user exists, but crew/yacht rows are missing.
-
-    It:
-    1. Logs in with Supabase Auth
-    2. Gets the real Supabase user id
-    3. Creates or reuses yacht
-    4. Creates or repairs crew profile with security_level = 1
-    5. Returns the normal Supabase access token
-
-    Remove or protect this route after setup.
     """
 
     try:
         auth_res = supabase.auth.sign_in_with_password({
             "email": email,
-            "password": password
+            "password": password,
         })
+
     except Exception as e:
         raise HTTPException(
             status_code=401,
-            detail=f"Supabase login failed: {str(e)}"
+            detail=f"Supabase login failed: {str(e)}",
         )
 
     if not auth_res or not getattr(auth_res, "session", None):
-        raise HTTPException(status_code=401, detail="No Supabase session returned")
+        raise HTTPException(
+            status_code=401,
+            detail="No Supabase session returned",
+        )
 
     if not auth_res.user:
-        raise HTTPException(status_code=401, detail="No Supabase user returned")
+        raise HTTPException(
+            status_code=401,
+            detail="No Supabase user returned",
+        )
 
     user_id = auth_res.user.id
 
-    crew_res = supabase.table("crew") \
-        .select("*") \
-        .eq("id", user_id) \
+    crew_res = (
+        supabase.table("crew")
+        .select("*")
+        .eq("id", user_id)
         .execute()
+    )
 
     if crew_res.data:
         crew = crew_res.data[0]
 
         return {
-            "message": "Login successful. Crew profile already exists.",
+            "message": (
+                "Login successful. "
+                "Crew profile already exists."
+            ),
             "access_token": auth_res.session.access_token,
             "refresh_token": auth_res.session.refresh_token,
             "token_type": "bearer",
             "user": {
                 "id": user_id,
-                "email": auth_res.user.email or email
+                "email": auth_res.user.email or email,
             },
-            "crew": crew
+            "crew": crew,
         }
 
-    yacht_res = supabase.table("yachts") \
-        .select("*") \
-        .eq("owner_id", user_id) \
-        .limit(1) \
+    yacht_res = (
+        supabase.table("yachts")
+        .select("*")
+        .eq("owner_id", user_id)
+        .limit(1)
         .execute()
+    )
 
     if yacht_res.data:
         yacht = yacht_res.data[0]
+
     else:
         yacht_insert = supabase.table("yachts").insert({
             "name": yacht_name,
-            "owner_id": user_id
+            "owner_id": user_id,
         }).execute()
 
         if not yacht_insert.data:
-            raise HTTPException(status_code=500, detail="Could not create yacht row")
+            raise HTTPException(
+                status_code=500,
+                detail="Could not create yacht row",
+            )
 
         yacht = yacht_insert.data[0]
 
@@ -521,30 +659,35 @@ def repair_admin_login(email: str, password: str, full_name: str, yacht_name: st
         "full_name": full_name,
         "yacht_id": yacht["id"],
         "security_level": 1,
-        "created_by": user_id
+        "created_by": user_id,
     }).execute()
 
     if not crew_insert.data:
-        raise HTTPException(status_code=500, detail="Could not create crew row")
+        raise HTTPException(
+            status_code=500,
+            detail="Could not create crew row",
+        )
 
     return {
-        "message": "Login successful. Admin crew profile repaired.",
+        "message": (
+            "Login successful. "
+            "Admin crew profile repaired."
+        ),
         "access_token": auth_res.session.access_token,
         "refresh_token": auth_res.session.refresh_token,
         "token_type": "bearer",
         "user": {
             "id": user_id,
-            "email": auth_res.user.email or email
+            "email": auth_res.user.email or email,
         },
         "crew": crew_insert.data[0],
-        "yacht": yacht
+        "yacht": yacht,
     }
 
 
 def create_crew(data: dict):
     """
     Basic direct crew creation.
-    You may not need this after using create_crew_user().
     """
 
     return supabase.table("crew").insert(data).execute()
@@ -557,21 +700,19 @@ def create_crew_user(
     full_name: str,
     security_level: int,
     position: str | None = None,
-    phone_number: str | None = None
+    phone_number: str | None = None,
 ):
     """
     MAIN account creates SUB accounts under the SAME yacht.
-
-    MAIN decides security_level:
-    1 = can access all yacht assets/docs
-    2 = limited, only explicitly granted assets/docs
-    3 = limited, only explicitly granted assets/docs
     """
 
     if int(admin_crew["security_level"]) != 1:
         raise HTTPException(
             status_code=403,
-            detail="Only security level 1 main accounts can create sub accounts"
+            detail=(
+                "Only security level 1 main accounts "
+                "can create sub accounts"
+            ),
         )
 
     security_level = int(security_level)
@@ -579,25 +720,33 @@ def create_crew_user(
     if security_level not in [1, 2, 3]:
         raise HTTPException(
             status_code=400,
-            detail="security_level must be 1, 2, or 3"
+            detail="security_level must be 1, 2, or 3",
         )
 
     try:
         auth_res = auth_admin.auth.admin.create_user({
             "email": email,
             "password": password,
-            "email_confirm": True
+            "email_confirm": True,
         })
+
     except Exception as e:
         raise HTTPException(
             status_code=400,
-            detail=f"Could not create Supabase Auth user: {str(e)}"
+            detail=(
+                "Could not create Supabase Auth user: "
+                f"{str(e)}"
+            ),
         )
 
     if not auth_res.user:
-        raise HTTPException(status_code=400, detail="Could not create Supabase Auth user")
+        raise HTTPException(
+            status_code=400,
+            detail="Could not create Supabase Auth user",
+        )
 
     user_id = auth_res.user.id
+
     try:
         crew_res = supabase.table("crew").insert({
             "id": user_id,
@@ -607,16 +756,23 @@ def create_crew_user(
             "security_level": security_level,
             "position": position,
             "phone_number": phone_number,
-            "created_by": admin_crew["id"]
+            "created_by": admin_crew["id"],
         }).execute()
+
     except Exception as e:
         raise HTTPException(
             status_code=400,
-            detail=f"Could not create crew profile: {str(e)}"
+            detail=(
+                "Could not create crew profile: "
+                f"{str(e)}"
+            ),
         )
 
     if not crew_res.data:
-        raise HTTPException(status_code=400, detail="Could not create crew profile")
+        raise HTTPException(
+            status_code=400,
+            detail="Could not create crew profile",
+        )
 
     return {
         "message": "Sub account created successfully",
@@ -625,40 +781,53 @@ def create_crew_user(
         "yacht_id": admin_crew["yacht_id"],
         "sub_user_id": user_id,
         "sub_security_level": security_level,
-        "crew": crew_res.data[0]
+        "crew": crew_res.data[0],
     }
+
+
 def list_crew_for_yacht(admin_crew: dict):
     """
     Admin can see all crew for their yacht.
     """
 
-    if admin_crew["security_level"] != 1:
-        raise HTTPException(status_code=403, detail="Only security level 1 can list crew")
+    if int(admin_crew["security_level"]) != 1:
+        raise HTTPException(
+            status_code=403,
+            detail="Only security level 1 can list crew",
+        )
 
-    return supabase.table("crew") \
-        .select("*") \
-        .eq("yacht_id", admin_crew["yacht_id"]) \
+    return (
+        supabase.table("crew")
+        .select("*")
+        .eq("yacht_id", admin_crew["yacht_id"])
         .execute()
+    )
+
 
 def _require_admin_level_1(admin_crew: dict):
     if int(admin_crew["security_level"]) != 1:
         raise HTTPException(
             status_code=403,
-            detail="Only Tier 1 admins can manage users"
+            detail="Only Tier 1 admins can manage users",
         )
 
 
-def _get_target_crew_for_admin(admin_crew: dict, target_crew_id: str):
-    target_res = supabase.table("crew") \
-        .select("*") \
-        .eq("id", target_crew_id) \
-        .eq("yacht_id", admin_crew["yacht_id"]) \
+def _get_target_crew_for_admin(
+    admin_crew: dict,
+    target_crew_id: str,
+):
+    target_res = (
+        supabase.table("crew")
+        .select("*")
+        .eq("id", target_crew_id)
+        .eq("yacht_id", admin_crew["yacht_id"])
         .execute()
+    )
 
     if not target_res.data:
         raise HTTPException(
             status_code=404,
-            detail="Crew member not found for this yacht"
+            detail="Crew member not found for this yacht",
         )
 
     return target_res.data[0]
@@ -671,18 +840,17 @@ def update_crew_user(
     full_name: str | None = None,
     security_level: int | None = None,
     position: str | None = None,
-    phone_number: str | None = None
+    phone_number: str | None = None,
 ):
     """
     Tier 1 admin updates a crew user's profile.
-    Also updates Supabase Auth email if email is changed.
     """
 
     _require_admin_level_1(admin_crew)
 
     target_crew = _get_target_crew_for_admin(
         admin_crew=admin_crew,
-        target_crew_id=target_crew_id
+        target_crew_id=target_crew_id,
     )
 
     updates = {}
@@ -699,7 +867,7 @@ def update_crew_user(
         if security_level not in [1, 2, 3]:
             raise HTTPException(
                 status_code=400,
-                detail="security_level must be 1, 2, or 3"
+                detail="security_level must be 1, 2, or 3",
             )
 
         updates["security_level"] = security_level
@@ -713,52 +881,62 @@ def update_crew_user(
     if not updates:
         return {
             "message": "No changes provided",
-            "crew": target_crew
+            "crew": target_crew,
         }
 
     if email is not None:
         try:
-            supabase.auth.admin.update_user_by_id(
+            auth_admin.auth.admin.update_user_by_id(
                 target_crew_id,
                 {
                     "email": email,
-                    "email_confirm": True
-                }
+                    "email_confirm": True,
+                },
             )
+
         except Exception as e:
             raise HTTPException(
                 status_code=400,
-                detail=f"Could not update Supabase Auth email: {str(e)}"
+                detail=(
+                    "Could not update Supabase Auth email: "
+                    f"{str(e)}"
+                ),
             )
 
     try:
-        crew_res = supabase.table("crew") \
-            .update(updates) \
-            .eq("id", target_crew_id) \
-            .eq("yacht_id", admin_crew["yacht_id"]) \
+        crew_res = (
+            supabase.table("crew")
+            .update(updates)
+            .eq("id", target_crew_id)
+            .eq("yacht_id", admin_crew["yacht_id"])
             .execute()
+        )
+
     except Exception as e:
         raise HTTPException(
             status_code=400,
-            detail=f"Could not update crew profile: {str(e)}"
+            detail=(
+                "Could not update crew profile: "
+                f"{str(e)}"
+            ),
         )
 
     if not crew_res.data:
         raise HTTPException(
             status_code=400,
-            detail="Could not update crew profile"
+            detail="Could not update crew profile",
         )
 
     return {
         "message": "User updated successfully",
-        "crew": crew_res.data[0]
+        "crew": crew_res.data[0],
     }
 
 
 def reset_crew_password(
     admin_crew: dict,
     target_crew_id: str,
-    new_password: str
+    new_password: str,
 ):
     """
     Tier 1 admin resets a crew user's Supabase Auth password.
@@ -768,43 +946,40 @@ def reset_crew_password(
 
     _get_target_crew_for_admin(
         admin_crew=admin_crew,
-        target_crew_id=target_crew_id
+        target_crew_id=target_crew_id,
     )
 
     if not new_password or len(new_password) < 8:
         raise HTTPException(
             status_code=400,
-            detail="Password must be at least 8 characters"
+            detail="Password must be at least 8 characters",
         )
 
     try:
-        supabase.auth.admin.update_user_by_id(
+        auth_admin.auth.admin.update_user_by_id(
             target_crew_id,
             {
-                "password": new_password
-            }
+                "password": new_password,
+            },
         )
+
     except Exception as e:
         raise HTTPException(
             status_code=400,
-            detail=f"Could not reset password: {str(e)}"
+            detail=f"Could not reset password: {str(e)}",
         )
 
     return {
-        "message": "Password reset successfully"
+        "message": "Password reset successfully",
     }
 
 
 def delete_crew_user(
     admin_crew: dict,
-    target_crew_id: str
+    target_crew_id: str,
 ):
     """
-    Tier 1 admin deletes a crew user from:
-    1. crew table
-    2. Supabase Auth
-
-    Admin cannot delete themselves.
+    Tier 1 admin deletes a crew user from the crew table and Auth.
     """
 
     _require_admin_level_1(admin_crew)
@@ -812,252 +987,390 @@ def delete_crew_user(
     if target_crew_id == admin_crew["id"]:
         raise HTTPException(
             status_code=400,
-            detail="You cannot delete your own admin account"
+            detail="You cannot delete your own admin account",
         )
 
     target_crew = _get_target_crew_for_admin(
         admin_crew=admin_crew,
-        target_crew_id=target_crew_id
+        target_crew_id=target_crew_id,
     )
 
     try:
-        supabase.table("crew") \
-            .delete() \
-            .eq("id", target_crew_id) \
-            .eq("yacht_id", admin_crew["yacht_id"]) \
+        (
+            supabase.table("crew")
+            .delete()
+            .eq("id", target_crew_id)
+            .eq("yacht_id", admin_crew["yacht_id"])
             .execute()
-    except Exception as e:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Could not delete crew profile: {str(e)}"
         )
 
-    try:
-        supabase.auth.admin.delete_user(target_crew_id)
     except Exception as e:
         raise HTTPException(
             status_code=400,
             detail=(
-                "Crew profile was deleted, but Supabase Auth user could not be deleted: "
+                "Could not delete crew profile: "
                 f"{str(e)}"
-            )
+            ),
+        )
+
+    try:
+        auth_admin.auth.admin.delete_user(target_crew_id)
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Crew profile was deleted, but Supabase Auth "
+                "user could not be deleted: "
+                f"{str(e)}"
+            ),
         )
 
     return {
         "message": "User deleted successfully",
         "deleted_user": {
             "id": target_crew_id,
-            "email": target_crew.get("email")
-        }
+            "email": target_crew.get("email"),
+        },
     }
 
-def get_accessible_asset_ids(crew_id: str, yacht_id: str, security_level: int):
-    """
-    Level 1:
-        Can access all assets for the yacht.
 
-    Level 2 and 3:
-        Can only access assets explicitly granted in asset_access.
+# ------------------------
+# ASSET ACCESS
+# ------------------------
+
+def get_accessible_asset_ids(
+    crew_id: str,
+    yacht_id: str,
+    security_level: int,
+):
+    """
+    File security model:
+
+    User Tier 1:
+        Can access files with security_level 1, 2, or 3.
+
+    User Tier 2:
+        Can access files with security_level 2 or 3.
+
+    User Tier 3:
+        Can access files with security_level 3 only.
+
+    Extra explicit access:
+        Level 2/3 users may also access assets granted in asset_access.
     """
 
     security_level = int(security_level)
 
-    if security_level == 1:
-        assets = supabase.table("assets") \
-            .select("id") \
-            .eq("yacht_id", yacht_id) \
-            .execute()
+    if security_level not in [1, 2, 3]:
+        return []
 
-        return [asset["id"] for asset in assets.data]
-
-    access = supabase.table("asset_access") \
-        .select("asset_id, assets!inner(yacht_id)") \
-        .eq("crew_id", crew_id) \
-        .eq("assets.yacht_id", yacht_id) \
+    base_assets = (
+        supabase.table("assets")
+        .select("id")
+        .eq("yacht_id", yacht_id)
+        .gte("security_level", security_level)
         .execute()
+    )
 
-    return [row["asset_id"] for row in access.data]
+    allowed_ids = {
+        asset["id"]
+        for asset in (base_assets.data or [])
+    }
+
+    access = (
+        supabase.table("asset_access")
+        .select("asset_id, assets!inner(yacht_id)")
+        .eq("crew_id", crew_id)
+        .eq("assets.yacht_id", yacht_id)
+        .execute()
+    )
+
+    for row in access.data or []:
+        allowed_ids.add(row["asset_id"])
+
+    return list(allowed_ids)
 
 
 def authorize_asset_access(
     asset_id: str,
     target_crew_id: str,
     granted_by: str,
-    yacht_id: str
+    yacht_id: str,
 ):
-    asset_res = supabase.table("assets") \
-        .select("*") \
-        .eq("id", asset_id) \
-        .eq("yacht_id", yacht_id) \
+    asset_res = (
+        supabase.table("assets")
+        .select("*")
+        .eq("id", asset_id)
+        .eq("yacht_id", yacht_id)
         .execute()
+    )
 
     if not asset_res.data:
-        raise HTTPException(status_code=404, detail="Asset not found for this yacht")
+        raise HTTPException(
+            status_code=404,
+            detail="Asset not found for this yacht",
+        )
 
-    crew_res = supabase.table("crew") \
-        .select("*") \
-        .eq("id", target_crew_id) \
-        .eq("yacht_id", yacht_id) \
+    crew_res = (
+        supabase.table("crew")
+        .select("*")
+        .eq("id", target_crew_id)
+        .eq("yacht_id", yacht_id)
         .execute()
+    )
 
     if not crew_res.data:
-        raise HTTPException(status_code=404, detail="Crew member not found for this yacht")
+        raise HTTPException(
+            status_code=404,
+            detail="Crew member not found for this yacht",
+        )
 
     return supabase.table("asset_access").upsert({
         "asset_id": asset_id,
         "crew_id": target_crew_id,
-        "granted_by": granted_by
+        "granted_by": granted_by,
     }).execute()
 
 
 def list_assets_for_admin(admin_crew: dict):
-    if admin_crew["security_level"] != 1:
-        raise HTTPException(status_code=403, detail="Only security level 1 can list assets")
+    if int(admin_crew["security_level"]) != 1:
+        raise HTTPException(
+            status_code=403,
+            detail="Only security level 1 can list assets",
+        )
 
-    return supabase.table("assets") \
-        .select("*") \
-        .eq("yacht_id", admin_crew["yacht_id"]) \
-        .order("created_at", desc=True) \
+    return (
+        supabase.table("assets")
+        .select("*")
+        .eq("yacht_id", admin_crew["yacht_id"])
+        .order("created_at", desc=True)
         .execute()
+    )
 
 
 def list_my_assets(crew: dict):
     asset_ids = get_accessible_asset_ids(
         crew_id=crew["id"],
         yacht_id=crew["yacht_id"],
-        security_level=crew["security_level"]
+        security_level=crew["security_level"],
     )
 
     if not asset_ids:
         return {"data": []}
 
-    return supabase.table("assets") \
-        .select("*") \
-        .in_("id", asset_ids) \
-        .eq("yacht_id", crew["yacht_id"]) \
-        .order("created_at", desc=True) \
+    return (
+        supabase.table("assets")
+        .select("*")
+        .in_("id", asset_ids)
+        .eq("yacht_id", crew["yacht_id"])
+        .order("created_at", desc=True)
         .execute()
+    )
 
 
 def get_asset_status(asset_id: str, yacht_id: str):
-    res = supabase.table("assets") \
-        .select("id, file_name, processing_status, processing_error") \
-        .eq("id", asset_id) \
-        .eq("yacht_id", yacht_id) \
+    res = (
+        supabase.table("assets")
+        .select(
+            "id, file_name, processing_status, processing_error"
+        )
+        .eq("id", asset_id)
+        .eq("yacht_id", yacht_id)
         .execute()
+    )
 
     if not res.data:
-        raise HTTPException(status_code=404, detail="Asset not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Asset not found",
+        )
 
     return res.data[0]
+
 
 def create_asset_signed_url(asset_id: str, crew: dict):
     """
     Creates a temporary signed URL for a private asset.
-
-    Security:
-    - Checks the asset is accessible to this crew member.
-    - Checks the asset belongs to the same yacht.
-    - Does not expose permanent public URLs.
     """
 
     accessible_asset_ids = get_accessible_asset_ids(
         crew_id=crew["id"],
         yacht_id=crew["yacht_id"],
-        security_level=crew["security_level"]
+        security_level=crew["security_level"],
     )
 
     if asset_id not in accessible_asset_ids:
-        raise HTTPException(status_code=403, detail="No access to this asset")
+        raise HTTPException(
+            status_code=403,
+            detail="No access to this asset",
+        )
 
-    asset_res = supabase.table("assets") \
-        .select("id, yacht_id, storage_path") \
-        .eq("id", asset_id) \
-        .eq("yacht_id", crew["yacht_id"]) \
+    asset_res = (
+        supabase.table("assets")
+        .select("id, yacht_id, storage_path")
+        .eq("id", asset_id)
+        .eq("yacht_id", crew["yacht_id"])
         .execute()
+    )
 
     if not asset_res.data:
-        raise HTTPException(status_code=404, detail="Asset not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Asset not found",
+        )
 
     asset = asset_res.data[0]
 
-    signed = supabase.storage.from_(BUCKET_NAME).create_signed_url(
-        asset["storage_path"],
-        60 * 5
+    signed = (
+        supabase.storage
+        .from_(BUCKET_NAME)
+        .create_signed_url(
+            asset["storage_path"],
+            60 * 5,
+        )
     )
 
-    signed_url = signed.get("signedURL") or signed.get("signed_url")
+    signed_url = (
+        signed.get("signedURL")
+        or signed.get("signed_url")
+    )
 
     if not signed_url:
         raise HTTPException(
             status_code=500,
-            detail="Could not create signed URL"
+            detail="Could not create signed URL",
         )
 
     return {
         "asset_id": asset_id,
-        "signed_url": signed_url
+        "signed_url": signed_url,
     }
+
+
+# ------------------------
+# TEXT CHUNKING
+# ------------------------
+
+def chunk_text(
+    text: str,
+    chunk_size: int = 1000,
+    overlap: int = 150,
+):
+    """
+    Splits text into overlapping chunks.
+    """
+
+    if not text:
+        return []
+
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be greater than zero")
+
+    if overlap < 0:
+        raise ValueError("overlap cannot be negative")
+
+    if overlap >= chunk_size:
+        raise ValueError(
+            "overlap must be smaller than chunk_size"
+        )
+
+    chunks = []
+    start = 0
+    text_length = len(text)
+
+    while start < text_length:
+        end = start + chunk_size
+        chunk = text[start:end].strip()
+
+        if chunk:
+            chunks.append(chunk)
+
+        start += chunk_size - overlap
+
+    return chunks
+
+
+# ------------------------
+# SEED ASSET
+# ------------------------
 
 def seed_text_asset(
     file_name: str,
     content: str,
     yacht_id: str,
     uploaded_by: str,
-    security_level: int = 1
+    security_level: int = 1,
 ):
     """
     TEMP DEV FUNCTION.
 
     Creates a searchable text asset directly in the database,
     without using file upload or Supabase Storage.
-
-    Remove before production.
     """
 
     import hashlib
 
     if not content or not content.strip():
-        raise HTTPException(status_code=400, detail="Content is required")
+        raise HTTPException(
+            status_code=400,
+            detail="Content is required",
+        )
 
     security_level = int(security_level)
 
     if security_level not in [1, 2, 3]:
         raise HTTPException(
             status_code=400,
-            detail="security_level must be 1, 2, or 3"
+            detail="security_level must be 1, 2, or 3",
         )
 
-    clean_filename = safe_filename(file_name or "seeded_asset.txt")
+    clean_filename = safe_filename(
+        file_name or "seeded_asset.txt"
+    )
+
     unique_id = str(uuid.uuid4())
 
     file_hash = hashlib.sha256(
-        f"{yacht_id}:{clean_filename}:{content}".encode("utf-8")
+        (
+            f"{yacht_id}:"
+            f"{clean_filename}:"
+            f"{content}"
+        ).encode("utf-8")
     ).hexdigest()
 
     detected_year = extract_year_from_text(content)
     detected_event = detect_event(content)
     tags = generate_basic_tags(content)
 
-    storage_path = f"{yacht_id}/seeded/{unique_id}-{clean_filename}"
+    storage_path = (
+        f"{yacht_id}/seeded/"
+        f"{unique_id}-{clean_filename}"
+    )
 
     try:
-        existing = supabase.table("assets") \
-            .select("*") \
-            .eq("yacht_id", yacht_id) \
-            .eq("file_hash", file_hash) \
+        existing = (
+            supabase.table("assets")
+            .select("*")
+            .eq("yacht_id", yacht_id)
+            .eq("file_hash", file_hash)
             .execute()
+        )
+
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Could not check duplicate seeded asset: {str(e)}"
+            detail=(
+                "Could not check duplicate seeded asset: "
+                f"{str(e)}"
+            ),
         )
 
     if existing.data:
         return {
             "message": "Seeded asset already exists",
             "asset": existing.data[0],
-            "duplicate": True
+            "duplicate": True,
         }
 
     try:
@@ -1086,19 +1399,25 @@ def seed_text_asset(
             "tags": tags,
             "summary": content[:1500],
             "processing_status": "processed",
-            "processing_error": None
+            "processing_error": None,
         }).execute()
+
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Could not insert seeded asset row: {str(e)}"
+            detail=(
+                "Could not insert seeded asset row: "
+                f"{str(e)}"
+            ),
         )
 
     if not asset_res.data:
-        raise HTTPException(status_code=500, detail="Could not save seeded asset")
+        raise HTTPException(
+            status_code=500,
+            detail="Could not save seeded asset",
+        )
 
     asset = asset_res.data[0]
-
     rows = []
 
     metadata_content = f"""
@@ -1119,7 +1438,7 @@ Tags: {", ".join(tags)}
         "detected_date": None,
         "detected_year": detected_year,
         "tags": tags,
-        "embedding": embed(metadata_content)
+        "embedding": embed(metadata_content),
     })
 
     for index, chunk in enumerate(chunk_text(content)):
@@ -1134,28 +1453,45 @@ Tags: {", ".join(tags)}
             "detected_date": None,
             "detected_year": detected_year,
             "tags": tags,
-            "embedding": embed(chunk)
+            "embedding": embed(chunk),
         })
 
     try:
         supabase.table("asset_chunks").insert(rows).execute()
+
     except Exception as e:
-        supabase.table("assets").update({
-            "processing_status": "failed",
-            "processing_error": f"Could not insert seeded chunks: {str(e)}"
-        }).eq("id", asset["id"]).execute()
+        (
+            supabase.table("assets")
+            .update({
+                "processing_status": "failed",
+                "processing_error": (
+                    "Could not insert seeded chunks: "
+                    f"{str(e)}"
+                ),
+            })
+            .eq("id", asset["id"])
+            .execute()
+        )
 
         raise HTTPException(
             status_code=500,
-            detail=f"Could not insert seeded asset chunks: {str(e)}"
+            detail=(
+                "Could not insert seeded asset chunks: "
+                f"{str(e)}"
+            ),
         )
 
     return {
         "message": "Seeded asset created successfully",
         "asset": asset,
         "chunks_created": len(rows),
-        "duplicate": False
+        "duplicate": False,
     }
+
+
+# ------------------------
+# ASSET UPLOAD
+# ------------------------
 
 def upload_asset(
     file,
@@ -1165,108 +1501,138 @@ def upload_asset(
     mime_type: str | None = None,
     original_relative_path: str | None = None,
     chat_id: str | None = None,
-    security_level: int = 1
+    security_level: int = 1,
 ):
     """
-    Uploads any file, stores it in Supabase Storage, creates an asset row,
-    extracts/processes it, creates chunks and embeddings.
+    Uploads a file, stores it in Supabase Storage,
+    creates an asset row, extracts it, and creates embeddings.
     """
 
     clean_filename = safe_filename(filename)
-    file_type = detect_file_type(clean_filename, mime_type)
+
+    file_type = detect_file_type(
+        clean_filename,
+        mime_type,
+    )
+
     security_level = int(security_level)
 
     if security_level not in [1, 2, 3]:
         raise HTTPException(
             status_code=400,
-            detail="security_level must be 1, 2, or 3"
+            detail="security_level must be 1, 2, or 3",
         )
-        
+
     if chat_id:
         verify_chat_access(
             chat_id=chat_id,
             crew_id=uploaded_by,
-            yacht_id=yacht_id
+            yacht_id=yacht_id,
         )
 
     try:
         file_hash = calculate_file_hash(file)
+
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Could not calculate file hash: {str(e)}"
+            detail=(
+                "Could not calculate file hash: "
+                f"{str(e)}"
+            ),
         )
 
     try:
-        existing_query = supabase.table("assets") \
-            .select("*") \
-            .eq("yacht_id", yacht_id) \
+        existing_query = (
+            supabase.table("assets")
+            .select("*")
+            .eq("yacht_id", yacht_id)
             .eq("file_hash", file_hash)
+        )
 
         if chat_id:
-            existing_query = existing_query.eq("chat_id", chat_id)
+            existing_query = existing_query.eq(
+                "chat_id",
+                chat_id,
+            )
+
         else:
-            existing_query = existing_query.is_("chat_id", "null")
+            existing_query = existing_query.is_(
+                "chat_id",
+                "null",
+            )
 
         existing = existing_query.execute()
+
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Could not check duplicate asset: {str(e)}"
+            detail=(
+                "Could not check duplicate asset: "
+                f"{str(e)}"
+            ),
         )
 
     if existing.data:
         return {
             "message": "Asset already exists",
             "asset": existing.data[0],
-            "duplicate": True
+            "duplicate": True,
         }
 
     unique_id = str(uuid.uuid4())
 
     if chat_id:
-        path = f"{yacht_id}/chats/{chat_id}/assets/{unique_id}-{clean_filename}"
+        path = (
+            f"{yacht_id}/chats/{chat_id}/assets/"
+            f"{unique_id}-{clean_filename}"
+        )
+
     else:
-        path = f"{yacht_id}/assets/{unique_id}-{clean_filename}"
+        path = (
+            f"{yacht_id}/assets/"
+            f"{unique_id}-{clean_filename}"
+        )
 
     try:
         file.seek(0)
         file_bytes = file.read()
         file.seek(0)
+
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Could not read uploaded file: {str(e)}"
+            detail=(
+                "Could not read uploaded file: "
+                f"{str(e)}"
+            ),
         )
 
     try:
-        supabase.storage.from_(BUCKET_NAME).upload(
-            path,
-            file_bytes,
-            file_options={
-                "content-type": mime_type or "application/octet-stream",
-                "upsert": "true"
-            }
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Supabase Storage upload failed. Check bucket '{BUCKET_NAME}'. Error: {str(e)}"
+        (
+            supabase.storage
+            .from_(BUCKET_NAME)
+            .upload(
+                path,
+                file_bytes,
+                file_options={
+                    "content-type": (
+                        mime_type
+                        or "application/octet-stream"
+                    ),
+                    "upsert": "true",
+                },
+            )
         )
 
-    try:
-        supabase.storage.from_(BUCKET_NAME).upload(
-            path,
-            file_bytes,
-            file_options={
-                "content-type": mime_type or "application/octet-stream",
-                "upsert": "true"
-            }
-        )
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Supabase Storage upload failed. Check bucket '{BUCKET_NAME}'. Error: {str(e)}"
+            detail=(
+                "Supabase Storage upload failed. "
+                f"Check bucket '{BUCKET_NAME}'. "
+                f"Error: {str(e)}"
+            ),
         )
 
     url = None
@@ -1285,21 +1651,33 @@ def upload_asset(
             "mime_type": mime_type,
             "storage_path": path,
             "file_url": url,
-            "processing_status": "pending"
+            "processing_status": "pending",
         }).execute()
+
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Could not insert asset row. Check assets table columns. Error: {str(e)}"
+            detail=(
+                "Could not insert asset row. "
+                "Check assets table columns. "
+                f"Error: {str(e)}"
+            ),
         )
 
     if not asset_res.data:
-        raise HTTPException(status_code=500, detail="Could not save asset. Supabase returned no data.")
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Could not save asset. "
+                "Supabase returned no data."
+            ),
+        )
 
     asset = asset_res.data[0]
 
     try:
         import io
+
         processing_file = io.BytesIO(file_bytes)
 
         process_uploaded_asset(
@@ -1309,39 +1687,55 @@ def upload_asset(
             file_type=file_type,
             yacht_id=yacht_id,
             chat_id=chat_id,
-            security_level=security_level
+            security_level=security_level,
         )
+
     except Exception as e:
-        supabase.table("assets").update({
-            "processing_status": "failed",
-            "processing_error": f"{type(e).__name__}: {str(e)}"
-        }).eq("id", asset["id"]).execute()
+        (
+            supabase.table("assets")
+            .update({
+                "processing_status": "failed",
+                "processing_error": (
+                    f"{type(e).__name__}: {str(e)}"
+                ),
+            })
+            .eq("id", asset["id"])
+            .execute()
+        )
 
         raise HTTPException(
             status_code=500,
-            detail=f"Asset was uploaded but processing failed: {type(e).__name__}: {str(e)}"
+            detail=(
+                "Asset was uploaded but processing failed: "
+                f"{type(e).__name__}: {str(e)}"
+            ),
         )
 
     try:
-        updated = supabase.table("assets") \
-            .select("*") \
-            .eq("id", asset["id"]) \
-            .single() \
+        updated = (
+            supabase.table("assets")
+            .select("*")
+            .eq("id", asset["id"])
+            .single()
             .execute()
+        )
 
         return {
-            "message": "Asset uploaded and processed successfully",
+            "message": (
+                "Asset uploaded and processed successfully"
+            ),
             "asset": updated.data,
-            "duplicate": False
+            "duplicate": False,
         }
 
     except Exception:
         return {
-            "message": "Asset uploaded and processed successfully",
+            "message": (
+                "Asset uploaded and processed successfully"
+            ),
             "asset": asset,
-            "duplicate": False
+            "duplicate": False,
         }
-
 
 
 def process_uploaded_asset(
@@ -1351,17 +1745,22 @@ def process_uploaded_asset(
     file_type: str,
     yacht_id: str,
     chat_id: str | None = None,
-    security_level: int = 1
+    security_level: int = 1,
 ):
     """
     Converts a raw uploaded file into searchable memory.
     """
 
     try:
-        supabase.table("assets").update({
-            "processing_status": "processing",
-            "processing_error": None
-        }).eq("id", asset_id).execute()
+        (
+            supabase.table("assets")
+            .update({
+                "processing_status": "processing",
+                "processing_error": None,
+            })
+            .eq("id", asset_id)
+            .execute()
+        )
 
         extracted_text = ""
         visual_description = ""
@@ -1369,28 +1768,52 @@ def process_uploaded_asset(
 
         if file_type in ["text", "pdf", "docx"]:
             file.seek(0)
+
             extracted_text = extract_text_by_file_type(
                 file=file,
                 filename=filename,
-                file_type=file_type
+                file_type=file_type,
             )
 
         if file_type == "image":
             file.seek(0)
-            visual_description = describe_image(file, filename)
+
+            visual_description = describe_image(
+                file,
+                filename,
+            )
 
             file.seek(0)
-            ocr_text = extract_ocr_from_image(file, filename)
+
+            ocr_text = extract_ocr_from_image(
+                file,
+                filename,
+            )
 
         combined_text = "\n\n".join([
             f"File name: {filename}",
             f"File type: {file_type}",
-            f"Extracted text:\n{extracted_text}" if extracted_text else "",
-            f"Image visual description:\n{visual_description}" if visual_description else "",
-            f"OCR text:\n{ocr_text}" if ocr_text else ""
+            (
+                f"Extracted text:\n{extracted_text}"
+                if extracted_text
+                else ""
+            ),
+            (
+                "Image visual description:\n"
+                f"{visual_description}"
+                if visual_description
+                else ""
+            ),
+            (
+                f"OCR text:\n{ocr_text}"
+                if ocr_text
+                else ""
+            ),
         ]).strip()
 
-        detected_date, date_source = extract_date_from_filename(filename)
+        detected_date, date_source = (
+            extract_date_from_filename(filename)
+        )
 
         detected_year = None
         detected_month = None
@@ -1400,28 +1823,47 @@ def process_uploaded_asset(
             detected_year = detected_date.year
             detected_month = detected_date.month
             detected_day = detected_date.day
+
         else:
-            detected_year = extract_year_from_text(combined_text)
+            detected_year = extract_year_from_text(
+                combined_text
+            )
 
         detected_event = detect_event(combined_text)
         tags = generate_basic_tags(combined_text)
 
-        summary = combined_text[:1500] if combined_text else None
+        summary = (
+            combined_text[:1500]
+            if combined_text
+            else None
+        )
 
-        supabase.table("assets").update({
-            "extracted_text": extracted_text or None,
-            "visual_description": visual_description or None,
-            "ocr_text": ocr_text or None,
-            "detected_date": detected_date.isoformat() if detected_date else None,
-            "detected_year": detected_year,
-            "detected_month": detected_month,
-            "detected_day": detected_day,
-            "date_source": date_source,
-            "detected_event": detected_event,
-            "tags": tags,
-            "summary": summary,
-            "processing_status": "processed"
-        }).eq("id", asset_id).execute()
+        (
+            supabase.table("assets")
+            .update({
+                "extracted_text": extracted_text or None,
+                "visual_description": (
+                    visual_description or None
+                ),
+                "ocr_text": ocr_text or None,
+                "detected_date": (
+                    detected_date.isoformat()
+                    if detected_date
+                    else None
+                ),
+                "detected_year": detected_year,
+                "detected_month": detected_month,
+                "detected_day": detected_day,
+                "date_source": date_source,
+                "detected_event": detected_event,
+                "tags": tags,
+                "summary": summary,
+                "processing_status": "processed",
+                "processing_error": None,
+            })
+            .eq("id", asset_id)
+            .execute()
+        )
 
         create_asset_chunks(
             asset_id=asset_id,
@@ -1435,16 +1877,22 @@ def process_uploaded_asset(
             detected_date=detected_date,
             detected_year=detected_year,
             tags=tags,
-            security_level=security_level
+            security_level=security_level,
         )
 
     except Exception as e:
-        supabase.table("assets").update({
-            "processing_status": "failed",
-            "processing_error": str(e)
-        }).eq("id", asset_id).execute()
+        (
+            supabase.table("assets")
+            .update({
+                "processing_status": "failed",
+                "processing_error": str(e),
+            })
+            .eq("id", asset_id)
+            .execute()
+        )
 
         raise
+
 
 def create_asset_chunks(
     asset_id: str,
@@ -1458,10 +1906,11 @@ def create_asset_chunks(
     detected_date=None,
     detected_year: int | None = None,
     tags: list[str] | None = None,
-    security_level: int = 1
+    security_level: int = 1,
 ):
     """
-    Creates searchable chunks for asset metadata, text, OCR, and image captions.
+    Creates searchable chunks for asset metadata,
+    text, OCR, and image captions.
     """
 
     tags = tags or []
@@ -1482,10 +1931,14 @@ Tags: {", ".join(tags)}
         "content": metadata_content,
         "content_type": "metadata",
         "chunk_index": 0,
-        "detected_date": detected_date.isoformat() if detected_date else None,
+        "detected_date": (
+            detected_date.isoformat()
+            if detected_date
+            else None
+        ),
         "detected_year": detected_year,
         "tags": tags,
-        "embedding": embed(metadata_content)
+        "embedding": embed(metadata_content),
     })
 
     if visual_description:
@@ -1506,14 +1959,20 @@ Tags: {", ".join(tags)}
             "content": content,
             "content_type": "image_caption",
             "chunk_index": 0,
-            "detected_date": detected_date.isoformat() if detected_date else None,
+            "detected_date": (
+                detected_date.isoformat()
+                if detected_date
+                else None
+            ),
             "detected_year": detected_year,
             "tags": tags,
-            "embedding": embed(content)
+            "embedding": embed(content),
         })
 
     if ocr_text:
-        for index, chunk in enumerate(chunk_text(ocr_text)):
+        for index, chunk in enumerate(
+            chunk_text(ocr_text)
+        ):
             rows.append({
                 "asset_id": asset_id,
                 "yacht_id": yacht_id,
@@ -1522,14 +1981,20 @@ Tags: {", ".join(tags)}
                 "content": chunk,
                 "content_type": "ocr",
                 "chunk_index": index,
-                "detected_date": detected_date.isoformat() if detected_date else None,
+                "detected_date": (
+                    detected_date.isoformat()
+                    if detected_date
+                    else None
+                ),
                 "detected_year": detected_year,
                 "tags": tags,
-                "embedding": embed(chunk)
+                "embedding": embed(chunk),
             })
 
     if extracted_text:
-        for index, chunk in enumerate(chunk_text(extracted_text)):
+        for index, chunk in enumerate(
+            chunk_text(extracted_text)
+        ):
             rows.append({
                 "asset_id": asset_id,
                 "yacht_id": yacht_id,
@@ -1538,23 +2003,27 @@ Tags: {", ".join(tags)}
                 "content": chunk,
                 "content_type": "text",
                 "chunk_index": index,
-                "detected_date": detected_date.isoformat() if detected_date else None,
+                "detected_date": (
+                    detected_date.isoformat()
+                    if detected_date
+                    else None
+                ),
                 "detected_year": detected_year,
                 "tags": tags,
-                "embedding": embed(chunk)
+                "embedding": embed(chunk),
             })
 
     if rows:
-        supabase.table("asset_chunks").insert(rows).execute()
+        supabase.table("asset_chunks").insert(
+            rows
+        ).execute()
 
-def build_context_from_asset_results(results: list[dict]) -> str:
+
+def build_context_from_asset_results(
+    results: list[dict],
+) -> str:
     """
     Builds the private context sent to the LLM.
-
-    Important:
-    - Do not include file_url.
-    - Do not include storage_path.
-    - Only include text/chunks that already passed yacht/user access checks.
     """
 
     parts = []
@@ -1575,15 +2044,12 @@ Content:
 
     return "\n\n---\n\n".join(parts)
 
-def build_sources_from_asset_results(results: list[dict]) -> list[dict]:
-    """
-    Builds the sources returned to the frontend.
 
-    Important:
-    - Do not return file_url.
-    - Do not return storage_path.
-    - The frontend should only receive safe metadata.
-    - If the frontend needs to open the file, it must call the signed-url endpoint.
+def build_sources_from_asset_results(
+    results: list[dict],
+) -> list[dict]:
+    """
+    Builds safe source metadata returned to the frontend.
     """
 
     seen = set()
@@ -1603,10 +2069,11 @@ def build_sources_from_asset_results(results: list[dict]) -> list[dict]:
             "file_type": row.get("file_type"),
             "content_type": row.get("content_type"),
             "detected_year": row.get("detected_year"),
-            "matched_content": row.get("content")
+            "matched_content": row.get("content"),
         })
 
     return sources
+
 
 # ------------------------
 # DOCUMENT ACCESS
@@ -1616,153 +2083,142 @@ def authorize_document_access(
     document_id: str,
     target_crew_id: str,
     granted_by: str,
-    yacht_id: str
+    yacht_id: str,
 ):
     """
-    Checks:
-    1. The document belongs to the same yacht.
-    2. The target crew member belongs to the same yacht.
-    3. Then grants document access.
+    Grants document access after validating yacht ownership.
     """
 
-    doc_res = supabase.table("documents") \
-        .select("*") \
-        .eq("id", document_id) \
-        .eq("yacht_id", yacht_id) \
+    doc_res = (
+        supabase.table("documents")
+        .select("*")
+        .eq("id", document_id)
+        .eq("yacht_id", yacht_id)
         .execute()
+    )
 
     if not doc_res.data:
-        raise HTTPException(status_code=404, detail="Document not found for this yacht")
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found for this yacht",
+        )
 
-    crew_res = supabase.table("crew") \
-        .select("*") \
-        .eq("id", target_crew_id) \
-        .eq("yacht_id", yacht_id) \
+    crew_res = (
+        supabase.table("crew")
+        .select("*")
+        .eq("id", target_crew_id)
+        .eq("yacht_id", yacht_id)
         .execute()
+    )
 
     if not crew_res.data:
-        raise HTTPException(status_code=404, detail="Crew member not found for this yacht")
+        raise HTTPException(
+            status_code=404,
+            detail="Crew member not found for this yacht",
+        )
 
     return supabase.table("document_access").upsert({
         "document_id": document_id,
         "crew_id": target_crew_id,
-        "granted_by": granted_by
+        "granted_by": granted_by,
     }).execute()
 
 
-def get_accessible_asset_ids(crew_id: str, yacht_id: str, security_level: int):
+def get_accessible_document_ids(
+    crew_id: str,
+    yacht_id: str,
+    security_level: int,
+):
     """
-    File security model:
+    Returns document IDs accessible to a crew member.
 
-    User Tier 1:
-        Can access files with security_level 1, 2, or 3.
-
-    User Tier 2:
-        Can access files with security_level 2 or 3.
-
-    User Tier 3:
-        Can access files with security_level 3 only.
-
-    Extra explicit access:
-        Level 2/3 users may also access assets granted in asset_access.
+    Tier 1 can access all yacht documents.
+    Tier 2 and Tier 3 use explicit document_access rows.
     """
 
     security_level = int(security_level)
 
-    if security_level not in [1, 2, 3]:
-        return []
+    if security_level == 1:
+        documents = (
+            supabase.table("documents")
+            .select("id")
+            .eq("yacht_id", yacht_id)
+            .execute()
+        )
 
-    # Tier rule:
-    # lower number = more powerful user
-    # lower number file = more sensitive file
-    base_assets = supabase.table("assets") \
-        .select("id") \
-        .eq("yacht_id", yacht_id) \
-        .gte("security_level", security_level) \
+        return [
+            document["id"]
+            for document in (documents.data or [])
+        ]
+
+    access = (
+        supabase.table("document_access")
+        .select(
+            "document_id, documents!inner(yacht_id)"
+        )
+        .eq("crew_id", crew_id)
+        .eq("documents.yacht_id", yacht_id)
         .execute()
+    )
 
-    allowed_ids = {asset["id"] for asset in (base_assets.data or [])}
+    return [
+        row["document_id"]
+        for row in (access.data or [])
+    ]
 
-    # Optional explicit grants.
-    # Useful if a Tier 3 user needs one specific Tier 1 or Tier 2 file.
-    access = supabase.table("asset_access") \
-        .select("asset_id, assets!inner(yacht_id)") \
-        .eq("crew_id", crew_id) \
-        .eq("assets.yacht_id", yacht_id) \
-        .execute()
-
-    for row in access.data or []:
-        allowed_ids.add(row["asset_id"])
-
-    return list(allowed_ids)
 
 def list_documents_for_admin(admin_crew: dict):
     """
     Admin can list all documents for their yacht.
     """
 
-    if admin_crew["security_level"] != 1:
-        raise HTTPException(status_code=403, detail="Only security level 1 can list documents")
+    if int(admin_crew["security_level"]) != 1:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Only security level 1 can list documents"
+            ),
+        )
 
-    return supabase.table("documents") \
-        .select("*") \
-        .eq("yacht_id", admin_crew["yacht_id"]) \
-        .order("created_at", desc=True) \
+    return (
+        supabase.table("documents")
+        .select("*")
+        .eq("yacht_id", admin_crew["yacht_id"])
+        .order("created_at", desc=True)
         .execute()
+    )
 
 
 def list_my_documents(crew: dict):
     """
-    Level 1 gets all yacht documents.
-    Level 2 and 3 get only authorized documents.
+    Tier 1 gets all yacht documents.
+    Tier 2 and Tier 3 get authorized documents.
     """
 
     document_ids = get_accessible_document_ids(
         crew_id=crew["id"],
         yacht_id=crew["yacht_id"],
-        security_level=crew["security_level"]
+        security_level=crew["security_level"],
     )
 
     if not document_ids:
         return {"data": []}
 
-    return supabase.table("documents") \
-        .select("*") \
-        .in_("id", document_ids) \
-        .eq("yacht_id", crew["yacht_id"]) \
-        .order("created_at", desc=True) \
+    return (
+        supabase.table("documents")
+        .select("*")
+        .in_("id", document_ids)
+        .eq("yacht_id", crew["yacht_id"])
+        .order("created_at", desc=True)
         .execute()
+    )
 
 
-# ------------------------
-# DOCUMENT TEXT CHUNKING
-# ------------------------
-
-def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 150):
-    """
-    Splits document text into overlapping chunks.
-    """
-
-    if not text:
-        return []
-
-    chunks = []
-    start = 0
-    text_length = len(text)
-
-    while start < text_length:
-        end = start + chunk_size
-        chunk = text[start:end].strip()
-
-        if chunk:
-            chunks.append(chunk)
-
-        start += chunk_size - overlap
-
-    return chunks
-
-
-def save_document_chunks(document_id: str, yacht_id: str, text: str):
+def save_document_chunks(
+    document_id: str,
+    yacht_id: str,
+    text: str,
+):
     """
     Saves chunks and embeddings into document_chunks.
     """
@@ -1779,28 +2235,32 @@ def save_document_chunks(document_id: str, yacht_id: str, text: str):
             "document_id": document_id,
             "yacht_id": yacht_id,
             "content": chunk,
-            "embedding": embed(chunk)
+            "embedding": embed(chunk),
         })
 
-    return supabase.table("document_chunks").insert(rows).execute()
+    return (
+        supabase.table("document_chunks")
+        .insert(rows)
+        .execute()
+    )
 
 
-def extract_text_from_uploaded_file(file, filename: str):
+def extract_text_from_uploaded_file(
+    file,
+    filename: str,
+):
     """
-    First-step version:
-    Supports .txt files.
-
-    Later we can add:
-    - PDF extraction
-    - DOCX extraction
-    - image OCR
+    Legacy helper supporting TXT files.
     """
 
     file.seek(0)
     raw = file.read()
 
     if filename.lower().endswith(".txt"):
-        return raw.decode("utf-8", errors="ignore")
+        return raw.decode(
+            "utf-8",
+            errors="ignore",
+        )
 
     return ""
 
@@ -1809,53 +2269,73 @@ def extract_text_from_uploaded_file(file, filename: str):
 # DOCUMENTS
 # ------------------------
 
-def upload_document(file, filename: str, yacht_id: str, uploaded_by: str):
+def upload_document(
+    file,
+    filename: str,
+    yacht_id: str,
+    uploaded_by: str,
+):
     return upload_asset(
         file=file,
         filename=filename,
         yacht_id=yacht_id,
         uploaded_by=uploaded_by,
-        mime_type=None
+        mime_type=None,
     )
+
 
 # ------------------------
 # IMAGES
 # ------------------------
 
-def upload_image(file, filename: str, yacht_id: str, uploaded_by: str):
+def upload_image(
+    file,
+    filename: str,
+    yacht_id: str,
+    uploaded_by: str,
+):
     return upload_asset(
         file=file,
         filename=filename,
         yacht_id=yacht_id,
         uploaded_by=uploaded_by,
-        mime_type=None
+        mime_type=None,
     )
+
 
 # ------------------------
 # CHAT SECURE
 # ------------------------
+
 def chat(
     query: str,
     crew_id: str,
     yacht_id: str,
     security_level: int,
-    chat_id: str
+    chat_id: str,
 ):
     """
     Secure yacht-isolated chat flow.
 
     Rules:
-    - The chat must belong to this exact crew member.
-    - The user can only search assets from their own yacht.
-    - Security level 1 can search all yacht assets.
-    - Security level 2/3 can search only explicitly authorized assets.
-    - No user can search another yacht's files.
+    - The chat belongs to this exact crew member.
+    - The user searches only their own yacht assets.
+    - Asset security rules are applied before retrieval.
+    - Retrieved document text is sent to ask_llm as context.
     """
+
+    query = (query or "").strip()
+
+    if not query:
+        raise HTTPException(
+            status_code=400,
+            detail="Query cannot be empty",
+        )
 
     chat_row = verify_chat_access(
         chat_id=chat_id,
         crew_id=crew_id,
-        yacht_id=yacht_id
+        yacht_id=yacht_id,
     )
 
     supabase.table("messages").insert({
@@ -1863,19 +2343,26 @@ def chat(
         "yacht_id": yacht_id,
         "crew_id": crew_id,
         "role": "user",
-        "content": query
+        "content": query,
     }).execute()
 
     if chat_row.get("title") == "New Chat":
-        supabase.table("chats").update({
-            "title": query[:60],
-            "updated_at": "now()"
-        }).eq("id", chat_id).eq("crew_id", crew_id).eq("yacht_id", yacht_id).execute()
+        (
+            supabase.table("chats")
+            .update({
+                "title": query[:60],
+                "updated_at": "now()",
+            })
+            .eq("id", chat_id)
+            .eq("crew_id", crew_id)
+            .eq("yacht_id", yacht_id)
+            .execute()
+        )
 
     accessible_asset_ids = get_accessible_asset_ids(
         crew_id=crew_id,
         yacht_id=yacht_id,
-        security_level=security_level
+        security_level=security_level,
     )
 
     if not accessible_asset_ids:
@@ -1886,21 +2373,26 @@ def chat(
             "yacht_id": yacht_id,
             "crew_id": crew_id,
             "role": "assistant",
-            "content": answer
+            "content": answer,
         }).execute()
 
         return {
             "answer": answer,
-            "sources": []
+            "sources": [],
         }
 
-    assets_res = supabase.table("assets") \
-        .select("id") \
-        .eq("yacht_id", yacht_id) \
-        .in_("id", accessible_asset_ids) \
+    assets_res = (
+        supabase.table("assets")
+        .select("id")
+        .eq("yacht_id", yacht_id)
+        .in_("id", accessible_asset_ids)
         .execute()
+    )
 
-    allowed_asset_ids = [asset["id"] for asset in assets_res.data]
+    allowed_asset_ids = [
+        asset["id"]
+        for asset in (assets_res.data or [])
+    ]
 
     if not allowed_asset_ids:
         answer = FALLBACK_NO_DATA_ANSWER
@@ -1910,26 +2402,43 @@ def chat(
             "yacht_id": yacht_id,
             "crew_id": crew_id,
             "role": "assistant",
-            "content": answer
+            "content": answer,
         }).execute()
 
         return {
             "answer": answer,
-            "sources": []
+            "sources": [],
         }
 
     filters = extract_query_filters(query)
     year_filter = filters.get("year")
 
-    results = supabase.rpc("match_asset_chunks_secure", {
-        "query_embedding": embed(query),
-        "match_count": 12,
-        "allowed_asset_ids": allowed_asset_ids,
-        "yacht_filter": yacht_id,
-        "year_filter": year_filter
-    }).execute()
+    try:
+        query_embedding = embed(query)
 
-    if not results.data:
+        results = supabase.rpc(
+            "match_asset_chunks_secure",
+            {
+                "query_embedding": query_embedding,
+                "match_count": 12,
+                "allowed_asset_ids": allowed_asset_ids,
+                "yacht_filter": yacht_id,
+                "year_filter": year_filter,
+            },
+        ).execute()
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Could not search document chunks: "
+                f"{str(e)}"
+            ),
+        )
+
+    result_rows = results.data or []
+
+    if not result_rows:
         answer = FALLBACK_NO_DATA_ANSWER
 
         supabase.table("messages").insert({
@@ -1937,76 +2446,104 @@ def chat(
             "yacht_id": yacht_id,
             "crew_id": crew_id,
             "role": "assistant",
-            "content": answer
+            "content": answer,
         }).execute()
 
         return {
             "answer": answer,
-            "sources": []
+            "sources": [],
         }
 
-    context = build_context_from_asset_results(results.data)
+    context = build_context_from_asset_results(
+        result_rows
+    )
 
     if not context.strip():
         answer = FALLBACK_NO_DATA_ANSWER
+
     else:
         answer = ask_llm(
             query=query,
-            context=context
+            context=context,
         )
+
+        if not answer or not str(answer).strip():
+            answer = FALLBACK_NO_DATA_ANSWER
 
     supabase.table("messages").insert({
         "chat_id": chat_id,
         "yacht_id": yacht_id,
         "crew_id": crew_id,
         "role": "assistant",
-        "content": answer
+        "content": answer,
     }).execute()
 
-    supabase.table("chats").update({
-        "updated_at": "now()"
-    }).eq("id", chat_id).eq("crew_id", crew_id).eq("yacht_id", yacht_id).execute()
+    (
+        supabase.table("chats")
+        .update({
+            "updated_at": "now()",
+        })
+        .eq("id", chat_id)
+        .eq("crew_id", crew_id)
+        .eq("yacht_id", yacht_id)
+        .execute()
+    )
 
-    sources = build_sources_from_asset_results(results.data)
+    sources = build_sources_from_asset_results(
+        result_rows
+    )
 
     return {
         "answer": answer,
-        "sources": sources
+        "sources": sources,
     }
+
+
 # ------------------------
-# TEMP DEMO LOGIN FOR TESTING ONLY
+# TEMP DEMO LOGIN
 # Remove before production.
 # ------------------------
 
-def dev_demo_login(email: str = "demo@bridgeos.com"):
+def dev_demo_login(
+    email: str = "demo@bridgeos.com",
+):
     """
     TEMP TEST LOGIN.
 
-    Creates/fetches a demo yacht and demo crew row directly in the database,
-    then returns a JWT that your existing get_user() can read.
-
-    This bypasses Supabase Auth only so you can test upload/chat now.
-    Remove before production.
+    Creates or fetches a demo yacht and crew,
+    then returns a development JWT.
     """
 
-    demo_user_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, email))
+    demo_user_id = str(
+        uuid.uuid5(
+            uuid.NAMESPACE_DNS,
+            email,
+        )
+    )
+
     demo_yacht_name = "Demo Yacht"
 
-    crew_res = supabase.table("crew") \
-        .select("*") \
-        .eq("id", demo_user_id) \
+    crew_res = (
+        supabase.table("crew")
+        .select("*")
+        .eq("id", demo_user_id)
         .execute()
+    )
 
     if crew_res.data:
         crew = crew_res.data[0]
+
     else:
         yacht_res = supabase.table("yachts").insert({
             "name": demo_yacht_name,
-            "owner_id": demo_user_id
+            "owner_id": demo_user_id,
         }).execute()
 
         if not yacht_res.data:
-            raise HTTPException(status_code=400, detail="Could not create demo yacht")
+            raise HTTPException(
+                status_code=400,
+                detail="Could not create demo yacht",
+            )
 
         yacht = yacht_res.data[0]
 
@@ -2016,11 +2553,14 @@ def dev_demo_login(email: str = "demo@bridgeos.com"):
             "full_name": "Demo Admin",
             "yacht_id": yacht["id"],
             "security_level": 1,
-            "created_by": demo_user_id
+            "created_by": demo_user_id,
         }).execute()
 
         if not crew_insert.data:
-            raise HTTPException(status_code=400, detail="Could not create demo crew")
+            raise HTTPException(
+                status_code=400,
+                detail="Could not create demo crew",
+            )
 
         crew = crew_insert.data[0]
 
@@ -2033,10 +2573,10 @@ def dev_demo_login(email: str = "demo@bridgeos.com"):
             "aud": "authenticated",
             "role": "authenticated",
             "iat": now,
-            "exp": now + 60 * 60 * 24 * 7
+            "exp": now + 60 * 60 * 24 * 7,
         },
         SUPABASE_JWT_SECRET,
-        algorithm="HS256"
+        algorithm="HS256",
     )
 
     return {
@@ -2045,14 +2585,14 @@ def dev_demo_login(email: str = "demo@bridgeos.com"):
         "token_type": "bearer",
         "user": {
             "id": demo_user_id,
-            "email": email
+            "email": email,
         },
-        "crew": crew
+        "crew": crew,
     }
+
 
 # ------------------------
 # TEMP WORKING DEMO AUTH
-# This bypasses Supabase Auth so you can test upload/chat now.
 # Remove before production.
 # ------------------------
 
@@ -2068,19 +2608,25 @@ def ensure_demo_account():
     - demo yacht
     - demo crew profile with security_level = 1
 
-    This does NOT use Supabase Auth.
-    It only creates database rows needed by the app.
+    This does not use Supabase Auth.
     """
 
     try:
-        crew_res = supabase.table("crew") \
-            .select("*") \
-            .eq("id", DEV_USER_ID) \
+        crew_res = (
+            supabase.table("crew")
+            .select("*")
+            .eq("id", DEV_USER_ID)
             .execute()
+        )
+
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Could not query demo crew. Check crew table. Error: {str(e)}"
+            detail=(
+                "Could not query demo crew. "
+                "Check crew table. "
+                f"Error: {str(e)}"
+            ),
         )
 
     if crew_res.data:
@@ -2089,18 +2635,26 @@ def ensure_demo_account():
     try:
         yacht_res = supabase.table("yachts").insert({
             "name": DEV_YACHT_NAME,
-            "owner_id": DEV_USER_ID
+            "owner_id": DEV_USER_ID,
         }).execute()
+
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Could not create demo yacht. Check yachts table columns. Error: {str(e)}"
+            detail=(
+                "Could not create demo yacht. "
+                "Check yachts table columns. "
+                f"Error: {str(e)}"
+            ),
         )
 
     if not yacht_res.data:
         raise HTTPException(
             status_code=500,
-            detail="Could not create demo yacht. Supabase returned no data."
+            detail=(
+                "Could not create demo yacht. "
+                "Supabase returned no data."
+            ),
         )
 
     yacht = yacht_res.data[0]
@@ -2112,18 +2666,26 @@ def ensure_demo_account():
             "full_name": "Demo Admin",
             "yacht_id": yacht["id"],
             "security_level": 1,
-            "created_by": DEV_USER_ID
+            "created_by": DEV_USER_ID,
         }).execute()
+
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Could not create demo crew. Check crew table columns. Error: {str(e)}"
+            detail=(
+                "Could not create demo crew. "
+                "Check crew table columns. "
+                f"Error: {str(e)}"
+            ),
         )
 
     if not crew_insert.data:
         raise HTTPException(
             status_code=500,
-            detail="Could not create demo crew. Supabase returned no data."
+            detail=(
+                "Could not create demo crew. "
+                "Supabase returned no data."
+            ),
         )
 
     return crew_insert.data[0]
@@ -2138,91 +2700,7 @@ def test_login_response():
         "token_type": "bearer",
         "user": {
             "id": DEV_USER_ID,
-            "email": DEV_EMAIL
+            "email": DEV_EMAIL,
         },
-        "crew": crew
+        "crew": crew,
     }
-
-def post_json(path, payload, token=None):
-    url = API_BASE + path
-    data = json.dumps(payload).encode("utf-8")
-
-    headers = {
-        "Content-Type": "application/json"
-    }
-
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers=headers,
-        method="POST"
-    )
-
-    try:
-        with urllib.request.urlopen(req) as res:
-            body = res.read().decode("utf-8")
-            return json.loads(body)
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8")
-        print("REQUEST FAILED")
-        print("URL:", url)
-        print("STATUS:", e.code)
-        print("BODY:", body)
-        raise SystemExit(1)
-
-
-def main():
-    if len(sys.argv) != 5:
-        print("Usage:")
-        print("python3 seed_file_to_yacht.py EMAIL PASSWORD FILE_PATH SECURITY_LEVEL")
-        print("")
-        print("SECURITY_LEVEL:")
-        print("1 = Tier 1 only")
-        print("2 = Tier 1 and Tier 2")
-        print("3 = Tier 1, Tier 2, and Tier 3")
-        raise SystemExit(1)
-
-    email = sys.argv[1]
-    password = sys.argv[2]
-    file_path = Path(sys.argv[3])
-    security_level = int(sys.argv[4])
-
-    if security_level not in [1, 2, 3]:
-        print("SECURITY_LEVEL must be 1, 2, or 3")
-        raise SystemExit(1)
-
-    if not file_path.exists():
-        print(f"File not found: {file_path}")
-        raise SystemExit(1)
-
-    content = file_path.read_text(encoding="utf-8", errors="ignore")
-
-    if not content.strip():
-        print("File is empty.")
-        raise SystemExit(1)
-
-    print("Logging in...")
-    login = post_json("/auth/login", {
-        "email": email,
-        "password": password
-    })
-
-    token = login["access_token"]
-
-    print(f"Seeding file with security_level={security_level}...")
-    result = post_json("/dev/seed-asset", {
-        "file_name": file_path.name,
-        "content": content,
-        "security_level": security_level
-    }, token=token)
-
-    print(json.dumps(result, indent=2))
-    print("")
-    print("Done. This file is now searchable by allowed tiers only.")
-
-
-if __name__ == "__main__":
-    main()

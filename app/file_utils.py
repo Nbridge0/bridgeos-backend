@@ -74,4 +74,4 @@ def safe_filename(filename: str) -> str:
     Keeps it simple for now.
     """
 
-    return filename.replace("/", "_").replace("\\", "_").strip() 
+    return filename.replace("/", "_").replace("\\", "_").strip()
