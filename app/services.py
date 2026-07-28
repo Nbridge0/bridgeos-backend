@@ -2142,15 +2142,6 @@ def test_login_response():
         },
         "crew": crew
     }
- 
-seed_file_to_yacht.py:   import json
-import sys
-import urllib.request
-import urllib.error
-from pathlib import Path
-
-API_BASE = "https://bridgeos-backend.onrender.com"
-
 
 def post_json(path, payload, token=None):
     url = API_BASE + path
