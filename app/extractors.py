@@ -377,3 +377,109 @@ def extract_docx_text(file) -> str:
     )
 
     return final_text
+
+def extract_text_by_file_type(
+    file,
+    filename: str,
+    file_type: str | None = None
+) -> str:
+    """
+    Routes the uploaded file to the correct text extractor.
+
+    Supported file types:
+    - PDF
+    - DOCX
+    - Plain text files
+    """
+
+    clean_filename = str(filename or "").strip()
+    clean_file_type = str(file_type or "").strip().lower()
+
+    if not clean_filename:
+        clean_filename = "uploaded_file"
+
+    if not clean_file_type:
+        lower_filename = clean_filename.lower()
+
+        if lower_filename.endswith(".pdf"):
+            clean_file_type = "pdf"
+
+        elif lower_filename.endswith(".docx"):
+            clean_file_type = "docx"
+
+        elif lower_filename.endswith(
+            (
+                ".txt",
+                ".md",
+                ".csv",
+                ".json",
+                ".html",
+                ".xml"
+            )
+        ):
+            clean_file_type = "text"
+
+    try:
+        file.seek(0)
+    except Exception:
+        pass
+
+    try:
+        if clean_file_type == "pdf":
+            extracted_text = extract_pdf_text(
+                file=file,
+                filename=clean_filename
+            )
+
+        elif clean_file_type == "docx":
+            extracted_text = extract_docx_text(
+                file=file
+            )
+
+        elif clean_file_type == "text":
+            extracted_text = extract_plain_text(
+                file=file,
+                filename=clean_filename
+            )
+
+        else:
+            raise ValueError(
+                f"Unsupported file type: "
+                f"{clean_file_type or 'unknown'} "
+                f"for file {clean_filename}"
+            )
+
+        extracted_text = str(
+            extracted_text or ""
+        ).strip()
+
+        print(
+            "FILE TEXT EXTRACTION FINAL:",
+            {
+                "filename": clean_filename,
+                "file_type": clean_file_type,
+                "characters": len(extracted_text),
+                "preview": extracted_text[:500]
+            }
+        )
+
+        return extracted_text
+
+    except Exception as error:
+        print(
+            "FILE TEXT EXTRACTION ERROR:",
+            {
+                "filename": clean_filename,
+                "file_type": clean_file_type,
+                "error_type": type(error).__name__,
+                "error": str(error)
+            }
+        )
+
+        raise
+
+    finally:
+        try:
+            file.seek(0)
+        except Exception:
+            pass

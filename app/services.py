@@ -1,12 +1,3 @@
-from fastapi import Request, HTTPException
-from supabase import create_client
-import jwt as pyjwt
-
-from app.config import SUPABASE_URL, SUPABASE_SERVICE_KEY, SUPABASE_JWT_SECRET
-
-
-auth_client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-
 from fastapi import HTTPException, Request
 import requests
 import json
@@ -15,6 +6,7 @@ import hashlib
 import smtplib
 from openai import OpenAI
 from email.message import EmailMessage
+
 from app.database import supabase
 from app.embeddings import embed
 from app.config import (
@@ -48,16 +40,16 @@ from app.image_ai import (
 )
 
 import base64
-from email.utils import parsedate_to_datetime
-
 import time
 import uuid
-import jwt as pyjwt
 import io
 import re
 import zipfile
 import ast
 import operator
+import jwt as pyjwt
+
+from email.utils import parsedate_to_datetime
 from urllib.parse import quote
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -86,7 +78,10 @@ from app.config import (
 
 from supabase import create_client
 
-auth_admin = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+auth_admin = create_client(
+    SUPABASE_URL,
+    SUPABASE_SERVICE_KEY
+)
 
 storage_admin = create_client(
     SUPABASE_URL,
