@@ -1,5 +1,4 @@
-
-Auth.py: from fastapi import Request, HTTPException
+from fastapi import Request, HTTPException
 from supabase import create_client
 import jwt as pyjwt
 
