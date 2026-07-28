@@ -8481,130 +8481,176 @@ def answer_only_from_verified_document_evidence(
     matched_rows: list[dict]
 ) -> dict:
     """
-    Produces a cohesive answer from one or more retrieved documents.
+    Produces a document answer with strictly verified sources.
 
-    The documents provide every fact.
-
-    OpenAI is allowed only to:
-    - identify relevant facts;
-    - combine facts from several sources;
-    - remove repetition;
-    - make the language cohesive;
-    - match the format to the question.
-
-    OpenAI is not allowed to add facts.
+    Security and accuracy:
+    - OpenAI may only use the supplied document text.
+    - Every claim must reference an asset_id, never a positional source number.
+    - Every evidence quotation must exist in that exact asset.
+    - Sources are constructed only from successfully verified evidence.
+    - Retrieved-but-unused documents never appear as sources.
     """
 
     clean_query = clean_text_for_postgres(
         str(query or "")
     ).strip()
 
-    clean_rows = deduplicate_context_rows(
-        matched_rows or []
-    )
-
-    if not clean_query or not clean_rows:
+    if not clean_query or not matched_rows:
         return {
             "answer": FALLBACK_NO_DATA_ANSWER,
             "sources": []
         }
 
-    numbered_context = (
-        build_numbered_context_from_asset_results(
-            clean_rows
-        )
-    )
+    # =========================================================
+    # GROUP ALL RETRIEVED TEXT BY ASSET
+    # =========================================================
 
-    numbered_context = clean_text_for_postgres(
-        str(numbered_context or "")
+    documents_by_asset = {}
+
+    for row in matched_rows:
+        if not isinstance(row, dict):
+            continue
+
+        asset_id = str(
+            row.get("asset_id") or ""
+        ).strip()
+
+        if not asset_id:
+            continue
+
+        file_name = clean_text_for_postgres(
+            str(
+                row.get("original_file_name")
+                or row.get("file_name")
+                or row.get("title")
+                or "Untitled document"
+            )
+        ).strip()
+
+        row_text = clean_text_for_postgres(
+            str(
+                row.get("search_text")
+                or row.get("content")
+                or row.get("text")
+                or ""
+            )
+        ).strip()
+
+        if not row_text:
+            continue
+
+        if asset_id not in documents_by_asset:
+            documents_by_asset[asset_id] = {
+                "asset_id": asset_id,
+                "file_name": file_name,
+                "original_file_name": file_name,
+                "base_row": row,
+                "parts": [],
+                "seen_parts": set()
+            }
+
+        normalised_part = normalise_for_source_check(
+            row_text
+        )
+
+        if not normalised_part:
+            continue
+
+        if (
+            normalised_part
+            in documents_by_asset[asset_id]["seen_parts"]
+        ):
+            continue
+
+        documents_by_asset[asset_id]["seen_parts"].add(
+            normalised_part
+        )
+
+        documents_by_asset[asset_id]["parts"].append(
+            row_text
+        )
+
+    if not documents_by_asset:
+        return {
+            "answer": FALLBACK_NO_DATA_ANSWER,
+            "sources": []
+        }
+
+    # =========================================================
+    # BUILD CONTEXT WITH PERMANENT ASSET IDS
+    # =========================================================
+
+    context_parts = []
+
+    for document in documents_by_asset.values():
+        document_text = "\n\n".join(
+            document["parts"]
+        ).strip()
+
+        document["document_text"] = document_text
+
+        if not document_text:
+            continue
+
+        context_parts.append(
+            "\n".join([
+                "DOCUMENT",
+                f"asset_id: {document['asset_id']}",
+                f"file_name: {document['file_name']}",
+                "content:",
+                document_text
+            ])
+        )
+
+    document_context = "\n\n---\n\n".join(
+        context_parts
     ).strip()
 
-    if not numbered_context:
+    if not document_context:
         return {
             "answer": FALLBACK_NO_DATA_ANSWER,
             "sources": []
         }
+
+    # =========================================================
+    # ASK OPENAI FOR CLAIMS AND EXACT EVIDENCE
+    # =========================================================
 
     try:
         raw_response = ask_llm(
             query=clean_query,
             context=f"""
-You are a strict document evidence composer.
+You are BridgeOS, a strictly evidence-grounded document assistant.
 
-The numbered document sources below are the ONLY allowed source of facts.
+Answer the user's question using ONLY the documents supplied below.
 
-Your role is limited to:
-
-1. Identify the exact information needed to answer the user's question.
-2. Find all relevant pieces across every numbered source.
-3. Combine facts when different documents contain different parts
-   of the answer.
-4. Remove unnecessary repetition.
-5. Organise the facts cohesively.
-6. Match the format to the question.
-
-You must NOT contribute factual knowledge.
-
-Return ONLY valid JSON in this exact form:
+Return ONLY valid JSON in exactly this structure:
 
 {{
-  "answer": "the cohesive final answer",
+  "answer": "complete direct answer",
   "claims": [
     {{
-      "claim": "one factual statement used in the answer",
-      "source_number": 1,
-      "evidence_quote": "an exact quotation copied from that source"
+      "claim": "one factual claim included in the answer",
+      "asset_id": "exact asset_id copied from the supporting document",
+      "evidence_quote": "short exact continuous quotation copied from that document"
     }}
   ]
 }}
 
-ABSOLUTE RULES:
-
-- Every factual statement in "answer" must be represented in "claims".
-- Every claim must have one valid source_number.
-- Every evidence_quote must be copied exactly from that source.
-- Do not paraphrase the evidence_quote.
-- A claim may make the quotation grammatically cohesive, but it must
-  not add any factual detail absent from the quotation.
-- Search all sources before answering.
-- Do not stop after the first relevant source.
-- Use multiple sources when they contain different requested facts.
-- Never use general knowledge.
-- Never guess missing details.
-- Never infer a cause, reason, intent, responsibility, approval,
-  relationship, completion status or conclusion unless directly stated.
-- Preserve names exactly.
-- Preserve dates exactly.
-- Preserve times exactly.
-- Preserve quantities exactly.
-- Preserve amounts exactly.
-- Preserve currencies exactly.
-- Preserve percentages exactly.
-- Preserve document identifiers exactly.
-- Do not silently correct document values.
-- Do not calculate new values unless an exact deterministic calculation
-  result is already explicitly included in the source context.
-- Do not add source names inside the answer text.
-
-Match the answer structure to the question:
-
-- A direct factual question gets a direct answer.
-- A list request gets a list.
-- A comparison gets a clear comparison.
-- A procedure gets ordered steps.
-- A summary gets a cohesive summary.
-- A who/when/where question directly provides those fields.
-- A yes/no question gives yes or no only when the evidence explicitly
-  establishes it.
-
-If some requested information is present and another requested part
-is absent:
-- answer with the supported information;
-- explicitly state which requested part was not found;
-- do not guess the missing part.
-
-If the sources contain none of the requested information, return:
-
+Critical rules:
+- Use only the supplied documents.
+- Never use outside knowledge.
+- Never guess or infer a missing fact.
+- Never invent names, dates, quantities, requirements, conclusions or events.
+- Copy asset_id exactly.
+- Copy evidence_quote exactly from the corresponding document.
+- Every factual statement in the answer must be covered by at least one claim.
+- If multiple documents contribute, include claims for every contributing document.
+- Do not cite a document merely because it discusses a similar subject.
+- Do not use source numbers.
+- Do not return Markdown.
+- Use British English.
+- If the documents do not contain enough information, return exactly:
 {{
   "answer": "{FALLBACK_NO_DATA_ANSWER}",
   "claims": []
@@ -8613,14 +8659,14 @@ If the sources contain none of the requested information, return:
 User question:
 {clean_query}
 
-Numbered document sources:
-{numbered_context}
+Documents:
+{document_context}
 """.strip()
         )
 
     except Exception as error:
         print(
-            "STRICT DOCUMENT ANSWER REQUEST ERROR:",
+            "VERIFIED ANSWER OPENAI ERROR:",
             type(error).__name__,
             str(error)
         )
@@ -8630,14 +8676,14 @@ Numbered document sources:
             "sources": []
         }
 
-    parsed_response = parse_llm_json_response(
+    parsed = parse_llm_json_response(
         raw_response
     )
 
-    if not isinstance(parsed_response, dict):
+    if not isinstance(parsed, dict):
         print(
-            "STRICT DOCUMENT ANSWER INVALID JSON:",
-            str(raw_response or "")[:1000]
+            "VERIFIED ANSWER INVALID JSON:",
+            str(raw_response or "")[:2000]
         )
 
         return {
@@ -8646,15 +8692,10 @@ Numbered document sources:
         }
 
     answer = clean_text_for_postgres(
-        str(
-            parsed_response.get("answer")
-            or ""
-        )
+        str(parsed.get("answer") or "")
     ).strip()
 
-    claims = parsed_response.get(
-        "claims"
-    )
+    claims = parsed.get("claims") or []
 
     if (
         not answer
@@ -8667,248 +8708,190 @@ Numbered document sources:
             "sources": []
         }
 
-    verified_rows = []
-    verified_quotes = []
-    seen_row_keys = set()
+    # =========================================================
+    # VERIFY EACH CLAIM AGAINST ITS EXACT ASSET
+    # =========================================================
 
-    for claim_index, claim_data in enumerate(
-        claims,
-        start=1
-    ):
-        if not isinstance(claim_data, dict):
-            print(
-                "STRICT CLAIM IS NOT AN OBJECT:",
-                claim_index
-            )
+    verified_claims = []
+    verified_asset_ids = set()
 
-            return {
-                "answer": FALLBACK_NO_DATA_ANSWER,
-                "sources": []
-            }
+    for claim_item in claims:
+        if not isinstance(claim_item, dict):
+            continue
 
-        claim_text = clean_text_for_postgres(
-            str(
-                claim_data.get("claim")
-                or ""
-            )
+        claim = clean_text_for_postgres(
+            str(claim_item.get("claim") or "")
+        ).strip()
+
+        asset_id = str(
+            claim_item.get("asset_id") or ""
         ).strip()
 
         evidence_quote = clean_text_for_postgres(
             str(
-                claim_data.get("evidence_quote")
-                or claim_data.get("quote")
+                claim_item.get("evidence_quote")
+                or claim_item.get("evidence")
                 or ""
             )
         ).strip()
 
-        try:
-            source_number = int(
-                claim_data.get("source_number")
-            )
-        except Exception:
+        if not claim or not asset_id or not evidence_quote:
+            continue
+
+        document = documents_by_asset.get(
+            asset_id
+        )
+
+        if not document:
             print(
-                "STRICT CLAIM HAS INVALID SOURCE:",
-                claim_index
-            )
-
-            return {
-                "answer": FALLBACK_NO_DATA_ANSWER,
-                "sources": []
-            }
-
-        source_index = source_number - 1
-
-        if (
-            not claim_text
-            or not evidence_quote
-            or source_index < 0
-            or source_index >= len(clean_rows)
-        ):
-            print(
-                "STRICT CLAIM IS INCOMPLETE:",
-                claim_index
-            )
-
-            return {
-                "answer": FALLBACK_NO_DATA_ANSWER,
-                "sources": []
-            }
-
-        selected_row = clean_rows[
-            source_index
-        ]
-
-        if not source_quote_exists_in_row(
-            selected_row,
-            evidence_quote
-        ):
-            print(
-                "STRICT CLAIM QUOTE NOT FOUND:",
+                "CLAIM REJECTED: UNKNOWN ASSET",
                 {
-                    "claim_index": claim_index,
-                    "source_number": source_number,
-                    "quote": evidence_quote[:500]
+                    "asset_id": asset_id,
+                    "claim": claim
                 }
             )
+            continue
 
-            return {
-                "answer": FALLBACK_NO_DATA_ANSWER,
-                "sources": []
-            }
+        document_text = document.get(
+            "document_text"
+        ) or ""
 
-        # Ensure protected values in the individual claim are present
-        # in that claim's exact quotation.
-        if not validate_protected_tokens_against_evidence(
-            answer=claim_text,
-            evidence_quotes=[evidence_quote]
+        if not evidence_is_supported_exactly(
+            evidence=evidence_quote,
+            document_text=document_text
         ):
             print(
-                "STRICT CLAIM ADDED A PROTECTED VALUE:",
-                claim_index
+                "CLAIM REJECTED: EVIDENCE NOT FOUND",
+                {
+                    "asset_id": asset_id,
+                    "file_name": document.get("file_name"),
+                    "claim": claim,
+                    "evidence": evidence_quote
+                }
             )
+            continue
 
-            return {
-                "answer": FALLBACK_NO_DATA_ANSWER,
-                "sources": []
-            }
+        verified_claims.append({
+            "claim": claim,
+            "asset_id": asset_id,
+            "evidence_quote": evidence_quote
+        })
 
-        verified_quotes.append(
-            evidence_quote
+        verified_asset_ids.add(
+            asset_id
         )
 
-        row_key = (
-            selected_row.get("asset_id"),
-            selected_row.get("chunk_index"),
-            selected_row.get("content_type")
-        )
-
-        if row_key not in seen_row_keys:
-            seen_row_keys.add(
-                row_key
-            )
-
-            verified_rows.append(
-                selected_row
-            )
-
-    # Deterministically reject unsupported numbers, dates,
-    # amounts, percentages and identifiers in the final answer.
-    if not validate_protected_tokens_against_evidence(
-        answer=answer,
-        evidence_quotes=verified_quotes
-    ):
+    if not verified_claims or not verified_asset_ids:
         return {
             "answer": FALLBACK_NO_DATA_ANSWER,
             "sources": []
         }
 
-    # Final semantic validation using only the already verified quotes.
-    try:
-        validation_response = ask_llm(
-            query=clean_query,
-            context=f"""
-You are validating whether a proposed answer contains only facts from
-verified exact document quotations.
+    # =========================================================
+    # CHECK THAT ANSWER VALUES EXIST IN VERIFIED EVIDENCE
+    # =========================================================
 
-Return ONLY valid JSON:
+    verified_evidence_text = "\n\n".join(
+        item["evidence_quote"]
+        for item in verified_claims
+    )
 
-{{
-  "supported": true
-}}
-
-or:
-
-{{
-  "supported": false
-}}
-
-Set "supported" to true only when every factual statement in the
-proposed answer is explicitly supported by the verified quotations.
-
-Connecting grammar, reordering and removing repetition are allowed.
-
-Set "supported" to false if the answer introduces any unsupported:
-
-- person;
-- organisation;
-- date;
-- time;
-- number;
-- quantity;
-- amount;
-- currency;
-- percentage;
-- identifier;
-- event;
-- action;
-- status;
-- condition;
-- cause;
-- reason;
-- conclusion;
-- recommendation;
-- relationship;
-- responsibility;
-- approval;
-- intent.
-
-Set "supported" to false when the answer claims a requested fact was
-not found but that statement is contradicted by the quotations.
-
-Do not explain.
-Do not rewrite the answer.
-Return JSON only.
-
-User question:
-{clean_query}
-
-Proposed answer:
-{answer}
-
-Verified exact quotations:
-{json.dumps(
-    verified_quotes,
-    ensure_ascii=False,
-    indent=2
-)}
-""".strip()
+    answer_numbers = set(
+        re.findall(
+            r"\b\d+(?:[.,]\d+)*\b",
+            answer
         )
+    )
 
-        validation_data = parse_llm_json_response(
-            validation_response
+    evidence_numbers = set(
+        re.findall(
+            r"\b\d+(?:[.,]\d+)*\b",
+            verified_evidence_text
         )
+    )
 
-        if (
-            not isinstance(validation_data, dict)
-            or validation_data.get("supported") is not True
-        ):
-            print(
-                "STRICT FINAL ANSWER FAILED VALIDATION:",
-                validation_response
-            )
+    unsupported_numbers = (
+        answer_numbers - evidence_numbers
+    )
 
-            return {
-                "answer": FALLBACK_NO_DATA_ANSWER,
-                "sources": []
-            }
-
-    except Exception as error:
+    if unsupported_numbers:
         print(
-            "STRICT FINAL ANSWER VALIDATION ERROR:",
-            type(error).__name__,
-            str(error)
+            "VERIFIED ANSWER REJECTED: UNSUPPORTED NUMBERS",
+            {
+                "query": clean_query,
+                "unsupported_numbers": sorted(
+                    unsupported_numbers
+                ),
+                "answer": answer
+            }
         )
 
         return {
             "answer": FALLBACK_NO_DATA_ANSWER,
             "sources": []
         }
+
+    # =========================================================
+    # BUILD SOURCES ONLY FROM VERIFIED ASSET IDS
+    # =========================================================
+
+    sources = []
+
+    for asset_id in verified_asset_ids:
+        document = documents_by_asset.get(
+            asset_id
+        )
+
+        if not document:
+            continue
+
+        file_name = (
+            document.get("file_name")
+            or "Untitled document"
+        )
+
+        asset_claims = [
+            {
+                "claim": item["claim"],
+                "evidence_quote": item["evidence_quote"]
+            }
+            for item in verified_claims
+            if item["asset_id"] == asset_id
+        ]
+
+        sources.append({
+            "asset_id": asset_id,
+            "title": file_name,
+            "file_name": file_name,
+            "evidence": asset_claims
+        })
+
+    if not sources:
+        return {
+            "answer": FALLBACK_NO_DATA_ANSWER,
+            "sources": []
+        }
+
+    print(
+        "STRICT VERIFIED DOCUMENT ANSWER:",
+        {
+            "query": clean_query,
+            "verified_claim_count": len(
+                verified_claims
+            ),
+            "verified_sources": [
+                {
+                    "asset_id": source["asset_id"],
+                    "file_name": source["file_name"]
+                }
+                for source in sources
+            ]
+        }
+    )
 
     return {
         "answer": answer,
-        "sources": build_sources_from_asset_results(
-            verified_rows
-        )
+        "sources": sources
     }
 
 
@@ -14016,6 +13999,13 @@ def chat(
     def unique_source_cards(
         raw_sources: list[dict] | None
     ) -> list[dict]:
+        """
+        Keeps only unique verified source assets.
+
+        Evidence is preserved so the frontend can show exactly why
+        each document was used.
+        """
+
         output = []
         seen_asset_ids = set()
 
@@ -14023,7 +14013,9 @@ def chat(
             if not isinstance(source, dict):
                 continue
 
-            asset_id = source.get("asset_id")
+            asset_id = str(
+                source.get("asset_id") or ""
+            ).strip()
 
             if not asset_id:
                 continue
@@ -14031,7 +14023,9 @@ def chat(
             if asset_id in seen_asset_ids:
                 continue
 
-            seen_asset_ids.add(asset_id)
+            seen_asset_ids.add(
+                asset_id
+            )
 
             file_name = (
                 source.get("title")
@@ -14040,11 +14034,20 @@ def chat(
                 or "Untitled document"
             )
 
-            output.append({
+            source_card = {
                 "asset_id": asset_id,
                 "title": file_name,
                 "file_name": file_name
-            })
+            }
+
+            evidence = source.get("evidence")
+
+            if isinstance(evidence, list):
+                source_card["evidence"] = evidence
+
+            output.append(
+                source_card
+            )
 
         return output
 
