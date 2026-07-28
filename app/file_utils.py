@@ -4,15 +4,6 @@ from pathlib import Path
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".gif"}
-AUDIO_EXTENSIONS = {
-    ".webm",
-    ".wav",
-    ".mp3",
-    ".m4a",
-    ".ogg",
-    ".aac",
-    ".mp4"
-}
 TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".json", ".html", ".xml"}
 PDF_EXTENSIONS = {".pdf"}
 DOCX_EXTENSIONS = {".docx"}
@@ -20,9 +11,6 @@ DOCX_EXTENSIONS = {".docx"}
 
 def detect_file_type(filename: str, mime_type: str | None = None) -> str:
     ext = Path(filename.lower()).suffix
-
-    if ext in AUDIO_EXTENSIONS:
-        return "audio"
 
     if ext in IMAGE_EXTENSIONS:
         return "image"
@@ -37,14 +25,17 @@ def detect_file_type(filename: str, mime_type: str | None = None) -> str:
         return "text"
 
     if mime_type:
-        if mime_type.startswith("audio/"):
-            return "audio"
-
-        if mime_type in ["audio/mp4", "video/mp4"]:
-            return "audio"
-
         if mime_type.startswith("image/"):
             return "image"
+
+        if mime_type == "application/pdf":
+            return "pdf"
+
+        if "wordprocessingml" in mime_type:
+            return "docx"
+
+        if mime_type.startswith("text/"):
+            return "text"
 
     guessed_type, _ = mimetypes.guess_type(filename)
 
@@ -83,4 +74,4 @@ def safe_filename(filename: str) -> str:
     Keeps it simple for now.
     """
 
-    return filename.replace("/", "_").replace("\\", "_").strip()
+    return filename.replace("/", "_").replace("\\", "_").strip() 
