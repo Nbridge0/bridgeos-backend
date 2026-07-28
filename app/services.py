@@ -6837,6 +6837,371 @@ def keyword_match_asset_chunks(
 
     return [item["row"] for item in ranked[:limit]]
 
+def search_processed_assets_directly(
+    query: str,
+    yacht_id: str,
+    allowed_asset_ids: list[str],
+    limit: int = 100
+) -> list[dict]:
+    """
+    Searches the complete processed asset text directly.
+
+    This is a reliable fallback for information that exists in:
+    - extracted_text;
+    - OCR text;
+    - summaries;
+    - visual descriptions;
+    - file names.
+
+    It does not depend on embeddings or asset_chunks.
+
+    This prevents valid document information from being missed when:
+    - an embedding is missing;
+    - semantic similarity is weak;
+    - the relevant chunk was not returned;
+    - a document title contains the requested subject;
+    - OCR spacing differs from the query.
+    """
+
+    clean_query = clean_text_for_postgres(
+        str(query or "")
+    ).strip()
+
+    if (
+        not clean_query
+        or not yacht_id
+        or not allowed_asset_ids
+    ):
+        return []
+
+    stop_words = {
+        "a",
+        "an",
+        "the",
+        "and",
+        "or",
+        "of",
+        "to",
+        "in",
+        "on",
+        "for",
+        "from",
+        "with",
+        "by",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "it",
+        "this",
+        "that",
+        "these",
+        "those",
+        "i",
+        "me",
+        "my",
+        "we",
+        "our",
+        "you",
+        "your",
+        "they",
+        "them",
+        "their",
+        "what",
+        "which",
+        "who",
+        "where",
+        "when",
+        "why",
+        "how",
+        "tell",
+        "give",
+        "show",
+        "find",
+        "explain",
+        "describe",
+        "about",
+        "please",
+        "can",
+        "could",
+        "would",
+        "should",
+        "document",
+        "documents",
+        "file",
+        "files",
+    }
+
+    normalised_query = normalise_search_text(
+        clean_query
+    )
+
+    search_terms = []
+
+    for word in normalised_query.split():
+        if len(word) < 3:
+            continue
+
+        if word in stop_words:
+            continue
+
+        if word not in search_terms:
+            search_terms.append(word)
+
+    # Preserve the complete phrase as an additional scoring signal.
+    complete_phrase = " ".join(
+        search_terms
+    ).strip()
+
+    if not search_terms:
+        return []
+
+    found_assets = {}
+
+    def add_asset(asset: dict):
+        if not isinstance(asset, dict):
+            return
+
+        asset_id = str(
+            asset.get("id")
+            or ""
+        ).strip()
+
+        if not asset_id:
+            return
+
+        file_name = clean_text_for_postgres(
+            str(
+                asset.get("original_file_name")
+                or asset.get("file_name")
+                or "Untitled document"
+            )
+        ).strip()
+
+        extracted_text = clean_text_for_postgres(
+            str(
+                asset.get("extracted_text")
+                or ""
+            )
+        ).strip()
+
+        ocr_text = clean_text_for_postgres(
+            str(
+                asset.get("ocr_text")
+                or ""
+            )
+        ).strip()
+
+        summary = clean_text_for_postgres(
+            str(
+                asset.get("summary")
+                or ""
+            )
+        ).strip()
+
+        visual_description = clean_text_for_postgres(
+            str(
+                asset.get("visual_description")
+                or ""
+            )
+        ).strip()
+
+        complete_text = "\n\n".join(
+            part
+            for part in [
+                f"File name: {file_name}",
+                (
+                    "Extracted document text:\n"
+                    + extracted_text
+                    if extracted_text
+                    else ""
+                ),
+                (
+                    "OCR document text:\n"
+                    + ocr_text
+                    if ocr_text
+                    else ""
+                ),
+                (
+                    "Document summary:\n"
+                    + summary
+                    if summary
+                    else ""
+                ),
+                (
+                    "Image visual description:\n"
+                    + visual_description
+                    if visual_description
+                    else ""
+                ),
+            ]
+            if str(part or "").strip()
+        ).strip()
+
+        if not complete_text:
+            return
+
+        normalised_document = normalise_search_text(
+            complete_text
+        )
+
+        term_hits = sum(
+            1
+            for term in search_terms
+            if term in normalised_document
+        )
+
+        if term_hits <= 0:
+            return
+
+        score = term_hits * 20
+
+        if (
+            complete_phrase
+            and complete_phrase in normalised_document
+        ):
+            score += 100
+
+        normalised_file_name = normalise_search_text(
+            file_name
+        )
+
+        file_name_hits = sum(
+            1
+            for term in search_terms
+            if term in normalised_file_name
+        )
+
+        score += file_name_hits * 30
+
+        existing = found_assets.get(
+            asset_id
+        )
+
+        if existing and existing["score"] >= score:
+            return
+
+        found_assets[asset_id] = {
+            "score": score,
+            "row": {
+                "asset_id": asset_id,
+                "id": asset_id,
+                "yacht_id": asset.get("yacht_id"),
+                "chat_id": asset.get("chat_id"),
+                "security_level": asset.get(
+                    "security_level"
+                ),
+                "content": complete_text,
+                "search_text": complete_text,
+                "content_type": "complete_asset_text",
+                "chunk_index": 0,
+                "detected_date": asset.get(
+                    "detected_date"
+                ),
+                "detected_year": asset.get(
+                    "detected_year"
+                ),
+                "tags": asset.get("tags") or [],
+                "file_name": asset.get("file_name"),
+                "original_file_name": asset.get(
+                    "original_file_name"
+                ),
+                "file_type": asset.get("file_type"),
+                "mime_type": asset.get("mime_type"),
+                "processing_status": asset.get(
+                    "processing_status"
+                )
+            }
+        }
+
+    select_columns = """
+        id,
+        yacht_id,
+        chat_id,
+        security_level,
+        file_name,
+        original_file_name,
+        file_type,
+        mime_type,
+        processing_status,
+        extracted_text,
+        ocr_text,
+        summary,
+        visual_description,
+        detected_date,
+        detected_year,
+        tags
+    """
+
+    # Search each useful term directly in the complete assets table.
+    for term in search_terms[:12]:
+        try:
+            result = (
+                supabase.table("assets")
+                .select(select_columns)
+                .eq("yacht_id", yacht_id)
+                .in_("id", allowed_asset_ids)
+                .eq("processing_status", "processed")
+                .or_(
+                    ",".join([
+                        f"file_name.ilike.%{term}%",
+                        f"original_file_name.ilike.%{term}%",
+                        f"extracted_text.ilike.%{term}%",
+                        f"ocr_text.ilike.%{term}%",
+                        f"summary.ilike.%{term}%",
+                        f"visual_description.ilike.%{term}%"
+                    ])
+                )
+                .limit(limit)
+                .execute()
+            )
+
+            for asset in result.data or []:
+                add_asset(asset)
+
+        except Exception as error:
+            print(
+                "DIRECT ASSET TERM SEARCH ERROR:",
+                {
+                    "query": clean_query,
+                    "term": term,
+                    "error_type": type(error).__name__,
+                    "error": str(error)
+                }
+            )
+
+    ranked_assets = sorted(
+        found_assets.values(),
+        key=lambda item: item["score"],
+        reverse=True
+    )
+
+    rows = [
+        item["row"]
+        for item in ranked_assets[:limit]
+    ]
+
+    print(
+        "DIRECT COMPLETE ASSET SEARCH RESULT:",
+        {
+            "query": clean_query,
+            "search_terms": search_terms,
+            "result_count": len(rows),
+            "files": [
+                (
+                    row.get("original_file_name")
+                    or row.get("file_name")
+                )
+                for row in rows
+            ]
+        }
+    )
+
+    return rows
+
 def keyword_search_asset_chunks(
     query: str,
     yacht_id: str,
@@ -15199,238 +15564,120 @@ Rules:
             mode="document_qa"
         )
 
-        # =========================================================
-    # NORMAL GROUNDED DOCUMENT ANSWER
+
+    # =========================================================
+    # NORMAL VERIFIED DOCUMENT ANSWER
     # =========================================================
 
     clean_context = clean_text_for_postgres(
         str(context or "")
     ).strip()
 
-    if not clean_context:
+    if not clean_context or not matched_rows:
         return finish(
             final_answer=FALLBACK_NO_DATA_ANSWER,
             final_sources=[],
             mode="document_qa"
         )
 
-    # Use the retrieved document rows as the only factual context.
-    # The model is asked for structured JSON first, but a plain-text
-    # fallback is allowed because some RunPod models do not reliably
-    # follow JSON-only instructions.
-    answer = ""
-    verified_rows = []
-
     try:
-        raw_answer = ask_llm(
-            query=clean_query,
-            context=f"""
-You are BridgeOS, a private document assistant.
-
-Answer the user's question using ONLY the supplied document context.
-
-Return valid JSON when possible:
-
-{{
-  "answer": "direct answer supported by the documents",
-  "used_sources": [
-    {{
-      "source_number": 1,
-      "evidence_quote": "short exact supporting text from that source"
-    }}
-  ]
-}}
-
-Rules:
-- Use only the document context below.
-- Do not use outside knowledge.
-- Do not invent names, dates, numbers, events, requirements or conclusions.
-- Answer the exact user question.
-- If the answer is not present, return:
-  {{
-    "answer": "{FALLBACK_NO_DATA_ANSWER}",
-    "used_sources": []
-  }}
-- Source numbers correspond to the numbered sources below.
-- Keep evidence quotes short and copied from the source.
-- Use British English.
-
-User question:
-{clean_query}
-
-Document context:
-{clean_context}
-""".strip()
+        candidate_rows = deduplicate_context_rows(
+            matched_rows
         )
-
-        raw_answer = clean_text_for_postgres(
-            str(raw_answer or "")
-        ).strip()
-
-        parsed_answer = parse_llm_json_response(
-            raw_answer
-        )
-
-        if isinstance(parsed_answer, dict):
-            candidate_answer = clean_text_for_postgres(
-                str(
-                    parsed_answer.get("answer")
-                    or parsed_answer.get("response")
-                    or parsed_answer.get("message")
-                    or ""
-                )
-            ).strip()
-
-            used_sources = (
-                parsed_answer.get("used_sources")
-                or parsed_answer.get("sources")
-                or []
-            )
-
-            if (
-                candidate_answer
-                and candidate_answer != FALLBACK_NO_DATA_ANSWER
-            ):
-                answer = candidate_answer
-
-            if isinstance(used_sources, list):
-                for used_source in used_sources:
-                    if not isinstance(used_source, dict):
-                        continue
-
-                    try:
-                        source_number = int(
-                            used_source.get("source_number")
-                        )
-                    except Exception:
-                        continue
-
-                    source_index = source_number - 1
-
-                    if (
-                        source_index < 0
-                        or source_index >= len(matched_rows)
-                    ):
-                        continue
-
-                    selected_row = matched_rows[
-                        source_index
-                    ]
-
-                    evidence_quote = clean_text_for_postgres(
-                        str(
-                            used_source.get("evidence_quote")
-                            or used_source.get("quote")
-                            or ""
-                        )
-                    ).strip()
-
-                    # Accept an exact/normalised quote match.
-                    if (
-                        evidence_quote
-                        and source_quote_exists_in_row(
-                            selected_row,
-                            evidence_quote
-                        )
-                    ):
-                        verified_rows.append(
-                            selected_row
-                        )
-
-        else:
-            # Some RunPod models return a correct plain-text answer
-            # despite being instructed to return JSON.
-            if (
-                raw_answer
-                and raw_answer != FALLBACK_NO_DATA_ANSWER
-                and not raw_answer.lower().startswith(
-                    "runpod "
-                )
-            ):
-                answer = raw_answer
 
     except Exception as error:
         print(
-            "STRUCTURED DOCUMENT ANSWER ERROR:",
-            type(error).__name__,
-            str(error)
+            "FINAL CONTEXT DEDUPLICATION ERROR:",
+            {
+                "query": clean_query,
+                "error_type": type(error).__name__,
+                "error": str(error)
+            }
         )
 
-    # =========================================================
-    # PLAIN-TEXT FALLBACK
-    # =========================================================
+        candidate_rows = matched_rows
 
-    if not answer:
-        try:
-            fallback_answer = ask_llm(
-                query=clean_query,
-                context=f"""
-You are BridgeOS, a private document assistant.
-
-Answer the user's question directly using ONLY the document context below.
-
-Rules:
-- Do not use outside knowledge.
-- Do not invent information.
-- Do not mention that you are an AI.
-- Do not describe the retrieval process.
-- Do not return JSON.
-- Use British English.
-- If the documents do not contain the answer, return exactly:
-{FALLBACK_NO_DATA_ANSWER}
-
-User question:
-{clean_query}
-
-Document context:
-{clean_context}
-""".strip()
-            )
-
-            fallback_answer = clean_text_for_postgres(
-                str(fallback_answer or "")
-            ).strip()
-
-            if (
-                fallback_answer
-                and fallback_answer
-                != FALLBACK_NO_DATA_ANSWER
-                and not fallback_answer.lower().startswith(
-                    "runpod "
-                )
-            ):
-                answer = fallback_answer
-
-        except Exception as error:
-            print(
-                "PLAIN DOCUMENT ANSWER ERROR:",
-                type(error).__name__,
-                str(error)
-            )
-
-    if (
-        not answer
-        or answer == FALLBACK_NO_DATA_ANSWER
-    ):
+    if not candidate_rows:
         return finish(
             final_answer=FALLBACK_NO_DATA_ANSWER,
             final_sources=[],
             mode="document_qa"
         )
 
+    print(
+        "VERIFIED DOCUMENT ANSWER START:",
+        {
+            "query": clean_query,
+            "candidate_row_count": len(
+                candidate_rows
+            ),
+            "candidate_files": list({
+                (
+                    row.get("original_file_name")
+                    or row.get("file_name")
+                    or "Untitled document"
+                )
+                for row in candidate_rows
+                if isinstance(row, dict)
+            })
+        }
+    )
 
-    # =========================================================
-    # VERIFIED SOURCES ONLY
-    # =========================================================
+    try:
+        grounded_result = (
+            answer_only_from_verified_document_evidence(
+                query=clean_query,
+                matched_rows=candidate_rows
+            )
+        )
 
-    if not verified_rows:
+    except Exception as error:
         print(
-            "SOURCE VALIDATION FAILED:",
+            "VERIFIED DOCUMENT ANSWER ERROR:",
             {
                 "query": clean_query,
-                "reason": (
-                    "The answer was generated, but no exact supporting "
-                    "document quotation could be verified."
+                "error_type": type(error).__name__,
+                "error": str(error)
+            }
+        )
+
+        grounded_result = None
+
+    if not isinstance(grounded_result, dict):
+        return finish(
+            final_answer=FALLBACK_NO_DATA_ANSWER,
+            final_sources=[],
+            mode="document_qa"
+        )
+
+    final_answer = clean_text_for_postgres(
+        str(
+            grounded_result.get("answer")
+            or ""
+        )
+    ).strip()
+
+    final_sources = grounded_result.get(
+        "sources"
+    )
+
+    if not isinstance(final_sources, list):
+        final_sources = []
+
+    final_sources = unique_source_cards(
+        final_sources
+    )
+
+    if (
+        not final_answer
+        or final_answer == FALLBACK_NO_DATA_ANSWER
+    ):
+        print(
+            "VERIFIED DOCUMENT ANSWER: NO SUPPORTED ANSWER",
+            {
+                "query": clean_query,
+                "candidate_row_count": len(
+                    candidate_rows
                 )
             }
         )
@@ -15441,13 +15688,46 @@ Document context:
             mode="document_qa"
         )
 
-    verified_sources = build_sources_from_asset_results(
-        verified_rows
+    # A factual document answer must have at least one source that
+    # passed quotation and protected-value validation.
+    if not final_sources:
+        print(
+            "VERIFIED DOCUMENT ANSWER REJECTED: NO SOURCES",
+            {
+                "query": clean_query,
+                "answer": final_answer[:1000]
+            }
+        )
+
+        return finish(
+            final_answer=FALLBACK_NO_DATA_ANSWER,
+            final_sources=[],
+            mode="document_qa"
+        )
+
+    print(
+        "VERIFIED DOCUMENT ANSWER SUCCESS:",
+        {
+            "query": clean_query,
+            "answer_characters": len(
+                final_answer
+            ),
+            "verified_source_count": len(
+                final_sources
+            ),
+            "verified_sources": [
+                (
+                    source.get("file_name")
+                    or source.get("title")
+                )
+                for source in final_sources
+            ]
+        }
     )
 
     return finish(
-        final_answer=answer,
-        final_sources=verified_sources,
+        final_answer=final_answer,
+        final_sources=final_sources,
         mode="document_qa"
     )
 # ------------------------
