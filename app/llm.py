@@ -151,7 +151,8 @@ USER REQUEST
         response = client.responses.create(
             model=OPENAI_CHAT_MODEL,
             instructions=system_instructions,
-            input=user_input
+            input=user_input,
+            temperature=0
         )
 
         answer = str(

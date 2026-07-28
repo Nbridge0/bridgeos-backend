@@ -4431,39 +4431,23 @@ def transcribe_audio(
     mime_type: str | None = None
 ) -> str:
     """
-    Sends a voice note to the RunPod speech-to-text endpoint.
+    Transcribes a voice note using only the OpenAI Audio API.
 
-    Expected RunPod response:
-    {
-        "text": "transcribed message"
-    }
-
-    It also accepts:
-    {
-        "transcript": "transcribed message"
-    }
+    There is no RunPod connection or fallback.
     """
-
-    if not RUNPOD_BASE_URL:
-        raise HTTPException(
-            status_code=500,
-            detail="RUNPOD_BASE_URL is missing"
-        )
-
-    if not BRIDGEOS_API_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="BRIDGEOS_API_KEY is missing"
-        )
 
     try:
         file.seek(0)
         audio_bytes = file.read()
         file.seek(0)
-    except Exception as e:
+
+    except Exception as error:
         raise HTTPException(
             status_code=400,
-            detail=f"Could not read voice note: {str(e)}"
+            detail=(
+                "Could not read voice note: "
+                f"{type(error).__name__}: {error}"
+            )
         )
 
     if not audio_bytes:
@@ -4472,84 +4456,102 @@ def transcribe_audio(
             detail="The voice note is empty"
         )
 
-    # Maximum 25 MB.
+    # OpenAI transcription upload limit.
     if len(audio_bytes) > 25 * 1024 * 1024:
         raise HTTPException(
             status_code=413,
             detail="Voice note must be smaller than 25 MB"
         )
 
-    url = f"{RUNPOD_BASE_URL.rstrip('/')}/api/bridgeos/transcribe"
-
-    try:
-        response = requests.post(
-            url,
-            files={
-                "file": (
-                    filename or "voice-note.webm",
-                    audio_bytes,
-                    mime_type or "audio/webm"
-                )
-            },
-            headers={
-                "x-api-key": BRIDGEOS_API_KEY
-            },
-            timeout=180
-        )
-
-        print("VOICE TRANSCRIPTION DEBUG URL:", url)
-        print("VOICE TRANSCRIPTION DEBUG STATUS:", response.status_code)
-        print("VOICE TRANSCRIPTION DEBUG RESPONSE:", response.text[:500])
-
-    except requests.exceptions.Timeout:
-        raise HTTPException(
-            status_code=504,
-            detail="Voice transcription timed out"
-        )
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "Could not connect to the voice transcription service: "
-                f"{type(e).__name__}: {str(e)}"
-            )
-        )
-
-    if response.status_code >= 400:
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                f"Voice transcription returned {response.status_code}: "
-                f"{response.text[:500]}"
-            )
-        )
-
-    try:
-        data = response.json()
-    except Exception:
-        raise HTTPException(
-            status_code=502,
-            detail="Voice transcription returned invalid JSON"
-        )
-
-    transcript = (
-        data.get("text")
-        or data.get("transcript")
-        or data.get("response")
-        or data.get("result", {}).get("text")
-        or ""
+    clean_filename = safe_filename(
+        filename or "voice-note.webm"
     )
 
-    transcript = clean_text_for_postgres(str(transcript or ""))
+    clean_mime_type = (
+        str(mime_type or "").split(";")[0].strip()
+        or "audio/webm"
+    )
 
-    if not transcript:
-        raise HTTPException(
-            status_code=422,
-            detail="No speech could be detected in the voice note"
+    try:
+        client = get_openai_client()
+
+        print(
+            "OPENAI TRANSCRIPTION REQUEST:",
+            {
+                "provider": "openai",
+                "model": OPENAI_TRANSCRIPTION_MODEL,
+                "filename": clean_filename,
+                "mime_type": clean_mime_type,
+                "bytes": len(audio_bytes)
+            }
         )
 
-    return transcript
+        response = client.audio.transcriptions.create(
+            model=OPENAI_TRANSCRIPTION_MODEL,
+            file=(
+                clean_filename,
+                audio_bytes,
+                clean_mime_type
+            ),
+            response_format="text"
+        )
+
+        if isinstance(response, str):
+            transcript = response
+        else:
+            transcript = getattr(
+                response,
+                "text",
+                ""
+            )
+
+        transcript = clean_text_for_postgres(
+            str(transcript or "")
+        ).strip()
+
+        if not transcript:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "The voice note was uploaded, but no speech "
+                    "could be detected"
+                )
+            )
+
+        print(
+            "OPENAI TRANSCRIPTION SUCCESS:",
+            {
+                "provider": "openai",
+                "model": OPENAI_TRANSCRIPTION_MODEL,
+                "filename": clean_filename,
+                "transcript_characters": len(transcript)
+            }
+        )
+
+        return transcript
+
+    except HTTPException:
+        raise
+
+    except Exception as error:
+        print(
+            "OPENAI TRANSCRIPTION ERROR:",
+            {
+                "provider": "openai",
+                "model": OPENAI_TRANSCRIPTION_MODEL,
+                "filename": clean_filename,
+                "error_type": type(error).__name__,
+                "error": str(error)
+            }
+        )
+
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "OpenAI voice transcription failed: "
+                f"{type(error).__name__}: {error}"
+            )
+        )
 
 def upload_asset(
     file,
@@ -7922,48 +7924,61 @@ def normalise_for_source_check(value):
     return " ".join(str(value or "").lower().split())
 
 
-def source_quote_exists_in_row(row, quote):
-    if not row:
+def source_quote_exists_in_row(
+    row: dict,
+    quote: str
+) -> bool:
+    """
+    Verifies that a claimed quotation genuinely exists in the selected source.
+
+    Exact normalised matching is preferred. A conservative word-overlap
+    fallback handles OCR spacing and punctuation changes without accepting
+    loosely related sources.
+    """
+
+    if not isinstance(row, dict):
         return False
 
     row_text = normalise_for_source_check(
-        row.get("content")
+        row.get("search_text")
+        or row.get("content")
         or row.get("text")
         or ""
     )
 
-    if not row_text:
+    quote_text = normalise_for_source_check(
+        quote
+    )
+
+    if not row_text or not quote_text:
         return False
 
-    quote_text = normalise_for_source_check(quote)
-
-    if not quote_text:
-        # If the source number is valid but the quote is empty, do not approve blindly.
-        return False
-
-    # Exact normalised quote match.
+    # Direct normalised quotation match.
     if quote_text in row_text:
         return True
 
-    # Soft fallback:
-    # Sometimes the LLM copies evidence with punctuation, line breaks, or small spacing differences.
-    # Accept it only if most meaningful words from the quote appear in the selected source.
     quote_words = [
         word
         for word in quote_text.split()
-        if len(word) >= 4
+        if len(word) >= 3
     ]
 
-    if len(quote_words) < 4:
+    if len(quote_words) < 6:
         return False
 
-    matched_words = [
-        word
+    matched_word_count = sum(
+        1
         for word in quote_words
         if word in row_text
-    ]
+    )
 
-    return len(matched_words) / max(len(quote_words), 1) >= 0.75
+    overlap = (
+        matched_word_count
+        / len(quote_words)
+    )
+
+    # Require strong overlap for OCR-altered evidence.
+    return overlap >= 0.90
 
 def extract_protected_answer_tokens(
     value: str
@@ -9452,7 +9467,7 @@ def expand_retrieved_rows_to_full_relevant_documents(
     answer_depth: str = "focused",
     max_assets: int | None = None,
     max_rows_per_asset: int | None = None,
-    max_context_chars: int = 180000
+    max_context_chars: int = 250000
 ) -> list[dict]:
     """
     Expands initially retrieved chunks into complete relevant document context.
@@ -9507,7 +9522,7 @@ def expand_retrieved_rows_to_full_relevant_documents(
 
         else:
             # A direct question can still require facts from several files.
-            max_assets = 5
+            max_assets = 15
 
     max_assets = max(
         1,
@@ -15403,54 +15418,28 @@ Document context:
             mode="document_qa"
         )
 
+
     # =========================================================
-    # SOURCE FALLBACK
+    # VERIFIED SOURCES ONLY
     # =========================================================
 
-    # When valid evidence quotes were returned, use only those rows.
-    # Otherwise use the strongest retrieved document rows rather than
-    # throwing away a valid answer merely because the model did not
-    # produce perfect source JSON.
     if not verified_rows:
-        verified_rows = []
-
-        seen_verified_assets = set()
-
-        for row in matched_rows:
-            if not isinstance(row, dict):
-                continue
-
-            asset_id = row.get("asset_id")
-
-            if not asset_id:
-                continue
-
-            if asset_id in seen_verified_assets:
-                continue
-
-            row_text = clean_text_for_postgres(
-                str(
-                    row.get("content")
-                    or row.get("search_text")
-                    or row.get("text")
-                    or ""
+        print(
+            "SOURCE VALIDATION FAILED:",
+            {
+                "query": clean_query,
+                "reason": (
+                    "The answer was generated, but no exact supporting "
+                    "document quotation could be verified."
                 )
-            ).strip()
+            }
+        )
 
-            if not row_text:
-                continue
-
-            seen_verified_assets.add(
-                asset_id
-            )
-
-            verified_rows.append(
-                row
-            )
-
-            # Keep the displayed sources focused.
-            if len(verified_rows) >= 3:
-                break
+        return finish(
+            final_answer=FALLBACK_NO_DATA_ANSWER,
+            final_sources=[],
+            mode="document_qa"
+        )
 
     verified_sources = build_sources_from_asset_results(
         verified_rows
