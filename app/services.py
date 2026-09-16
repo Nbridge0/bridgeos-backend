@@ -7549,8 +7549,17 @@ def resolve_chat_turn(
 
     default_result = {
         "relationship": "standalone",
-        "active_topic": clean_query,
+
+    # The substantive subject that started the CURRENT topic.
+    # Greetings / acknowledgements must never become this.
+        "topic_anchor": clean_query,
+
+    # Concise accumulated state of this topic.
+        "topic_state": clean_query,
+
+    # Self-contained interpretation of the current request.
         "resolved_query": clean_query,
+
         "reuse_previous_sources": False,
         "needs_global_search": True,
         "reason": ""
@@ -7575,66 +7584,106 @@ def resolve_chat_turn(
             context=f"""
 Determine the conversation state for the latest user message.
 
-You must maintain ONE current substantive active topic.
+You are maintaining the semantic state of ONE conversation.
 
-A substantive topic is the actual task, situation or subject the
-user is discussing.
+Do NOT answer the user's factual question.
 
-Greetings, acknowledgements and small talk are NOT substantive topics.
+You must distinguish three different concepts:
 
-Examples:
+1. TOPIC ANCHOR
+2. TOPIC STATE
+3. RESOLVED QUERY
 
-"hi"
-"hello"
-"thanks"
-"okay"
-"great"
 
-must NEVER replace an existing active topic.
+TOPIC ANCHOR
+============
 
-A user may gradually add information to ONE real-world situation.
+topic_anchor is the substantive subject or task that STARTED the
+CURRENT discussion.
 
-For example:
+It is NOT automatically the first message in the chat.
 
-User:
-hi
+Ignore messages that are only:
+- greetings;
+- thanks;
+- acknowledgements;
+- pleasantries;
+- small talk;
+- application-control messages.
 
-User:
-the guest wants to use the swim platform, anything I need to know?
+The first substantive request after such messages establishes the
+topic anchor.
 
-User:
-the toys are in the water as well, does that matter?
+Once established, the topic anchor must remain stable through:
+- follow-up questions;
+- pronouns and references;
+- extra conditions;
+- extra objects;
+- extra events;
+- extra constraints;
+- clarifications;
+- comparisons;
+- "what about..." messages;
+- "and also..." messages;
+- "does that matter?" messages.
 
-User:
-and we're also fuel bunkering
+Do NOT replace the topic anchor merely because another detail has
+been introduced.
 
-This is ONE continuing substantive situation.
+Replace the topic anchor ONLY when the user clearly begins a
+genuinely different substantive subject.
 
-The active topic becomes conceptually:
 
-Guest use of the swim platform while toys are in the water and
-fuel bunkering is taking place.
+TOPIC STATE
+===========
 
-The latest message:
+topic_state is a concise representation of the current real-world
+situation associated with the topic anchor.
 
-"and we're also fuel bunkering"
+It may grow when the user adds relevant information.
 
-must therefore NOT be interpreted as an isolated question.
+It must preserve relevant established conditions from earlier turns.
 
-It must be resolved against the active situation.
+Do NOT copy the conversation transcript.
 
-Return ONLY valid JSON exactly shaped like:
+Do NOT include irrelevant old messages.
 
-{{
-    "relationship": "same_topic_addition",
-    "active_topic": "concise description of current substantive topic",
-    "resolved_query": "self-contained interpretation of the CURRENT user request",
-    "reuse_previous_sources": true,
-    "needs_global_search": true,
-    "reason": "short explanation"
-}}
+Do NOT treat assistant answers as factual document evidence.
 
-relationship MUST be exactly one of:
+
+RESOLVED QUERY
+==============
+
+resolved_query is the CURRENT user's request rewritten so that it
+can be understood on its own.
+
+For a follow-up or added condition, resolved_query MUST remain
+explicitly connected to the topic anchor and current topic state.
+
+Do not return only the newly introduced detail when that detail
+depends on the established topic.
+
+For example, conceptually:
+
+Topic anchor:
+"operation of equipment X"
+
+Later condition:
+"weather condition Y is also occurring"
+
+The resolved query must represent:
+"How does weather condition Y affect operation of equipment X?"
+
+It must NOT simply become:
+"weather condition Y"
+
+This rule applies GENERICALLY to every subject.
+
+
+RELATIONSHIP
+============
+
+Return exactly one of:
 
 conversational
 standalone
@@ -7642,127 +7691,95 @@ followup
 same_topic_addition
 topic_shift
 
-Definitions:
-
 conversational:
-The current message is greeting, acknowledgement, thanks,
-casual conversation or application help.
-
-A conversational message MUST NOT become the substantive active topic.
+The latest message is only greeting, thanks, acknowledgement,
+small talk or application help.
 
 standalone:
-The user introduces a substantive subject and there is no relevant
-existing topic that must be inherited.
+A substantive topic begins and there is no existing relevant
+substantive topic.
 
 followup:
-The user asks something that depends on the existing active topic.
+The latest request depends on the current topic anchor.
 
 same_topic_addition:
-The user adds another condition, constraint, event, object or fact
-to the SAME substantive situation.
+The user adds another condition, fact, event, constraint or object
+to the same substantive topic.
 
 topic_shift:
-The user clearly starts a genuinely different substantive subject.
+The user clearly starts discussing a different substantive subject.
 
-CRITICAL ACTIVE-TOPIC RULES:
 
-- Maintain the semantic topic, not the transcript.
-- Do NOT concatenate all previous messages.
-- Do NOT copy the whole conversation into resolved_query.
-- Do NOT make "hi" or another greeting the active topic.
-- Understand the conversation semantically.
-- Preserve relevant conditions already established.
-- Drop irrelevant historical details.
-- A later condition can extend the active topic.
-- A new substantive subject can replace the active topic.
-- Do not confuse a new condition with a topic change.
+SOURCE CONTINUITY
+=================
 
-REFERENCE RESOLUTION:
+reuse_previous_sources=true when documents already used during the
+current topic may still contain relevant evidence.
 
-Correctly resolve words and phrases such as:
+needs_global_search=true when additional evidence may be required
+for a new condition or aspect of the same topic.
+
+These may BOTH be true.
+
+A same-topic addition should normally preserve previous evidence
+while also allowing retrieval of new evidence.
+
+
+REFERENCE RESOLUTION
+====================
+
+Resolve contextual references such as:
 
 it
-that
 this
-those
-them
+that
 they
+them
+those
 the previous one
 the other one
 what about
-and also
+and
+also
 as well
-does that matter
-what should we do
-what happens then
 before that
 after that
-which one
+does that matter
+what should happen
+what should we do
 why
+which one
 
-RESOLVED QUERY RULES:
+against the current topic anchor and topic state.
 
-resolved_query must contain enough context for document retrieval
-but must remain concise.
 
-GOOD:
+CRITICAL RULES
+==============
 
-"Does fuel bunkering affect whether a guest can safely use the
-swim platform while toys are in the water?"
+- Maintain semantic continuity.
+- Do not concatenate user messages.
+- Do not concatenate assistant messages.
+- Do not turn conversation history into the retrieval query.
+- Do not invent document contents.
+- Do not invent requirements.
+- Do not invent values, dates, names or events.
+- The conversation determines intent only.
+- Documents determine facts.
+- Preserve the topic anchor until a real topic shift occurs.
+- A new detail is NOT automatically a new topic.
+- A greeting is NEVER a substantive topic.
 
-BAD:
+Return ONLY valid JSON exactly shaped like:
 
-"the guest wants to use the swim platform, anything I need to know?
-the toys are in the water as well, does that matter?
-and we're also fuel bunkering"
-
-Never return a transcript as the resolved query.
-
-SOURCE RULES:
-
-reuse_previous_sources=true when documents already used in the
-current active topic may still be relevant.
-
-needs_global_search=true when the current request introduces a new
-concept that may require additional documents.
-
-For example:
-
-swim platform
-→ previous swim-platform source useful
-
-toys added
-→ previous source useful BUT new toy documents may also be needed
-
-fuel bunkering added
-→ existing sources remain contextually relevant BUT bunkering
-documents may also need to be searched
-
-Therefore this can be:
-
-reuse_previous_sources=true
-needs_global_search=true
-
-IMPORTANT:
-
-Conversation history is used ONLY for understanding intent.
-
-Assistant answers are NOT authoritative factual evidence.
-
-Never invent:
-- document contents;
-- values;
-- dates;
-- names;
-- procedures;
-- requirements;
-- products;
-- suppliers;
-- equipment.
-
-Do not answer the question.
-
-Return JSON only.
+{{
+    "relationship": "followup",
+    "topic_anchor": "stable substantive topic for the current discussion",
+    "topic_state": "concise accumulated state of that topic",
+    "resolved_query": "self-contained meaning of the latest user request within that topic",
+    "reuse_previous_sources": true,
+    "needs_global_search": false,
+    "reason": "short explanation"
+}}
 
 CONVERSATION HISTORY:
 
@@ -7772,6 +7789,7 @@ LATEST USER MESSAGE:
 
 {clean_query}
 """.strip()
+
         )
 
         parsed = parse_llm_json_response(
@@ -7797,9 +7815,18 @@ LATEST USER MESSAGE:
         if relationship not in allowed_relationships:
             relationship = "standalone"
 
-        active_topic = clean_text_for_postgres(
+        topic_anchor = clean_text_for_postgres(
             str(
-                parsed.get("active_topic")
+                parsed.get("topic_anchor")
+                or clean_query
+            )
+        ).strip()
+
+
+        topic_state = clean_text_for_postgres(
+            str(
+                parsed.get("topic_state")
+                or topic_anchor
                 or clean_query
             )
         ).strip()
@@ -7816,6 +7843,12 @@ LATEST USER MESSAGE:
 
         if not resolved_query:
             resolved_query = clean_query
+
+        if not topic_anchor:
+            topic_anchor = resolved_query or clean_query
+
+        if not topic_state:
+            topic_state = topic_anchor
 
         reuse_previous_sources = bool(
             parsed.get(
@@ -7843,7 +7876,8 @@ LATEST USER MESSAGE:
 
         result = {
             "relationship": relationship,
-            "active_topic": active_topic,
+            "topic_anchor": topic_anchor,
+            "topic_state": topic_state,
             "resolved_query": resolved_query,
             "reuse_previous_sources": reuse_previous_sources,
             "needs_global_search": needs_global_search,
@@ -9083,8 +9117,7 @@ Answer the user's question using ONLY the documents supplied below.
 
 Return ONLY valid JSON in exactly this structure:
 
-{{
-  "answer": "complete direct answer",
+{
   "claims": [
     {{
       "claim": "one factual claim included in the answer",
@@ -9101,7 +9134,10 @@ Critical rules:
 - Never invent names, dates, quantities, requirements, conclusions or events.
 - Copy asset_id exactly.
 - Copy evidence_quote exactly from the corresponding document.
-- Every factual statement in the answer must be covered by at least one claim.
+- Extract only claims that directly answer the user's request.
+- Each claim must be a concise factual statement.
+- Every claim must be directly supported by its exact evidence quote.
+- Do not create the final prose answer yet.
 - If multiple documents contribute, include claims for every contributing document.
 - Do not cite a document merely because it discusses a similar subject.
 - Do not use source numbers.
@@ -9109,7 +9145,6 @@ Critical rules:
 - Use British English.
 - If the documents do not contain enough information, return exactly:
 {{
-  "answer": "{FALLBACK_NO_DATA_ANSWER}",
   "claims": []
 }}
 
@@ -9148,16 +9183,11 @@ Documents:
             "sources": []
         }
 
-    answer = clean_text_for_postgres(
-        str(parsed.get("answer") or "")
-    ).strip()
 
     claims = parsed.get("claims") or []
 
     if (
-        not answer
-        or answer == FALLBACK_NO_DATA_ANSWER
-        or not isinstance(claims, list)
+        not isinstance(claims, list)
         or not claims
     ):
         return {
@@ -9243,6 +9273,54 @@ Documents:
             "answer": FALLBACK_NO_DATA_ANSWER,
             "sources": []
         }
+
+
+    verified_claim_texts = []
+
+    seen_claim_texts = set()
+
+    for item in verified_claims:
+
+        claim_text = clean_text_for_postgres(
+            str(
+                item.get("claim")
+                or ""
+            )
+        ).strip()
+
+        if not claim_text:
+            continue
+
+        claim_key = normalise_search_text(
+            claim_text
+        )
+
+        if not claim_key:
+            continue
+
+        if claim_key in seen_claim_texts:
+            continue
+
+        seen_claim_texts.add(
+            claim_key
+        )
+
+        verified_claim_texts.append(
+            claim_text
+        )
+
+
+    if not verified_claim_texts:
+
+        return {
+            "answer": FALLBACK_NO_DATA_ANSWER,
+            "sources": []
+        }
+
+
+    answer = " ".join(
+        verified_claim_texts
+    ).strip()
 
     # =========================================================
     # CHECK THAT ANSWER VALUES EXIST IN VERIFIED EVIDENCE
@@ -9690,50 +9768,109 @@ def get_previous_assistant_source_asset_ids(
     chat_id: str,
     crew_id: str,
     yacht_id: str,
-    limit: int = 6
+    limit: int = 12
 ) -> list[str]:
     """
-    Gets source asset ids from the most recent assistant answer that had sources.
+    Collects source asset ids across the recent assistant answers
+    in the same chat.
 
-    Used for follow-up questions so BridgeOS expands from the same document
-    instead of searching unrelated documents.
+    This lets a continuing topic preserve documents discovered
+    during earlier turns instead of remembering only the latest
+    answer's source.
     """
 
     try:
-        res = supabase.table("messages") \
-            .select("role, sources, created_at") \
-            .eq("chat_id", chat_id) \
-            .eq("crew_id", crew_id) \
-            .eq("yacht_id", yacht_id) \
-            .eq("role", "assistant") \
-            .order("created_at", desc=True) \
-            .limit(limit) \
+        res = (
+            supabase.table("messages")
+            .select(
+                "role, sources, created_at"
+            )
+            .eq(
+                "chat_id",
+                chat_id
+            )
+            .eq(
+                "crew_id",
+                crew_id
+            )
+            .eq(
+                "yacht_id",
+                yacht_id
+            )
+            .eq(
+                "role",
+                "assistant"
+            )
+            .order(
+                "created_at",
+                desc=True
+            )
+            .limit(
+                max(
+                    1,
+                    int(limit or 12)
+                )
+            )
             .execute()
+        )
+
+        asset_ids = []
 
         for row in res.data or []:
-            row_sources = row.get("sources") or []
 
-            if not isinstance(row_sources, list):
+            row_sources = (
+                row.get("sources")
+                or []
+            )
+
+            if not isinstance(
+                row_sources,
+                list
+            ):
                 continue
 
-            asset_ids = []
-
             for source in row_sources:
-                if not isinstance(source, dict):
+
+                if not isinstance(
+                    source,
+                    dict
+                ):
                     continue
 
-                asset_id = source.get("asset_id")
+                asset_id = str(
+                    source.get("asset_id")
+                    or ""
+                ).strip()
 
-                if asset_id and asset_id not in asset_ids:
-                    asset_ids.append(asset_id)
+                if not asset_id:
+                    continue
 
-            if asset_ids:
-                return asset_ids
+                if asset_id in asset_ids:
+                    continue
 
-    except Exception as e:
-        print("PREVIOUS ASSISTANT SOURCES ERROR:", type(e).__name__, str(e))
+                asset_ids.append(
+                    asset_id
+                )
 
-    return []
+        print(
+            "CHAT TOPIC SOURCE MEMORY:",
+            {
+                "chat_id": chat_id,
+                "source_asset_ids": asset_ids
+            }
+        )
+
+        return asset_ids
+
+    except Exception as error:
+
+        print(
+            "PREVIOUS ASSISTANT SOURCES ERROR:",
+            type(error).__name__,
+            str(error)
+        )
+
+        return []
 
 def rerank_retrieved_rows_for_query(
     query: str,
@@ -10521,7 +10658,7 @@ def expand_retrieved_rows_to_full_relevant_documents(
             max_assets = 5
 
     max_assets = max(
-        1, or what?
+        1, 
         min(
             int(max_assets),
             20
@@ -15285,11 +15422,23 @@ def chat(
         )
     )
 
-    active_topic = clean_text_for_postgres(
+    topic_anchor = clean_text_for_postgres(
         str(
             turn_resolution.get(
-                "active_topic"
+                "topic_anchor"
             )
+            or resolved_query
+            or clean_query
+        )
+    ).strip()
+
+
+    topic_state = clean_text_for_postgres(
+        str(
+            turn_resolution.get(
+                "topic_state"
+            )
+            or topic_anchor
             or resolved_query
             or clean_query
         )
@@ -15306,19 +15455,30 @@ def chat(
     # clean_query remains the user's literal wording.
     effective_query = resolved_query
 
+    if memory_relationship in {
+        "followup",
+        "same_topic_addition"
+    }:
+        answer_query = (
+            f"Main conversation topic: {topic_anchor}\n"
+            f"Current situation: {topic_state}\n"
+            f"Current request: {resolved_query}"
+        ).strip()
+
+    else:
+        answer_query = resolved_query
+
     print(
         "CHAT MEMORY RESOLUTION:",
         {
             "current_query": clean_query,
             "relationship": memory_relationship,
-            "active_topic": active_topic,
+            "topic_anchor": topic_anchor,
+            "topic_state": topic_state,
             "resolved_query": resolved_query,
-            "reuse_previous_sources": (
-                reuse_previous_sources
-            ),
-            "needs_global_search": (
-                needs_global_search
-            )
+            "answer_query": answer_query,
+            "reuse_previous_sources": reuse_previous_sources,
+            "needs_global_search": needs_global_search
         }
     )
 
@@ -16532,7 +16692,7 @@ Rules:
     try:
         grounded_result = (
             answer_only_from_verified_document_evidence(
-                query=effective_query,
+                query=answer_query,
                 matched_rows=candidate_rows
             )
         )
