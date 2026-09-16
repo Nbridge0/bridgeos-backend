@@ -7221,692 +7221,201 @@ def keyword_search_asset_chunks(
         limit=limit
     )
 
-def ask_openai_memory(
-    query: str,
-    context: str
-) -> str:
+def get_recent_chat_context(chat_id: str, limit: int = 6) -> str:
     """
-    OpenAI is used ONLY as BridgeOS's conversation-state controller.
+    Gets recent chat messages.
 
-    It is NOT used for:
-    - document answering;
-    - document extraction;
-    - retrieval reranking;
-    - financial calculations;
-    - normal RAG generation.
+    This is used only to resolve follow-up references like:
+    - it
+    - that
+    - this
+    - they
+    - the above
+    - the previous answer
 
-    Those can continue using the existing ask_llm() provider.
-    """
-
-    clean_query = clean_text_for_postgres(
-        str(query or "")
-    ).strip()
-
-    clean_context = clean_text_for_postgres(
-        str(context or "")
-    ).strip()
-
-    try:
-        client = get_openai_client()
-
-        prompt = f"""
-You are the conversation-state controller for BridgeOS.
-
-You are NOT answering the user's factual question.
-
-Your only job is to understand conversation state, references,
-active topic and user intent.
-
-CONTEXT:
-
-{clean_context}
-
-CURRENT USER MESSAGE:
-
-{clean_query}
-""".strip()
-
-        print(
-            "OPENAI MEMORY START:",
-            {
-                "model": OPENAI_CHAT_MODEL,
-                "query": clean_query[:300]
-            }
-        )
-
-        response = client.responses.create(
-            model=OPENAI_CHAT_MODEL,
-            input=prompt,
-            store=False
-        )
-
-        output_text = str(
-            getattr(
-                response,
-                "output_text",
-                ""
-            )
-            or ""
-        ).strip()
-
-        if not output_text:
-            raise RuntimeError(
-                "OpenAI memory resolver returned empty text."
-            )
-
-        print(
-            "OPENAI MEMORY SUCCESS:",
-            {
-                "model": OPENAI_CHAT_MODEL,
-                "characters": len(output_text)
-            }
-        )
-
-        return output_text
-
-    except Exception as error:
-        print(
-            "OPENAI MEMORY ERROR:",
-            type(error).__name__,
-            str(error)
-        )
-
-        raise
-
-# ============================================================
-# CHAT MEMORY / TURN RESOLUTION
-# ============================================================
-
-def get_chat_memory_context(
-    chat_id: str,
-    current_query: str | None = None,
-    recent_limit: int = 30,
-    older_limit: int = 120
-) -> str:
-    """
-    Builds stable conversation memory for one chat.
-
-    Behaviour:
-    - Keeps a much larger recent verbatim window.
-    - Includes both user and assistant messages.
-    - Excludes the current user message if chat() already saved it.
-    - Summarises older conversation history instead of simply forgetting it.
-    - Does NOT use conversation history as factual document evidence.
-    - Conversation history is used only to understand the user's intent.
+    It is not used as factual evidence.
     """
 
     try:
-        total_limit = max(
-            recent_limit,
-            recent_limit + older_limit
-        )
-
-        res = (
-            supabase.table("messages")
-            .select("role, content, created_at, sources")
-            .eq("chat_id", chat_id)
-            .order("created_at", desc=True)
-            .limit(total_limit)
+        res = supabase.table("messages") \
+            .select("role, content, created_at") \
+            .eq("chat_id", chat_id) \
+            .order("created_at", desc=True) \
+            .limit(limit) \
             .execute()
-        )
 
-        rows = list(
-            reversed(
-                res.data or []
-            )
-        )
+        rows = list(reversed(res.data or []))
 
-        current_clean = clean_text_for_postgres(
-            str(current_query or "")
-        ).strip()
-
-        cleaned_rows = []
-
-        current_skipped = False
+        parts = []
 
         for row in rows:
-            role = str(
-                row.get("role")
-                or "message"
-            ).strip().lower()
+            role = row.get("role") or "message"
+            content = (row.get("content") or "").strip()
 
-            content = clean_text_for_postgres(
-                str(
-                    row.get("content")
-                    or ""
-                )
-            ).strip()
+            if content:
+                parts.append(f"{role}: {content}")
+
+        return "\n".join(parts)
+
+    except Exception as e:
+        print("RECENT CHAT CONTEXT ERROR:", type(e).__name__, str(e))
+        return ""
+
+
+def build_standalone_retrieval_query(query: str, chat_id: str) -> str:
+    """
+    Turns a follow-up question into a standalone retrieval query using recent chat.
+
+    No hardcoded document names.
+    No hardcoded topics.
+    No hardcoded example questions.
+
+    The LLM uses recent chat only to resolve references.
+    """
+
+    recent_chat_context = get_recent_chat_context(
+        chat_id=chat_id,
+        limit=6
+    )
+
+    if not recent_chat_context.strip():
+        return query
+
+    try:
+        rewritten = ask_llm(
+            query=query,
+            context=f"""
+You rewrite user questions for document retrieval.
+
+Your task:
+- Use the recent conversation only to resolve references in the current question.
+- If the current question depends on previous context, rewrite it as a complete standalone search query.
+- If it is already standalone, return it unchanged.
+- Do not answer the question.
+- Do not add facts.
+- Do not invent document names.
+- Do not invent topics.
+- Do not hardcode anything.
+- Return only the rewritten search query as plain text.
+
+Recent conversation:
+{recent_chat_context}
+
+Current question:
+{query}
+""".strip()
+        )
+
+        rewritten = str(rewritten or "").strip()
+
+        if rewritten:
+            return rewritten
+
+    except Exception as e:
+        print("STANDALONE QUERY REWRITE ERROR:", type(e).__name__, str(e))
+
+    return query
+
+def get_previous_user_query(chat_id: str, current_query: str) -> str:
+    """
+    Gets the previous user message in this same chat.
+
+    This is generic memory for follow-up questions.
+    It does not hardcode document names, topics, SOPs, reports, years, or examples.
+    """
+
+    try:
+        res = supabase.table("messages") \
+            .select("role, content, created_at") \
+            .eq("chat_id", chat_id) \
+            .eq("role", "user") \
+            .order("created_at", desc=True) \
+            .limit(6) \
+            .execute()
+
+        rows = res.data or []
+        current_clean = (current_query or "").strip()
+
+        for index, row in enumerate(rows):
+            content = (row.get("content") or "").strip()
 
             if not content:
                 continue
 
-            # chat() stores the current user message before memory resolution.
-            # Skip only the newest matching copy.
-            if (
-                not current_skipped
-                and current_clean
-                and role == "user"
-                and content == current_clean
-            ):
-                current_skipped = True
+            # The newest row is usually the current message because chat()
+            # inserts it before retrieval. Skip it.
+            if index == 0 and content == current_clean:
                 continue
 
-            cleaned_rows.append({
-                "role": role,
-                "content": content,
-                "sources": row.get("sources") or []
-            })
+            return content
 
-        if not cleaned_rows:
-            return ""
+    except Exception as e:
+        print("PREVIOUS USER QUERY ERROR:", type(e).__name__, str(e))
 
-        recent_rows = cleaned_rows[
-            -recent_limit:
-        ]
-
-        older_rows = cleaned_rows[
-            :-recent_limit
-        ]
-
-        recent_parts = []
-
-        for row in recent_rows:
-            role = row["role"]
-            content = row["content"]
-
-            recent_parts.append(
-                f"{role}: {content}"
-            )
-
-        recent_text = "\n".join(
-            recent_parts
-        ).strip()
-
-        older_summary = ""
-
-        if older_rows:
-            older_text_parts = []
-
-            for row in older_rows:
-                older_text_parts.append(
-                    f"{row['role']}: "
-                    f"{row['content']}"
-                )
-
-            older_text = "\n".join(
-                older_text_parts
-            ).strip()
-
-            if older_text:
-                try:
-                    summary_raw = ask_openai_memory(
-                        query=(
-                            "Create a conversation-memory summary."
-                        ),
-                        context=f"""
-You maintain conversation memory for BridgeOS.
-
-Summarise the older part of this SAME conversation so later turns
-can understand what the user is referring to.
-
-Preserve:
-- active subjects;
-- people;
-- products;
-- equipment;
-- document names only when they actually appeared;
-- dates and time periods;
-- previous user requests;
-- comparisons already requested;
-- unresolved references;
-- constraints;
-- changes of topic;
-- whether the discussion was about financial calculations,
-  ordinary document questions, email, API data, images, or another source.
-
-Rules:
-- Do NOT add facts.
-- Do NOT answer any question.
-- Do NOT use outside knowledge.
-- Do NOT invent document names.
-- Do NOT treat an assistant statement as document evidence.
-- Keep factual claims clearly attributable to the conversation.
-- Preserve important identifiers and numbers exactly.
-- Return concise plain text only.
-
-Older conversation:
-{older_text}
-""".strip()
-                    )
-
-                    older_summary = clean_text_for_postgres(
-                        str(
-                            summary_raw
-                            or ""
-                        )
-                    ).strip()
-
-                except Exception as error:
-                    print(
-                        "OLDER CHAT MEMORY SUMMARY ERROR:",
-                        type(error).__name__,
-                        str(error)
-                    )
-
-                    older_summary = older_text[
-                        -12000:
-                    ]
-
-        memory_parts = []
-
-        if older_summary:
-            memory_parts.append(
-                "OLDER CONVERSATION MEMORY:\n"
-                + older_summary
-            )
-
-        if recent_text:
-            memory_parts.append(
-                "RECENT VERBATIM CONVERSATION:\n"
-                + recent_text
-            )
-
-        return "\n\n".join(
-            memory_parts
-        ).strip()
-
-    except Exception as error:
-        print(
-            "CHAT MEMORY CONTEXT ERROR:",
-            type(error).__name__,
-            str(error)
-        )
-
-        return ""
+    return ""
 
 
-def resolve_chat_turn(
-    query: str,
-    chat_id: str
-) -> dict:
+def build_memory_aware_retrieval_input(query: str, chat_id: str) -> str:
     """
-    OpenAI conversation-state controller.
+    Rewrites follow-up questions into standalone document-search questions.
 
-    This function understands:
-    - the active substantive topic;
-    - follow-ups;
-    - same-topic additions;
-    - topic changes;
-    - references such as it/that/them;
-    - greetings and small talk.
-
-    It does NOT answer document questions.
+    No hardcoded topics, products, vendors, food names, years, or document names.
     """
 
-    clean_query = clean_text_for_postgres(
-        str(query or "")
-    ).strip()
-
-    default_result = {
-        "relationship": "standalone",
-
-    # The substantive subject that started the CURRENT topic.
-    # Greetings / acknowledgements must never become this.
-        "topic_anchor": clean_query,
-
-    # Concise accumulated state of this topic.
-        "topic_state": clean_query,
-
-    # Self-contained interpretation of the current request.
-        "resolved_query": clean_query,
-
-        "reuse_previous_sources": False,
-        "needs_global_search": True,
-        "reason": ""
-    }
+    clean_query = str(query or "").strip()
 
     if not clean_query:
-        return default_result
+        return ""
 
-    memory_context = get_chat_memory_context(
+    recent_user_context = get_recent_user_context(
         chat_id=chat_id,
         current_query=clean_query,
-        recent_limit=30,
-        older_limit=120
+        limit=6
     )
 
-    if not memory_context:
-        return default_result
+    if not recent_user_context.strip():
+        return clean_query
 
     try:
-        raw = ask_openai_memory(
+        rewritten = ask_llm(
             query=clean_query,
             context=f"""
-Determine the conversation state for the latest user message.
+You rewrite the latest user message into a complete standalone search query for document retrieval.
 
-You are maintaining the semantic state of ONE conversation.
+Use only the previous user messages to understand the user's intent.
 
-Do NOT answer the user's factual question.
+Rules:
+- Do not answer the question.
+- Do not add facts.
+- Do not invent values.
+- Do not invent document names.
+- Do not use assistant replies.
+- Preserve the latest user-requested item, date, person, object, category, or subject.
+- If the latest message is a follow-up, rewrite it as a full standalone question using the previous user message pattern.
+- If the latest message is already standalone, return it unchanged.
+- Return plain text only.
+- No explanations.
 
-You must distinguish three different concepts:
+Previous user messages:
+{recent_user_context}
 
-1. TOPIC ANCHOR
-2. TOPIC STATE
-3. RESOLVED QUERY
-
-
-TOPIC ANCHOR
-============
-
-topic_anchor is the substantive subject or task that STARTED the
-CURRENT discussion.
-
-It is NOT automatically the first message in the chat.
-
-Ignore messages that are only:
-- greetings;
-- thanks;
-- acknowledgements;
-- pleasantries;
-- small talk;
-- application-control messages.
-
-The first substantive request after such messages establishes the
-topic anchor.
-
-Once established, the topic anchor must remain stable through:
-- follow-up questions;
-- pronouns and references;
-- extra conditions;
-- extra objects;
-- extra events;
-- extra constraints;
-- clarifications;
-- comparisons;
-- "what about..." messages;
-- "and also..." messages;
-- "does that matter?" messages.
-
-Do NOT replace the topic anchor merely because another detail has
-been introduced.
-
-Replace the topic anchor ONLY when the user clearly begins a
-genuinely different substantive subject.
-
-
-TOPIC STATE
-===========
-
-topic_state is a concise representation of the current real-world
-situation associated with the topic anchor.
-
-It may grow when the user adds relevant information.
-
-It must preserve relevant established conditions from earlier turns.
-
-Do NOT copy the conversation transcript.
-
-Do NOT include irrelevant old messages.
-
-Do NOT treat assistant answers as factual document evidence.
-
-
-RESOLVED QUERY
-==============
-
-resolved_query is the CURRENT user's request rewritten so that it
-can be understood on its own.
-
-For a follow-up or added condition, resolved_query MUST remain
-explicitly connected to the topic anchor and current topic state.
-
-Do not return only the newly introduced detail when that detail
-depends on the established topic.
-
-For example, conceptually:
-
-Topic anchor:
-"operation of equipment X"
-
-Later condition:
-"weather condition Y is also occurring"
-
-The resolved query must represent:
-"How does weather condition Y affect operation of equipment X?"
-
-It must NOT simply become:
-"weather condition Y"
-
-This rule applies GENERICALLY to every subject.
-
-
-RELATIONSHIP
-============
-
-Return exactly one of:
-
-conversational
-standalone
-followup
-same_topic_addition
-topic_shift
-
-conversational:
-The latest message is only greeting, thanks, acknowledgement,
-small talk or application help.
-
-standalone:
-A substantive topic begins and there is no existing relevant
-substantive topic.
-
-followup:
-The latest request depends on the current topic anchor.
-
-same_topic_addition:
-The user adds another condition, fact, event, constraint or object
-to the same substantive topic.
-
-topic_shift:
-The user clearly starts discussing a different substantive subject.
-
-
-SOURCE CONTINUITY
-=================
-
-reuse_previous_sources=true when documents already used during the
-current topic may still contain relevant evidence.
-
-needs_global_search=true when additional evidence may be required
-for a new condition or aspect of the same topic.
-
-These may BOTH be true.
-
-A same-topic addition should normally preserve previous evidence
-while also allowing retrieval of new evidence.
-
-
-REFERENCE RESOLUTION
-====================
-
-Resolve contextual references such as:
-
-it
-this
-that
-they
-them
-those
-the previous one
-the other one
-what about
-and
-also
-as well
-before that
-after that
-does that matter
-what should happen
-what should we do
-why
-which one
-
-against the current topic anchor and topic state.
-
-
-CRITICAL RULES
-==============
-
-- Maintain semantic continuity.
-- Do not concatenate user messages.
-- Do not concatenate assistant messages.
-- Do not turn conversation history into the retrieval query.
-- Do not invent document contents.
-- Do not invent requirements.
-- Do not invent values, dates, names or events.
-- The conversation determines intent only.
-- Documents determine facts.
-- Preserve the topic anchor until a real topic shift occurs.
-- A new detail is NOT automatically a new topic.
-- A greeting is NEVER a substantive topic.
-
-Return ONLY valid JSON exactly shaped like:
-
-{{
-    "relationship": "followup",
-    "topic_anchor": "stable substantive topic for the current discussion",
-    "topic_state": "concise accumulated state of that topic",
-    "resolved_query": "self-contained meaning of the latest user request within that topic",
-    "reuse_previous_sources": true,
-    "needs_global_search": false,
-    "reason": "short explanation"
-}}
-
-CONVERSATION HISTORY:
-
-{memory_context}
-
-LATEST USER MESSAGE:
-
+Latest user message:
 {clean_query}
+
+Standalone search query:
 """.strip()
-
         )
 
-        parsed = parse_llm_json_response(
-            raw
-        )
+        rewritten = str(rewritten or "").strip()
 
-        if not isinstance(parsed, dict):
-            return default_result
+        if rewritten:
+            print("LOCAL CHAT DEBUG: rewritten retrieval query:", rewritten)
+            return rewritten
 
-        relationship = str(
-            parsed.get("relationship")
-            or "standalone"
-        ).strip().lower()
+    except Exception as e:
+        print("MEMORY AWARE QUERY REWRITE ERROR:", type(e).__name__, str(e))
 
-        allowed_relationships = {
-            "conversational",
-            "standalone",
-            "followup",
-            "same_topic_addition",
-            "topic_shift"
-        }
-
-        if relationship not in allowed_relationships:
-            relationship = "standalone"
-
-        topic_anchor = clean_text_for_postgres(
-            str(
-                parsed.get("topic_anchor")
-                or clean_query
-            )
-        ).strip()
-
-
-        topic_state = clean_text_for_postgres(
-            str(
-                parsed.get("topic_state")
-                or topic_anchor
-                or clean_query
-            )
-        ).strip()
-
-        resolved_query = clean_text_for_postgres(
-            str(
-                parsed.get("resolved_query")
-                or clean_query
-            )
-        ).strip()
-
-        if not active_topic:
-            active_topic = clean_query
-
-        if not resolved_query:
-            resolved_query = clean_query
-
-        if not topic_anchor:
-            topic_anchor = resolved_query or clean_query
-
-        if not topic_state:
-            topic_state = topic_anchor
-
-        reuse_previous_sources = bool(
-            parsed.get(
-                "reuse_previous_sources"
-            )
-        )
-
-        needs_global_search = bool(
-            parsed.get(
-                "needs_global_search",
-                True
-            )
-        )
-
-        if relationship in {
-            "standalone",
-            "topic_shift"
-        }:
-            reuse_previous_sources = False
-            needs_global_search = True
-
-        if relationship == "conversational":
-            reuse_previous_sources = False
-            needs_global_search = False
-
-        result = {
-            "relationship": relationship,
-            "topic_anchor": topic_anchor,
-            "topic_state": topic_state,
-            "resolved_query": resolved_query,
-            "reuse_previous_sources": reuse_previous_sources,
-            "needs_global_search": needs_global_search,
-            "reason": clean_text_for_postgres(
-                str(
-                    parsed.get("reason")
-                    or ""
-                )
-            ).strip()
-        }
-
-        print(
-            "CHAT TURN RESOLUTION:",
-            {
-                "original_query": clean_query,
-                **result
-            }
-        )
-
-        return result
-
-    except Exception as error:
-        print(
-            "CHAT TURN RESOLUTION ERROR:",
-            type(error).__name__,
-            str(error)
-        )
-
-        return default_result
+    return clean_query
 
 def get_latest_chat_asset_id(
     chat_id: str,
@@ -9117,7 +8626,8 @@ Answer the user's question using ONLY the documents supplied below.
 
 Return ONLY valid JSON in exactly this structure:
 
-{
+{{
+  "answer": "complete direct answer",
   "claims": [
     {{
       "claim": "one factual claim included in the answer",
@@ -9134,10 +8644,7 @@ Critical rules:
 - Never invent names, dates, quantities, requirements, conclusions or events.
 - Copy asset_id exactly.
 - Copy evidence_quote exactly from the corresponding document.
-- Extract only claims that directly answer the user's request.
-- Each claim must be a concise factual statement.
-- Every claim must be directly supported by its exact evidence quote.
-- Do not create the final prose answer yet.
+- Every factual statement in the answer must be covered by at least one claim.
 - If multiple documents contribute, include claims for every contributing document.
 - Do not cite a document merely because it discusses a similar subject.
 - Do not use source numbers.
@@ -9145,6 +8652,7 @@ Critical rules:
 - Use British English.
 - If the documents do not contain enough information, return exactly:
 {{
+  "answer": "{FALLBACK_NO_DATA_ANSWER}",
   "claims": []
 }}
 
@@ -9183,11 +8691,16 @@ Documents:
             "sources": []
         }
 
+    answer = clean_text_for_postgres(
+        str(parsed.get("answer") or "")
+    ).strip()
 
     claims = parsed.get("claims") or []
 
     if (
-        not isinstance(claims, list)
+        not answer
+        or answer == FALLBACK_NO_DATA_ANSWER
+        or not isinstance(claims, list)
         or not claims
     ):
         return {
@@ -9273,54 +8786,6 @@ Documents:
             "answer": FALLBACK_NO_DATA_ANSWER,
             "sources": []
         }
-
-
-    verified_claim_texts = []
-
-    seen_claim_texts = set()
-
-    for item in verified_claims:
-
-        claim_text = clean_text_for_postgres(
-            str(
-                item.get("claim")
-                or ""
-            )
-        ).strip()
-
-        if not claim_text:
-            continue
-
-        claim_key = normalise_search_text(
-            claim_text
-        )
-
-        if not claim_key:
-            continue
-
-        if claim_key in seen_claim_texts:
-            continue
-
-        seen_claim_texts.add(
-            claim_key
-        )
-
-        verified_claim_texts.append(
-            claim_text
-        )
-
-
-    if not verified_claim_texts:
-
-        return {
-            "answer": FALLBACK_NO_DATA_ANSWER,
-            "sources": []
-        }
-
-
-    answer = " ".join(
-        verified_claim_texts
-    ).strip()
 
     # =========================================================
     # CHECK THAT ANSWER VALUES EXIST IN VERIFIED EVIDENCE
@@ -9683,6 +9148,46 @@ def classify_bridgeos_query_scope(query: str) -> str:
     return "factual"
     
 
+def get_recent_user_context(chat_id: str, current_query: str, limit: int = 6) -> str:
+    """
+    Gets recent user messages only.
+
+    This is used to resolve follow-ups.
+    Assistant replies are intentionally excluded so fallback/sorry answers do not pollute the rewrite.
+    """
+
+    try:
+        res = supabase.table("messages") \
+            .select("role, content, created_at") \
+            .eq("chat_id", chat_id) \
+            .eq("role", "user") \
+            .order("created_at", desc=True) \
+            .limit(limit) \
+            .execute()
+
+        rows = list(reversed(res.data or []))
+
+        current_clean = str(current_query or "").strip()
+        parts = []
+
+        for row in rows:
+            content = str(row.get("content") or "").strip()
+
+            if not content:
+                continue
+
+            # Skip the current message because chat() already inserted it.
+            if content == current_clean:
+                continue
+
+            parts.append(content)
+
+        return "\n".join(parts)
+
+    except Exception as e:
+        print("RECENT USER CONTEXT ERROR:", type(e).__name__, str(e))
+        return ""
+
 def filter_rows_that_directly_answer_query(query: str, rows: list[dict]) -> list[dict]:
     """
     Keeps only rows that directly contain the answer to the user's exact question.
@@ -9768,402 +9273,111 @@ def get_previous_assistant_source_asset_ids(
     chat_id: str,
     crew_id: str,
     yacht_id: str,
-    limit: int = 12
+    limit: int = 6
 ) -> list[str]:
     """
-    Collects source asset ids across the recent assistant answers
-    in the same chat.
+    Gets source asset ids from the most recent assistant answer that had sources.
 
-    This lets a continuing topic preserve documents discovered
-    during earlier turns instead of remembering only the latest
-    answer's source.
+    Used for follow-up questions so BridgeOS expands from the same document
+    instead of searching unrelated documents.
     """
 
     try:
-        res = (
-            supabase.table("messages")
-            .select(
-                "role, sources, created_at"
-            )
-            .eq(
-                "chat_id",
-                chat_id
-            )
-            .eq(
-                "crew_id",
-                crew_id
-            )
-            .eq(
-                "yacht_id",
-                yacht_id
-            )
-            .eq(
-                "role",
-                "assistant"
-            )
-            .order(
-                "created_at",
-                desc=True
-            )
-            .limit(
-                max(
-                    1,
-                    int(limit or 12)
-                )
-            )
+        res = supabase.table("messages") \
+            .select("role, sources, created_at") \
+            .eq("chat_id", chat_id) \
+            .eq("crew_id", crew_id) \
+            .eq("yacht_id", yacht_id) \
+            .eq("role", "assistant") \
+            .order("created_at", desc=True) \
+            .limit(limit) \
             .execute()
-        )
-
-        asset_ids = []
 
         for row in res.data or []:
+            row_sources = row.get("sources") or []
 
-            row_sources = (
-                row.get("sources")
-                or []
-            )
-
-            if not isinstance(
-                row_sources,
-                list
-            ):
+            if not isinstance(row_sources, list):
                 continue
+
+            asset_ids = []
 
             for source in row_sources:
-
-                if not isinstance(
-                    source,
-                    dict
-                ):
+                if not isinstance(source, dict):
                     continue
 
-                asset_id = str(
-                    source.get("asset_id")
-                    or ""
-                ).strip()
+                asset_id = source.get("asset_id")
 
-                if not asset_id:
-                    continue
+                if asset_id and asset_id not in asset_ids:
+                    asset_ids.append(asset_id)
 
-                if asset_id in asset_ids:
-                    continue
+            if asset_ids:
+                return asset_ids
 
-                asset_ids.append(
-                    asset_id
-                )
+    except Exception as e:
+        print("PREVIOUS ASSISTANT SOURCES ERROR:", type(e).__name__, str(e))
 
-        print(
-            "CHAT TOPIC SOURCE MEMORY:",
-            {
-                "chat_id": chat_id,
-                "source_asset_ids": asset_ids
-            }
-        )
+    return []
 
-        return asset_ids
-
-    except Exception as error:
-
-        print(
-            "PREVIOUS ASSISTANT SOURCES ERROR:",
-            type(error).__name__,
-            str(error)
-        )
-
-        return []
-
-def rerank_retrieved_rows_for_query(
-    query: str,
-    rows: list[dict],
-    max_rows: int = 30
-) -> list[dict]:
+def is_contextual_followup_query(query: str, chat_id: str) -> bool:
     """
-    Precision reranker.
+    Detects whether the latest user message depends on earlier chat context.
 
-    Initial keyword/vector retrieval is intentionally broad.
-    This second stage decides which chunks actually relate to
-    the resolved user request before whole documents are expanded.
-
-    The reranker does NOT answer the question.
+    No hardcoded topics, products, vendors, or document names.
     """
 
-    clean_query = clean_text_for_postgres(
-        str(query or "")
-    ).strip()
+    clean_query = str(query or "").strip()
 
-    if not clean_query or not rows:
-        return []
+    if not clean_query:
+        return False
+
+    recent_user_context = get_recent_user_context(
+        chat_id=chat_id,
+        current_query=clean_query,
+        limit=6
+    )
+
+    if not recent_user_context.strip():
+        return False
 
     try:
-        candidate_rows = deduplicate_context_rows(
-            rows
-        )
-    except Exception:
-        candidate_rows = list(
-            rows or []
-        )
+        raw = ask_llm(
+            query=clean_query,
+            context=f"""
+Classify whether the latest user message depends on previous user messages.
 
-    if not candidate_rows:
-        return []
+Return ONLY one word:
 
-    # Keep the candidate set manageable while preserving high recall.
-    candidate_rows = candidate_rows[:60]
+followup
 
-    batch_size = 30
-    ranked_items = []
+or
 
-    for start in range(
-        0,
-        len(candidate_rows),
-        batch_size
-    ):
-        batch_rows = candidate_rows[
-            start:start + batch_size
-        ]
+standalone
 
-        source_blocks = []
-
-        for local_index, row in enumerate(
-            batch_rows,
-            start=1
-        ):
-            global_index = start + local_index
-
-            file_name = (
-                row.get("original_file_name")
-                or row.get("file_name")
-                or (
-                    row.get("assets") or {}
-                ).get("original_file_name")
-                or (
-                    row.get("assets") or {}
-                ).get("file_name")
-                or "Untitled document"
-            )
-
-            content = clean_text_for_postgres(
-                str(
-                    row.get("content")
-                    or row.get("search_text")
-                    or ""
-                )
-            ).strip()
-
-            if len(content) > 8000:
-                content = content[:8000]
-
-            source_blocks.append(
-                "\n".join([
-                    f"SOURCE_NUMBER: {global_index}",
-                    f"FILE: {file_name}",
-                    "CONTENT:",
-                    content
-                ])
-            )
-
-        batch_context = "\n\n---\n\n".join(
-            source_blocks
-        )
-
-        try:
-            raw = ask_llm(
-                query=clean_query,
-                context=f"""
-You are a strict retrieval reranker for BridgeOS.
-
-You are NOT answering the user's question.
-
-Score how useful each candidate source is for finding the
-answer to the EXACT resolved request.
-
-Return ONLY valid JSON:
-
-{{
-  "sources": [
-    {{
-      "source_number": 1,
-      "score": 4
-    }}
-  ]
-}}
-
-Score meaning:
-
-0 = unrelated
-1 = shares broad words/topic but does not help answer the request
-2 = possibly useful background/context
-3 = directly relevant evidence
-4 = very strong direct evidence likely containing the answer
+Definitions:
+- followup = the latest message is incomplete without previous context, asks to continue, asks for more detail, asks "what about..." another item, or refers back to the previous topic.
+- standalone = the latest message is complete by itself.
 
 Rules:
+- Do not answer the user.
+- Do not explain.
+- Return only followup or standalone.
 
-- Judge the exact user request, not general topical similarity.
-- A document with similar words but the wrong entity/date/operation
-  must score low.
-- Preserve potentially useful sources when the answer may be spread
-  across multiple documents.
-- Do not invent information.
-- Do not answer the user's question.
-- Do not favour a source merely because its filename sounds relevant.
-- Return every source in the batch with its score.
-- Return JSON only.
+Previous user messages:
+{recent_user_context}
 
-RESOLVED USER REQUEST:
-
+Latest user message:
 {clean_query}
-
-CANDIDATE SOURCES:
-
-{batch_context}
 """.strip()
-            )
-
-            parsed = parse_llm_json_response(
-                raw
-            )
-
-        except Exception as error:
-            print(
-                "RETRIEVAL RERANK BATCH ERROR:",
-                type(error).__name__,
-                str(error)
-            )
-
-            parsed = None
-
-        if not isinstance(parsed, dict):
-            # Do not destroy recall if reranking itself fails.
-            for local_index, row in enumerate(
-                batch_rows,
-                start=1
-            ):
-                ranked_items.append({
-                    "row": row,
-                    "score": 2,
-                    "position": start + local_index
-                })
-
-            continue
-
-        score_map = {}
-
-        for item in (
-            parsed.get("sources")
-            or []
-        ):
-            if not isinstance(item, dict):
-                continue
-
-            try:
-                source_number = int(
-                    item.get("source_number")
-                )
-
-                score = int(
-                    item.get("score")
-                )
-
-            except Exception:
-                continue
-
-            score = max(
-                0,
-                min(score, 4)
-            )
-
-            score_map[
-                source_number
-            ] = score
-
-        for local_index, row in enumerate(
-            batch_rows,
-            start=1
-        ):
-            global_index = start + local_index
-
-            score = score_map.get(
-                global_index,
-                0
-            )
-
-            ranked_items.append({
-                "row": row,
-                "score": score,
-                "position": global_index
-            })
-
-    # Direct/relevant evidence first.
-    ranked_items.sort(
-        key=lambda item: (
-            item["score"],
-            -item["position"]
-        ),
-        reverse=True
-    )
-
-    strong_rows = [
-        item["row"]
-        for item in ranked_items
-        if item["score"] >= 3
-    ]
-
-    possible_rows = [
-        item["row"]
-        for item in ranked_items
-        if item["score"] == 2
-    ]
-
-    # Prefer direct evidence.
-    # If direct evidence is sparse, retain some possible context too.
-    final_rows = strong_rows[:max_rows]
-
-    if len(final_rows) < min(
-        10,
-        max_rows
-    ):
-        remaining = (
-            max_rows
-            - len(final_rows)
         )
 
-        final_rows.extend(
-            possible_rows[:remaining]
-        )
+        value = str(raw or "").strip().lower()
 
-    # If reranker rejected everything, keep original high-recall
-    # retrieval rather than silently producing no context.
-    if not final_rows:
-        final_rows = candidate_rows[
-            :max_rows
-        ]
+        return value == "followup"
 
-    try:
-        final_rows = deduplicate_context_rows(
-            final_rows
-        )
-    except Exception:
-        pass
+    except Exception as e:
+        print("FOLLOWUP CLASSIFIER ERROR:", type(e).__name__, str(e))
+        return False
 
-    print(
-        "RETRIEVAL RERANK RESULT:",
-        {
-            "query": clean_query,
-            "input_rows": len(
-                candidate_rows
-            ),
-            "output_rows": len(
-                final_rows
-            ),
-            "strong_rows": len(
-                strong_rows
-            ),
-            "possible_rows": len(
-                possible_rows
-            )
-        }
-    )
-
-    return final_rows
 # ------------------------
 # GENERIC DOCUMENT CONTEXT EXPANSION
 # ------------------------
@@ -10601,7 +9815,7 @@ def expand_retrieved_rows_to_full_relevant_documents(
     answer_depth: str = "focused",
     max_assets: int | None = None,
     max_rows_per_asset: int | None = None,
-    max_context_chars: int = 120000
+    max_context_chars: int = 250000
 ) -> list[dict]:
     """
     Expands initially retrieved chunks into complete relevant document context.
@@ -10649,16 +9863,17 @@ def expand_retrieved_rows_to_full_relevant_documents(
 
     if max_assets is None:
         if clean_answer_depth == "comprehensive":
-            max_assets = 8
+            max_assets = 10
 
         elif clean_answer_depth == "document":
             max_assets = 1
 
         else:
-            max_assets = 5
+            # A direct question can still require facts from several files.
+            max_assets = 15
 
     max_assets = max(
-        1, 
+        1,
         min(
             int(max_assets),
             20
@@ -15247,7 +14462,7 @@ def chat(
 
         try:
             result = answer_financial_total_from_context(
-                query=effective_query,
+                query=clean_query,
                 context=financial_context,
                 matched_rows=financial_rows
             )
@@ -15374,121 +14589,12 @@ def chat(
             )
 
     # =========================================================
-    # RESOLVE CURRENT TURN AGAINST CHAT MEMORY
-    # =========================================================
-
-    try:
-        turn_resolution = resolve_chat_turn(
-            query=clean_query,
-            chat_id=chat_id
-        )
-
-    except Exception as error:
-        print(
-            "TURN RESOLUTION ERROR:",
-            type(error).__name__,
-            str(error)
-        )
-
-        turn_resolution = {
-            "relationship": "standalone",
-            "resolved_query": clean_query,
-            "reuse_previous_sources": False,
-            "reason": ""
-        }
-
-    memory_relationship = str(
-        turn_resolution.get(
-            "relationship"
-        )
-        or "standalone"
-    ).strip().lower()
-
-    resolved_query = clean_text_for_postgres(
-        str(
-            turn_resolution.get(
-                "resolved_query"
-            )
-            or clean_query
-        )
-    ).strip()
-
-    if not resolved_query:
-        resolved_query = clean_query
-
-    reuse_previous_sources = bool(
-        turn_resolution.get(
-            "reuse_previous_sources"
-        )
-    )
-
-    topic_anchor = clean_text_for_postgres(
-        str(
-            turn_resolution.get(
-                "topic_anchor"
-            )
-            or resolved_query
-            or clean_query
-        )
-    ).strip()
-
-
-    topic_state = clean_text_for_postgres(
-        str(
-            turn_resolution.get(
-                "topic_state"
-            )
-            or topic_anchor
-            or resolved_query
-            or clean_query
-        )
-    ).strip()
-
-    needs_global_search = bool(
-        turn_resolution.get(
-            "needs_global_search",
-            True
-        )
-    )
-
-    # This is the query used to understand intent and retrieve evidence.
-    # clean_query remains the user's literal wording.
-    effective_query = resolved_query
-
-    if memory_relationship in {
-        "followup",
-        "same_topic_addition"
-    }:
-        answer_query = (
-            f"Main conversation topic: {topic_anchor}\n"
-            f"Current situation: {topic_state}\n"
-            f"Current request: {resolved_query}"
-        ).strip()
-
-    else:
-        answer_query = resolved_query
-
-    print(
-        "CHAT MEMORY RESOLUTION:",
-        {
-            "current_query": clean_query,
-            "relationship": memory_relationship,
-            "topic_anchor": topic_anchor,
-            "topic_state": topic_state,
-            "resolved_query": resolved_query,
-            "answer_query": answer_query,
-            "reuse_previous_sources": reuse_previous_sources,
-            "needs_global_search": needs_global_search
-        }
-    )
-
-    # =========================================================
     # CLASSIFY QUERY
     # =========================================================
 
     try:
         query_scope = classify_bridgeos_query_scope(
-            effective_query
+            clean_query
         )
 
     except Exception as error:
@@ -15502,7 +14608,7 @@ def chat(
 
     try:
         financial_query = is_financial_total_query(
-            effective_query
+            clean_query
         )
 
     except Exception as error:
@@ -15520,7 +14626,7 @@ def chat(
     else:
         try:
             answer_depth = classify_answer_depth(
-                effective_query
+                clean_query
             )
 
         except Exception:
@@ -15536,7 +14642,7 @@ def chat(
         try:
             requested_financial_subjects = (
                 extract_spending_subjects(
-                    effective_query
+                    clean_query
                 )
                 or []
             )
@@ -15802,7 +14908,7 @@ Rules:
         try:
             numeric_result = (
                 answer_numeric_comparison_from_context(
-                    query=effective_query,
+                    query=clean_query,
                     context=context,
                     matched_rows=matched_rows
                 )
@@ -15832,7 +14938,7 @@ Rules:
         try:
             uploaded_result = (
                 answer_from_uploaded_chat_asset(
-                    query=effective_query,
+                    query=clean_query,
                     context=context,
                     matched_rows=matched_rows
                 )
@@ -16165,204 +15271,56 @@ Rules:
     # NORMAL DOCUMENT RETRIEVAL
     # =========================================================
 
-    followup_query = (
-        memory_relationship
-        in {
-            "followup",
-            "same_topic_addition"
-        }
-    )
+    try:
+        followup_query = is_contextual_followup_query(
+            query=clean_query,
+            chat_id=chat_id
+        )
 
-    retrieval_query_input = (
-        effective_query
-    )
+    except Exception as error:
+        print(
+            "FOLLOW-UP CLASSIFICATION ERROR:",
+            type(error).__name__,
+            str(error)
+        )
 
-    print(
-        "DOCUMENT RETRIEVAL INPUT:",
-        {
-            "original_query": clean_query,
-            "resolved_query": (
-                retrieval_query_input
-            ),
-            "relationship": (
-                memory_relationship
-            ),
-            "reuse_previous_sources": (
-                reuse_previous_sources
-            )
-        }
-    )
+        followup_query = False
+
+    retrieval_query_input = clean_query
 
     if followup_query:
-
-        # OpenAI has already converted the follow-up into one clean,
-        # self-contained retrieval query.
-        #
-        # Do NOT split it into many searches.
-        retrieval_queries = [
-            retrieval_query_input
-        ]
-
-    else:
         try:
-            retrieval_queries = (
-                build_retrieval_queries(
-                    retrieval_query_input
+            retrieval_query_input = (
+                build_memory_aware_retrieval_input(
+                    query=clean_query,
+                    chat_id=chat_id
                 )
-                or [
-                    retrieval_query_input
-                ]
-            )
-
-        except Exception:
-            retrieval_queries = [
-                retrieval_query_input
-            ]
-
-        # Prevent broad questions from exploding into excessive
-        # embedding/search calls.
-        retrieval_queries = retrieval_queries[:4]
-
-    matched_rows_by_key = {}
-
-    previous_source_asset_ids = []
-
-    if (
-        followup_query
-        and reuse_previous_sources
-    ):
-        try:
-            previous_source_asset_ids = (
-                get_previous_assistant_source_asset_ids(
-                    chat_id=chat_id,
-                    crew_id=crew_id,
-                    yacht_id=yacht_id,
-                    limit=12
-                )
-                or []
+                or clean_query
             )
 
         except Exception as error:
             print(
-                "PREVIOUS SOURCE MEMORY ERROR:",
+                "FOLLOW-UP REWRITE ERROR:",
                 type(error).__name__,
                 str(error)
             )
 
-            previous_source_asset_ids = []
+    try:
+        retrieval_queries = (
+            build_retrieval_queries(
+                retrieval_query_input
+            )
+            or [
+                retrieval_query_input
+            ]
+        )
 
-    if previous_source_asset_ids:
-        previous_source_asset_ids = [
-            asset_id
-            for asset_id in previous_source_asset_ids
-            if asset_id in allowed_asset_ids
+    except Exception:
+        retrieval_queries = [
+            retrieval_query_input
         ]
 
-        if previous_source_asset_ids:
-            try:
-                previous_rows_res = (
-                    supabase.table("asset_chunks")
-                    .select("""
-                        asset_id,
-                        yacht_id,
-                        chat_id,
-                        security_level,
-                        content,
-                        content_type,
-                        chunk_index,
-                        detected_date,
-                        detected_year,
-                        tags,
-                        assets!inner (
-                            id,
-                            file_name,
-                            original_file_name,
-                            file_type,
-                            mime_type
-                        )
-                    """)
-                    .eq(
-                        "yacht_id",
-                        yacht_id
-                    )
-                    .in_(
-                        "asset_id",
-                        previous_source_asset_ids
-                    )
-                    .order(
-                        "chunk_index"
-                    )
-                    .limit(120)
-                    .execute()
-                )
-
-                for row in (
-                    previous_rows_res.data
-                    or []
-                ):
-                    nested_asset = (
-                        row.get("assets")
-                        or {}
-                    )
-
-                    normalised_row = dict(
-                        row
-                    )
-
-                    normalised_row[
-                        "file_name"
-                    ] = (
-                        nested_asset.get(
-                            "file_name"
-                        )
-                    )
-
-                    normalised_row[
-                        "original_file_name"
-                    ] = (
-                        nested_asset.get(
-                            "original_file_name"
-                        )
-                    )
-
-                    normalised_row[
-                        "file_type"
-                    ] = (
-                        nested_asset.get(
-                            "file_type"
-                        )
-                    )
-
-                    normalised_row[
-                        "mime_type"
-                    ] = (
-                        nested_asset.get(
-                            "mime_type"
-                        )
-                    )
-
-                    key = (
-                        normalised_row.get(
-                            "asset_id"
-                        ),
-                        normalised_row.get(
-                            "chunk_index"
-                        ),
-                        normalised_row.get(
-                            "content_type"
-                        )
-                    )
-
-                    matched_rows_by_key[
-                        key
-                    ] = normalised_row
-
-            except Exception as error:
-                print(
-                    "PREVIOUS SOURCE CONTINUITY LOAD ERROR:",
-                    type(error).__name__,
-                    str(error)
-                )
+    matched_rows_by_key = {}
 
     try:
         file_listing_query = is_file_listing_query(
@@ -16428,7 +15386,7 @@ Rules:
                     yacht_id=yacht_id,
                     allowed_asset_ids=allowed_asset_ids,
                     year_filter=year_filter,
-                    limit=24
+                    limit=40
                 )
                 or []
             )
@@ -16470,7 +15428,7 @@ Rules:
                         "match_asset_chunks_secure",
                         {
                             "query_embedding": query_embedding,
-                            "match_count": 24,
+                            "match_count": 40,
                             "allowed_asset_ids": allowed_asset_ids,
                             "yacht_filter": yacht_id,
                             "year_filter": year_filter
@@ -16501,28 +15459,7 @@ Rules:
 
     matched_rows = list(
         matched_rows_by_key.values()
-    )[:60]
-
-    if (
-        matched_rows
-        and not file_listing_query
-    ):
-        try:
-            matched_rows = (
-                rerank_retrieved_rows_for_query(
-                    query=retrieval_query_input,
-                    rows=matched_rows,
-                    max_rows=30
-                )
-                or matched_rows
-            )
-
-        except Exception as error:
-            print(
-                "RETRIEVAL RERANK ERROR:",
-                type(error).__name__,
-                str(error)
-            )
+    )[:100]
 
     if (
         matched_rows
@@ -16604,7 +15541,7 @@ Rules:
     try:
         numeric_result = (
             answer_numeric_comparison_from_context(
-                query=effective_query,
+                query=clean_query,
                 context=context,
                 matched_rows=matched_rows
             )
@@ -16692,7 +15629,7 @@ Rules:
     try:
         grounded_result = (
             answer_only_from_verified_document_evidence(
-                query=answer_query,
+                query=clean_query,
                 matched_rows=candidate_rows
             )
         )
