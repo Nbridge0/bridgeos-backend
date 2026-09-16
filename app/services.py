@@ -7221,6 +7221,98 @@ def keyword_search_asset_chunks(
         limit=limit
     )
 
+def ask_openai_memory(
+    query: str,
+    context: str
+) -> str:
+    """
+    OpenAI is used ONLY as BridgeOS's conversation-state controller.
+
+    It is NOT used for:
+    - document answering;
+    - document extraction;
+    - retrieval reranking;
+    - financial calculations;
+    - normal RAG generation.
+
+    Those can continue using the existing ask_llm() provider.
+    """
+
+    clean_query = clean_text_for_postgres(
+        str(query or "")
+    ).strip()
+
+    clean_context = clean_text_for_postgres(
+        str(context or "")
+    ).strip()
+
+    try:
+        client = get_openai_client()
+
+        prompt = f"""
+You are the conversation-state controller for BridgeOS.
+
+You are NOT answering the user's factual question.
+
+Your only job is to understand conversation state, references,
+active topic and user intent.
+
+CONTEXT:
+
+{clean_context}
+
+CURRENT USER MESSAGE:
+
+{clean_query}
+""".strip()
+
+        print(
+            "OPENAI MEMORY START:",
+            {
+                "model": OPENAI_CHAT_MODEL,
+                "query": clean_query[:300]
+            }
+        )
+
+        response = client.responses.create(
+            model=OPENAI_CHAT_MODEL,
+            input=prompt,
+            store=False
+        )
+
+        output_text = str(
+            getattr(
+                response,
+                "output_text",
+                ""
+            )
+            or ""
+        ).strip()
+
+        if not output_text:
+            raise RuntimeError(
+                "OpenAI memory resolver returned empty text."
+            )
+
+        print(
+            "OPENAI MEMORY SUCCESS:",
+            {
+                "model": OPENAI_CHAT_MODEL,
+                "characters": len(output_text)
+            }
+        )
+
+        return output_text
+
+    except Exception as error:
+        print(
+            "OPENAI MEMORY ERROR:",
+            type(error).__name__,
+            str(error)
+        )
+
+        raise
+
 # ============================================================
 # CHAT MEMORY / TURN RESOLUTION
 # ============================================================
@@ -7347,7 +7439,7 @@ def get_chat_memory_context(
 
             if older_text:
                 try:
-                    summary_raw = ask_llm(
+                    summary_raw = ask_openai_memory(
                         query=(
                             "Create a conversation-memory summary."
                         ),
@@ -7438,14 +7530,17 @@ def resolve_chat_turn(
     chat_id: str
 ) -> dict:
     """
-    ONE authoritative conversation resolver.
+    OpenAI conversation-state controller.
 
-    This replaces separate:
-    - follow-up classification;
-    - previous-message guessing;
-    - independent retrieval-query rewriting.
+    This function understands:
+    - the active substantive topic;
+    - follow-ups;
+    - same-topic additions;
+    - topic changes;
+    - references such as it/that/them;
+    - greetings and small talk.
 
-    Returns one structured decision used by the rest of chat().
+    It does NOT answer document questions.
     """
 
     clean_query = clean_text_for_postgres(
@@ -7454,8 +7549,10 @@ def resolve_chat_turn(
 
     default_result = {
         "relationship": "standalone",
+        "active_topic": clean_query,
         "resolved_query": clean_query,
         "reuse_previous_sources": False,
+        "needs_global_search": True,
         "reason": ""
     }
 
@@ -7473,85 +7570,201 @@ def resolve_chat_turn(
         return default_result
 
     try:
-        raw = ask_llm(
+        raw = ask_openai_memory(
             query=clean_query,
             context=f"""
-You resolve conversation references for BridgeOS.
+Determine the conversation state for the latest user message.
 
-The latest message may either:
-1. be completely standalone;
-2. continue the previous subject;
-3. switch to a new subject;
-4. refer to something mentioned many turns earlier.
+You must maintain ONE current substantive active topic.
 
-Your job is ONLY to determine what the latest user request means.
+A substantive topic is the actual task, situation or subject the
+user is discussing.
 
-Return ONLY valid JSON with exactly this shape:
+Greetings, acknowledgements and small talk are NOT substantive topics.
+
+Examples:
+
+"hi"
+"hello"
+"thanks"
+"okay"
+"great"
+
+must NEVER replace an existing active topic.
+
+A user may gradually add information to ONE real-world situation.
+
+For example:
+
+User:
+hi
+
+User:
+the guest wants to use the swim platform, anything I need to know?
+
+User:
+the toys are in the water as well, does that matter?
+
+User:
+and we're also fuel bunkering
+
+This is ONE continuing substantive situation.
+
+The active topic becomes conceptually:
+
+Guest use of the swim platform while toys are in the water and
+fuel bunkering is taking place.
+
+The latest message:
+
+"and we're also fuel bunkering"
+
+must therefore NOT be interpreted as an isolated question.
+
+It must be resolved against the active situation.
+
+Return ONLY valid JSON exactly shaped like:
 
 {{
-  "relationship": "standalone",
-  "resolved_query": "complete standalone version of the latest request",
-  "reuse_previous_sources": false,
-  "reason": "short internal explanation"
+    "relationship": "same_topic_addition",
+    "active_topic": "concise description of current substantive topic",
+    "resolved_query": "self-contained interpretation of the CURRENT user request",
+    "reuse_previous_sources": true,
+    "needs_global_search": true,
+    "reason": "short explanation"
 }}
 
-relationship must be exactly one of:
+relationship MUST be exactly one of:
 
+conversational
 standalone
 followup
+same_topic_addition
 topic_shift
 
 Definitions:
 
+conversational:
+The current message is greeting, acknowledgement, thanks,
+casual conversation or application help.
+
+A conversational message MUST NOT become the substantive active topic.
+
 standalone:
-The latest request is already complete and does not need previous
-conversation to understand its subject or requested operation.
+The user introduces a substantive subject and there is no relevant
+existing topic that must be inherited.
 
 followup:
-The latest request genuinely depends on earlier conversation.
-Resolve references such as:
-- it
-- that
-- those
-- them
-- the other one
-- before that
-- after that
-- what about X
-- and X
-- compare them
-- why
-- how much then
-- which one
-- the previous one
+The user asks something that depends on the existing active topic.
+
+same_topic_addition:
+The user adds another condition, constraint, event, object or fact
+to the SAME substantive situation.
 
 topic_shift:
-The user has clearly started a different subject or operation.
-Do NOT carry the old topic into the new request.
+The user clearly starts a genuinely different substantive subject.
 
-Rules:
+CRITICAL ACTIVE-TOPIC RULES:
 
-- Preserve the CURRENT user's requested operation.
-- Preserve the CURRENT user's subject when they explicitly provide one.
-- Do not replace a new subject with the old subject.
-- Do not inherit a financial operation merely because an earlier question
-  was financial.
-- Do not inherit any previous operation unless the latest message genuinely
-  depends on it.
-- If the user says "what about X", preserve X and inherit only the operation
-  needed to make the request complete.
-- Resolve pronouns and incomplete references from conversation memory.
-- Never invent a product, person, document, value, date, supplier,
-  equipment name or topic.
-- Do not answer the question.
-- Do not add factual information.
-- Conversation memory is for intent only, never factual evidence.
-- Set reuse_previous_sources=true only when the latest request genuinely
-  continues the same source/document subject.
-- If uncertain whether this is a follow-up, prefer standalone.
-- Return JSON only.
+- Maintain the semantic topic, not the transcript.
+- Do NOT concatenate all previous messages.
+- Do NOT copy the whole conversation into resolved_query.
+- Do NOT make "hi" or another greeting the active topic.
+- Understand the conversation semantically.
+- Preserve relevant conditions already established.
+- Drop irrelevant historical details.
+- A later condition can extend the active topic.
+- A new substantive subject can replace the active topic.
+- Do not confuse a new condition with a topic change.
 
-CONVERSATION MEMORY:
+REFERENCE RESOLUTION:
+
+Correctly resolve words and phrases such as:
+
+it
+that
+this
+those
+them
+they
+the previous one
+the other one
+what about
+and also
+as well
+does that matter
+what should we do
+what happens then
+before that
+after that
+which one
+why
+
+RESOLVED QUERY RULES:
+
+resolved_query must contain enough context for document retrieval
+but must remain concise.
+
+GOOD:
+
+"Does fuel bunkering affect whether a guest can safely use the
+swim platform while toys are in the water?"
+
+BAD:
+
+"the guest wants to use the swim platform, anything I need to know?
+the toys are in the water as well, does that matter?
+and we're also fuel bunkering"
+
+Never return a transcript as the resolved query.
+
+SOURCE RULES:
+
+reuse_previous_sources=true when documents already used in the
+current active topic may still be relevant.
+
+needs_global_search=true when the current request introduces a new
+concept that may require additional documents.
+
+For example:
+
+swim platform
+→ previous swim-platform source useful
+
+toys added
+→ previous source useful BUT new toy documents may also be needed
+
+fuel bunkering added
+→ existing sources remain contextually relevant BUT bunkering
+documents may also need to be searched
+
+Therefore this can be:
+
+reuse_previous_sources=true
+needs_global_search=true
+
+IMPORTANT:
+
+Conversation history is used ONLY for understanding intent.
+
+Assistant answers are NOT authoritative factual evidence.
+
+Never invent:
+- document contents;
+- values;
+- dates;
+- names;
+- procedures;
+- requirements;
+- products;
+- suppliers;
+- equipment.
+
+Do not answer the question.
+
+Return JSON only.
+
+CONVERSATION HISTORY:
 
 {memory_context}
 
@@ -7573,12 +7786,23 @@ LATEST USER MESSAGE:
             or "standalone"
         ).strip().lower()
 
-        if relationship not in {
+        allowed_relationships = {
+            "conversational",
             "standalone",
             "followup",
+            "same_topic_addition",
             "topic_shift"
-        }:
+        }
+
+        if relationship not in allowed_relationships:
             relationship = "standalone"
+
+        active_topic = clean_text_for_postgres(
+            str(
+                parsed.get("active_topic")
+                or clean_query
+            )
+        ).strip()
 
         resolved_query = clean_text_for_postgres(
             str(
@@ -7586,6 +7810,9 @@ LATEST USER MESSAGE:
                 or clean_query
             )
         ).strip()
+
+        if not active_topic:
+            active_topic = clean_query
 
         if not resolved_query:
             resolved_query = clean_query
@@ -7596,16 +7823,30 @@ LATEST USER MESSAGE:
             )
         )
 
-        # Never reuse previous sources after a definite topic shift.
-        if relationship == "topic_shift":
+        needs_global_search = bool(
+            parsed.get(
+                "needs_global_search",
+                True
+            )
+        )
+
+        if relationship in {
+            "standalone",
+            "topic_shift"
+        }:
             reuse_previous_sources = False
+            needs_global_search = True
+
+        if relationship == "conversational":
+            reuse_previous_sources = False
+            needs_global_search = False
 
         result = {
             "relationship": relationship,
+            "active_topic": active_topic,
             "resolved_query": resolved_query,
-            "reuse_previous_sources": (
-                reuse_previous_sources
-            ),
+            "reuse_previous_sources": reuse_previous_sources,
+            "needs_global_search": needs_global_search,
             "reason": clean_text_for_postgres(
                 str(
                     parsed.get("reason")
@@ -9497,7 +9738,7 @@ def get_previous_assistant_source_asset_ids(
 def rerank_retrieved_rows_for_query(
     query: str,
     rows: list[dict],
-    max_rows: int = 60
+    max_rows: int = 30
 ) -> list[dict]:
     """
     Precision reranker.
@@ -9529,9 +9770,9 @@ def rerank_retrieved_rows_for_query(
         return []
 
     # Keep the candidate set manageable while preserving high recall.
-    candidate_rows = candidate_rows[:120]
+    candidate_rows = candidate_rows[:60]
 
-    batch_size = 25
+    batch_size = 30
     ranked_items = []
 
     for start in range(
@@ -10223,7 +10464,7 @@ def expand_retrieved_rows_to_full_relevant_documents(
     answer_depth: str = "focused",
     max_assets: int | None = None,
     max_rows_per_asset: int | None = None,
-    max_context_chars: int = 250000
+    max_context_chars: int = 120000
 ) -> list[dict]:
     """
     Expands initially retrieved chunks into complete relevant document context.
@@ -10271,17 +10512,16 @@ def expand_retrieved_rows_to_full_relevant_documents(
 
     if max_assets is None:
         if clean_answer_depth == "comprehensive":
-            max_assets = 10
+            max_assets = 8
 
         elif clean_answer_depth == "document":
             max_assets = 1
 
         else:
-            # A direct question can still require facts from several files.
-            max_assets = 15
+            max_assets = 5
 
     max_assets = max(
-        1,
+        1, or what?
         min(
             int(max_assets),
             20
@@ -15045,6 +15285,23 @@ def chat(
         )
     )
 
+    active_topic = clean_text_for_postgres(
+        str(
+            turn_resolution.get(
+                "active_topic"
+            )
+            or resolved_query
+            or clean_query
+        )
+    ).strip()
+
+    needs_global_search = bool(
+        turn_resolution.get(
+            "needs_global_search",
+            True
+        )
+    )
+
     # This is the query used to understand intent and retrieve evidence.
     # clean_query remains the user's literal wording.
     effective_query = resolved_query
@@ -15054,9 +15311,13 @@ def chat(
         {
             "current_query": clean_query,
             "relationship": memory_relationship,
+            "active_topic": active_topic,
             "resolved_query": resolved_query,
             "reuse_previous_sources": (
                 reuse_previous_sources
+            ),
+            "needs_global_search": (
+                needs_global_search
             )
         }
     )
@@ -15745,7 +16006,11 @@ Rules:
     # =========================================================
 
     followup_query = (
-        memory_relationship == "followup"
+        memory_relationship
+        in {
+            "followup",
+            "same_topic_addition"
+        }
     )
 
     retrieval_query_input = (
@@ -15768,20 +16033,35 @@ Rules:
         }
     )
 
-    try:
-        retrieval_queries = (
-            build_retrieval_queries(
-                retrieval_query_input
-            )
-            or [
-                retrieval_query_input
-            ]
-        )
+    if followup_query:
 
-    except Exception:
+        # OpenAI has already converted the follow-up into one clean,
+        # self-contained retrieval query.
+        #
+        # Do NOT split it into many searches.
         retrieval_queries = [
             retrieval_query_input
         ]
+
+    else:
+        try:
+            retrieval_queries = (
+                build_retrieval_queries(
+                    retrieval_query_input
+                )
+                or [
+                    retrieval_query_input
+                ]
+            )
+
+        except Exception:
+            retrieval_queries = [
+                retrieval_query_input
+            ]
+
+        # Prevent broad questions from exploding into excessive
+        # embedding/search calls.
+        retrieval_queries = retrieval_queries[:4]
 
     matched_rows_by_key = {}
 
@@ -15852,7 +16132,7 @@ Rules:
                     .order(
                         "chunk_index"
                     )
-                    .limit(300)
+                    .limit(120)
                     .execute()
                 )
 
@@ -15988,7 +16268,7 @@ Rules:
                     yacht_id=yacht_id,
                     allowed_asset_ids=allowed_asset_ids,
                     year_filter=year_filter,
-                    limit=40
+                    limit=24
                 )
                 or []
             )
@@ -16030,7 +16310,7 @@ Rules:
                         "match_asset_chunks_secure",
                         {
                             "query_embedding": query_embedding,
-                            "match_count": 40,
+                            "match_count": 24,
                             "allowed_asset_ids": allowed_asset_ids,
                             "yacht_filter": yacht_id,
                             "year_filter": year_filter
@@ -16061,7 +16341,7 @@ Rules:
 
     matched_rows = list(
         matched_rows_by_key.values()
-    )[:100]
+    )[:60]
 
     if (
         matched_rows
@@ -16072,7 +16352,7 @@ Rules:
                 rerank_retrieved_rows_for_query(
                     query=retrieval_query_input,
                     rows=matched_rows,
-                    max_rows=60
+                    max_rows=30
                 )
                 or matched_rows
             )
